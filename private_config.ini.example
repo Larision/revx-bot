@@ -1,0 +1,7 @@
+[revolut]
+api_key = TU_API_KEY_AQUI
+
+[telegram]
+enabled = true
+token   = TU_TOKEN_AQUI
+chat_id = TU_CHAT_ID_AQUI
