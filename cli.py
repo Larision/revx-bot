@@ -457,12 +457,12 @@ def _add_manual_order(engine: "GridEngine") -> None:
 
 
 def _fill_empty_levels(engine: "GridEngine") -> None:
-    """Ejecuta manualmente fill_empty_levels usando el precio actual."""
-    current_price = engine.current_price
+    """Ejecuta manualmente fill_empty_levels usando un precio fresco."""
+    print("  Consultando precio actual...")
+    current_price, _ = get_current_price()
 
     if current_price is None:
-        print("  Consultando precio actual...")
-        current_price, _ = get_current_price()
+        current_price = engine.current_price
 
     if current_price is None:
         print("  [!] No se pudo obtener el precio actual.")

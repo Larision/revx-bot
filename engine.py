@@ -60,6 +60,7 @@ class GridEngine:
         self.levels: List[Decimal]           = []
         self.active_orders: Dict[str, OrderInfo] = {}
         self.last_fill_side: Optional[str]   = None  # "buy" o "sell"
+        self.last_fill_price: Optional[Decimal] = None  # último nivel ejecutado
         self.current_price: Optional[Decimal] = None  # último precio conocido
 
         # Historial de fills en memoria para el submenú de monitorización
@@ -98,6 +99,7 @@ class GridEngine:
                 for key, info in self.active_orders.items()
             },
             "last_fill_side": self.last_fill_side,
+            "last_fill_price": str(self.last_fill_price) if self.last_fill_price is not None else None,
             "saved_at": int(time.time()),
         }
         try:
@@ -136,6 +138,17 @@ class GridEngine:
                 for key, info in raw.get("active_orders", {}).items()
             }
             self.last_fill_side = raw.get("last_fill_side")
+            self.last_fill_price = (
+                Decimal(raw["last_fill_price"])
+                if raw.get("last_fill_price") is not None else None
+            )
+            if self.last_fill_price is None:
+                missing_levels = [
+                    level for level in self.levels
+                    if _price_key(level) not in self.active_orders
+                ]
+                if len(missing_levels) == 1:
+                    self.last_fill_price = missing_levels[0]
 
             saved_at = raw.get("saved_at", 0)
             age_min  = (time.time() - saved_at) / 60
@@ -564,6 +577,7 @@ class GridEngine:
         price: Decimal = info["price"]
 
         self.last_fill_side = side
+        self.last_fill_price = price
 
         levels_snapshot = sorted(set(self.levels))
         lowest   = min(levels_snapshot)
@@ -666,22 +680,34 @@ class GridEngine:
         """
         Repobla niveles vacíos (por cancelación externa u otros motivos).
 
-        El nivel a dejar vacío se determina por la dirección del último fill:
-          - Último fill BUY  → precio bajando → dejar vacío el nivel SELL más cercano por encima
-          - Último fill SELL → precio subiendo → dejar vacío el nivel BUY más cercano por debajo
-          - Sin fill previo  → dejar vacío el nivel más cercano en cualquier dirección
+        Prioridad para decidir qué nivel debe permanecer vacío:
+          1. Si existe el último nivel ejecutado y sigue libre, se conserva ese hueco.
+          2. Si no, se usa la heurística anterior basada en last_fill_side/current_price.
+
+        Esto evita recrear una orden justo en el último fill si el precio oscila
+        ligeramente antes de ejecutar la recuperación.
         """
         if self.step is None:
             return
 
         levels_sorted = sorted(self.levels)
+        skip_level: Optional[Decimal] = None
+        skip_reason = "heurística"
 
-        if self.last_fill_side == "buy":
-            skip_level = next((l for l in levels_sorted if l > current_price), None)
-        elif self.last_fill_side == "sell":
-            skip_level = next((l for l in reversed(levels_sorted) if l < current_price), None)
-        else:
-            skip_level = min(self.levels, key=lambda l: abs(l - current_price), default=None)
+        if self.last_fill_price is not None:
+            last_fill_level = self.last_fill_price.quantize(TICK_SIZE, rounding=ROUND_DOWN)
+            last_fill_key = _price_key(last_fill_level)
+            if last_fill_level in levels_sorted and last_fill_key not in self.active_orders:
+                skip_level = last_fill_level
+                skip_reason = "último fill"
+
+        if skip_level is None:
+            if self.last_fill_side == "buy":
+                skip_level = next((l for l in levels_sorted if l > current_price), None)
+            elif self.last_fill_side == "sell":
+                skip_level = next((l for l in reversed(levels_sorted) if l < current_price), None)
+            else:
+                skip_level = min(self.levels, key=lambda l: abs(l - current_price), default=None)
 
         for level in levels_sorted:
             key = _price_key(level)
@@ -692,7 +718,7 @@ class GridEngine:
             if skip_level is not None and level == skip_level:
                 log_event(
                     f"[ENGINE] Nivel {key} dejado vacío intencionalmente "
-                    f"(último fill: {self.last_fill_side or 'desconocido'})"
+                    f"({skip_reason}, último fill: {self.last_fill_side or 'desconocido'})"
                 )
                 continue
 
