@@ -1,8 +1,11 @@
 from __future__ import annotations
+import csv
 import json
 import signal
 import threading
 import time
+from pathlib import Path
+from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
 from typing import TYPE_CHECKING, Optional, Tuple
 
@@ -22,13 +25,13 @@ from logger import log_event, log_file
 from api import (
     _parse_balances,
     _price_key,
-    cancel_order,
     cancel_all_orders,
     fmt_amount,
     get_active_orders,
     get_all_balances,
     get_current_price,
-    get_historical_orders,
+    get_all_trades_history_days_back,
+    get_order_by_id,
     get_ticker_price,
     place_order,
 )
@@ -72,6 +75,76 @@ def manual_order() -> Tuple[Optional[str], Optional[Decimal], Optional[Decimal]]
         return side, price_val, bs_val
 
     return None, None, None
+
+
+
+def _epoch_ms_to_iso(ms: object) -> str:
+    """Convierte epoch ms a ISO UTC. Devuelve cadena vacía si no es válido."""
+    if ms is None or isinstance(ms, bool):
+        return ''
+    if not isinstance(ms, (int, float, str)):
+        return ''
+
+    try:
+        value = int(ms)
+    except (TypeError, ValueError):
+        return ''
+
+    return datetime.fromtimestamp(value / 1000, tz=timezone.utc).isoformat()
+
+
+def _export_trades_history_to_csv(days_back: int) -> Tuple[Optional[Path], int]:
+    """Descarga el histórico de trades y lo exporta a CSV."""
+    safe_days = max(1, int(days_back))
+    response, logs = get_all_trades_history_days_back(safe_days)
+
+    for l in logs:
+        log_event(f"[LOG] {l['msg']}", l.get('level', 'info'))
+
+    if not isinstance(response, dict):
+        log_event('[ERROR] Respuesta inesperada al descargar histórico de trades.', 'error')
+        return None, 0
+
+    if response.get('error'):
+        log_event(f"[ERROR] No se pudo descargar el histórico de trades: {json.dumps(response, ensure_ascii=False)}", 'error')
+        return None, 0
+
+    rows = response.get('data', [])
+    if not isinstance(rows, list):
+        log_event('[ERROR] El campo data del histórico de trades no es una lista.', 'error')
+        return None, 0
+
+    filename = Path(f"historical-orderdata-{safe_days}-{SYMBOL}.csv")
+
+    preferred_fields = [
+        'tdt', 'tdt_iso',
+        'aid', 'anm',
+        'p', 'pc', 'pn',
+        'q', 'qc', 'qn',
+        've', 'pdt', 'pdt_iso', 'vp', 'tid',
+    ]
+    extra_fields = sorted({
+        key
+        for row in rows if isinstance(row, dict)
+        for key in row.keys()
+        if key not in {'tdt_iso', 'pdt_iso'} and key not in preferred_fields
+    })
+    fieldnames = preferred_fields + extra_fields
+
+    with filename.open('w', newline='', encoding='utf-8-sig') as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction='ignore')
+        writer.writeheader()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            out = dict(row)
+            out['tdt_iso'] = _epoch_ms_to_iso(row.get('tdt'))
+            out['pdt_iso'] = _epoch_ms_to_iso(row.get('pdt'))
+            writer.writerow(out)
+
+    return filename, len([row for row in rows if isinstance(row, dict)])
+
+
 
 
 # =========================================================
@@ -306,7 +379,12 @@ def _show_active_orders(engine: "GridEngine") -> None:
 
     for key, info in buys:
         oid = info["order_id"]
-        tag = " [virtual]" if oid == "virtual" else ""
+        if oid == "virtual":
+            tag = " [virtual]"
+        elif oid == "pending_post_only":
+            tag = " [latente]"
+        else:
+            tag = ""
         print(f"  {'BUY':<5}  {key:>12}  {oid}{tag}")
 
     print(SEP)
@@ -575,10 +653,10 @@ def show_menu() -> str:
     print("=" * 40)
     print(f"1. Precio actual {SYMBOL}")
     print("2. Ver balances")
-    print("3. Ver ultimas órdenes llenadas (historical)")
+    print("3. Exportar histórico de trades globales a CSV")
     print("4. Orden manual")
     print("5. Ver órdenes activas")
-    print("6. Cancelar orden por ID")
+    print("6. Ver orden por ID")
     print("7. Cancelar todas órdenes")
     print("8. Iniciar Grid Engine")
     print("c. Configuración manual")
@@ -656,12 +734,36 @@ def run_cli() -> None:
             log_event(f"{json.dumps(balances, indent=2, ensure_ascii=False)}", "info")
 
         # --------------------------------------------------
-        # 3. Ver filled orders
+        # 3. Exportar histórico de trades a CSV
         # --------------------------------------------------
         elif opcion == "3":
-            print("\n=== Ver filled orders ===")
-            resp, _ = get_historical_orders()
-            log_event(f"{json.dumps(resp, indent=2, ensure_ascii=False)}", "info")
+            print("\n=== Exportar histórico de trades globales a CSV ===")
+
+            while True:
+                raw_days = input(
+                    "¿De cuántos días atrás desde el momento actual quieres el histórico? [7]: "
+                ).strip()
+
+                if not raw_days:
+                    days_back = 7
+                    break
+
+                try:
+                    days_back = int(raw_days)
+                    if days_back < 1:
+                        raise ValueError
+                    break
+                except ValueError:
+                    print("Introduce un número entero mayor o igual que 1.")
+
+            csv_path, row_count = _export_trades_history_to_csv(days_back)
+            if csv_path is None:
+                print("No se pudo generar el CSV. Revisa el log.")
+                continue
+
+            print(f"CSV generado: {csv_path}")
+            print(f"Trades exportados: {row_count}")
+            log_event(f"Histórico de trades exportado a {csv_path} ({row_count} filas).", "info")
 
         # --------------------------------------------------
         # 4. Orden manual
@@ -699,44 +801,45 @@ def run_cli() -> None:
             log_event(f"{json.dumps(resp, indent=2, ensure_ascii=False)}", "info")
 
         # --------------------------------------------------
-        # 6. Cancelar orden por ID
+        # 6. Ver orden por ID
         # --------------------------------------------------
         elif opcion == "6":
-            print("\n=== Cancelar orden por ID ===")
-            activeid, _ = get_active_orders()
-            if isinstance(activeid, dict) and isinstance(activeid.get("data"), list):
-                orders = activeid["data"]
-                if not orders:
-                    print("No hay órdenes activas para cancelar.")
+            print("\n=== Ver orden por ID ===")
+            order_id = input("Introduce el ID de la orden: ").strip()
+
+            if not order_id:
+                print("ID vacío. Operación abortada.")
+                continue
+
+            try:
+                resp, logs = get_order_by_id(order_id)
+
+                for l in logs:
+                    log_event(f"[LOG] {l['msg']}", "info")
+
+                if not resp:
+                    print("No se recibió respuesta del servidor.")
+                    log_event(f"[ERROR] Respuesta vacía al consultar la orden {order_id}.", "error")
                     continue
 
-                print("\nÓrdenes activas:")
-                for idx, o in enumerate(orders, 1):
-                    oid = o.get("id", "N/A")
-                    price = o.get("price", "N/A")
-                    side = o.get("side", "N/A").upper()
-                    print(f"{idx}. {side} {price} USDC (ID: {oid})")
+                if isinstance(resp, dict) and resp.get("error"):
+                    print(f"No se pudo encontrar la orden {order_id}: {resp.get('error')}")
+                    log_event(f"[ERROR] Consulta de orden {order_id}: {json.dumps(resp, indent=2, ensure_ascii=False)}", "error")
+                    continue
 
-                try:
-                    sel = int(input("Selecciona el número de la orden a cancelar: "))
-                    if 1 <= sel <= len(orders):
-                        order_to_cancel = orders[sel - 1]
-                        oid = order_to_cancel.get("id")
-                        if isinstance(oid, str):
-                            confirm = input(f"¿Confirmas cancelar la orden {oid}? (s/n): ").strip().lower()
-                            if confirm.startswith("s"):
-                                cancel_resp, cancel_logs = cancel_order(oid)
-                                for l in cancel_logs:
-                                    log_event(f"[LOG] {l['msg']}", "info")
-                                log_event(f"{json.dumps(cancel_resp, indent=2, ensure_ascii=False)}", "info")
-                            else:
-                                print("Cancelación abortada.")
-                        else:
-                            print("ID de orden no válido.")
-                    else:
-                        print("Selección fuera de rango.")
-                except ValueError:
-                    print("Entrada inválida. Debe ser un número.")
+                data = resp.get("data") if isinstance(resp, dict) else None
+                if not data:
+                    print(f"No existe una orden con ID {order_id}.")
+                    log_event(f"[WARNING] La orden {order_id} no existe o no devolvió datos.", "warning")
+                    if isinstance(resp, dict):
+                        log_event(f"{json.dumps(resp, indent=2, ensure_ascii=False)}", "warning")
+                    continue
+
+                log_event(f"{json.dumps(resp, indent=2, ensure_ascii=False)}", "info")
+
+            except Exception as exc:
+                log_event(f"[ERROR] No se pudo consultar la orden {order_id}: {exc}", "error")
+                print("No se pudo consultar la orden. Revisa el log.")
 
         # --------------------------------------------------
         # 7. Cancelar todas ordenes
