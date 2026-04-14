@@ -1,6 +1,9 @@
 [revolut]
 api_key = TU_API_KEY_AQUI
 
+[signing]
+private_pem_path = private.pem
+
 [telegram]
 enabled = true
 token   = TU_TOKEN_AQUI

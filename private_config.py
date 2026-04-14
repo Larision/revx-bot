@@ -6,13 +6,14 @@ Lee private_config.ini con el siguiente formato:
     [revolut]
     api_key = TU_API_KEY
 
+    [signing]
+    private_pem_path = private.pem
+
     [telegram]
     enabled = true
     token   = TU_TOKEN
     chat_id = 123456789
 
-Los archivos individuales (api.key, telegramapi.token, telegram_chatid.txt)
-siguen siendo compatibles como fallback si no existe private_config.ini.
 Si [telegram] enabled = false, el programa no cargará ni arrancará el bot.
 """
 
@@ -39,6 +40,19 @@ def get_revolut_api_key() -> Optional[str]:
     cfg = _load()
     val = cfg.get("revolut", "api_key", fallback=None)
     return val.strip() if val else None
+
+
+def get_signing_private_pem_path() -> Optional[Path]:
+    """Lee private_pem_path de [signing] en private_config.ini."""
+    cfg = _load()
+    val = cfg.get("signing", "private_pem_path", fallback=None)
+    if not val or not val.strip():
+        return None
+
+    path = Path(val.strip()).expanduser()
+    if not path.is_absolute():
+        path = PRIVATE_CONFIG_PATH.parent / path
+    return path
 
 
 def get_telegram_token() -> Optional[str]:
