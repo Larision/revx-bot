@@ -63,12 +63,29 @@ class GridEngine:
         self.last_fill_price: Optional[Decimal] = None  # último nivel ejecutado
         self.current_price: Optional[Decimal] = None  # último precio conocido
 
-        # Historial de fills en memoria para el submenú de monitorización
+        # Historial de fills REALES en memoria para el submenú de monitorización.
+        # No incluye activaciones de órdenes virtuales de trailing.
         # Cada entrada: {"side": str, "price": str, "order_id": str, "ts": float}
         self.fill_history: List[Dict[str, Any]] = []
 
-
         self._stop_event = threading.Event()
+
+    def _is_virtual_order(self, info: Optional["OrderInfo"]) -> bool:
+        """Retorna True si el snapshot corresponde a un centinela virtual."""
+        return bool(info) and info.get("order_id") == "virtual"
+
+    def _record_real_fill(self, price_key: str, info: "OrderInfo") -> None:
+        """
+        Registra solo fills reales del exchange en memoria y en fills.csv.
+        Las activaciones virtuales sirven para rebalancear, pero no cuentan como fill.
+        """
+        self.fill_history.append({
+            "side": info["side"],
+            "price": price_key,
+            "order_id": info["order_id"],
+            "ts": time.time(),
+        })
+        log_fill(info["side"], price_key, fmt_amount(self.base_size))
 
     # ----------------------------------------------------------
     # STATE
@@ -397,7 +414,8 @@ class GridEngine:
         Detecta órdenes ejecutadas consultando el historial de filled.
 
         Lógica por cada orden en active_orders:
-          - Orden virtual: se compara precio con mercado.
+          - Orden virtual: se compara precio con mercado; si se activa, rebalancea,
+            pero NO se registra como fill real en métricas.
           - Aparece en historial filled  → ejecutada, rebalancear.
           - No aparece en filled ni en activas, y tiene más de 30s → se mira order by id y se decide segun el status.
           - Sigue en activas, o tiene menos de 30s → ignorar.
@@ -765,21 +783,22 @@ class GridEngine:
                 filled, _ = self.detect_fills(current_price)
 
                 if filled:
-                    # Fase 1: registrar historial, guardar snapshot y eliminar todos los fills
-                    # antes de rebalancear, para que cada rebalance vea el estado limpio
+                    # Fase 1: guardar snapshot y eliminar todos los fills/activaciones
+                    # antes de rebalancear, para que cada rebalance vea el estado limpio.
+                    # Solo los fills REALES se registran en fill_history y fills.csv.
                     fill_snapshots: Dict[str, "OrderInfo"] = {}
                     for key in filled:
                         info = self.active_orders.get(key)
                         if info:
                             fill_snapshots[key] = info
-                            log_event(f"[ENGINE] Orden ejecutada: {info['order_id']}")
-                            self.fill_history.append({
-                                "side":     info["side"],
-                                "price":    key,
-                                "order_id": info["order_id"],
-                                "ts":       time.time(),
-                            })
-                            log_fill(info["side"], key, fmt_amount(self.base_size))
+                            if self._is_virtual_order(info):
+                                log_event(
+                                    f"[ENGINE] Activación virtual detectada en {key} "
+                                    f"({info['side']}) - se rebalancea sin registrar fill real"
+                                )
+                            else:
+                                log_event(f"[ENGINE] Orden ejecutada: {info['order_id']}")
+                                self._record_real_fill(key, info)
                             del self.active_orders[key]
 
                     # Fase 2: rebalancear en orden correcto
