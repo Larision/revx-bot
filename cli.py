@@ -196,6 +196,7 @@ def exportar_trades_menu():
 
 def exportar_candles_menu():
     print("\n=== Obtener y exportar histórico de candles ===")
+    print("\n=== Maximo intervalo permitido = 50000 candles (ej: 1 mes con 1 min) ===")
 
     symbol = input(f"Symbol [{SYMBOL}]: ").strip() or SYMBOL
 
@@ -209,18 +210,50 @@ def exportar_candles_menu():
         except ValueError:
             print("Intervalo inválido.")
 
+    from datetime import datetime, timezone
+
+    def _parse_date_to_ms(date_str: str, end_of_day: bool = False) -> int:
+        """
+        Convierte YYYYMMDD a timestamp ms en UTC.
+        Si end_of_day=True → 23:59:59.999
+        """
+        dt = datetime.strptime(date_str, "%Y%m%d")
+
+        if end_of_day:
+            dt = dt.replace(hour=23, minute=59, second=59, microsecond=999000)
+        else:
+            dt = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        return int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+
+    # Fecha inicio
     while True:
-        dias = input("Días atrás desde hoy: ").strip()
+        start_str = input("Fecha inicio (YYYYMMDD): ").strip()
         try:
-            dias = int(dias)
-            if dias < 1:
-                raise ValueError
+            since = _parse_date_to_ms(start_str)
             break
         except ValueError:
-            print("Introduce un número válido >= 1")
+            print("Formato inválido. Usa YYYYMMDD (ej: 20260415)")
 
-    now = int(time.time() * 1000)
-    since = now - dias * 24 * 60 * 60 * 1000
+    # Fecha fin (default = ahora)
+    while True:
+        end_str = input("Fecha fin (YYYYMMDD) [hoy]: ").strip()
+
+        if not end_str:
+            now = int(time.time() * 1000)
+            until = now
+            break
+
+        try:
+            until = _parse_date_to_ms(end_str, end_of_day=True)
+            break
+        except ValueError:
+            print("Formato inválido. Usa YYYYMMDD (ej: 20260415)")
+    
+    if since > until:
+        print("La fecha de inicio no puede ser mayor que la fecha de fin.")
+        return
 
     from api import get_candles
 
@@ -244,7 +277,8 @@ def exportar_candles_menu():
         print("No hay datos.")
         return
 
-    filename = Path(f"candles-{symbol}-{interval}-{dias}d.csv")
+    end_label = end_str if end_str else "now"
+    filename = Path(f"candles-{symbol}-{interval}-{start_str}_to_{end_label}.csv")
 
     with filename.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
