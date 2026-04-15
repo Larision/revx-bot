@@ -31,6 +31,7 @@ from api import (
     get_current_price,
     get_historical_orders,
     get_order_by_id,
+    place_order as api_place_order,
 )
 
 
@@ -63,12 +64,12 @@ class GridEngine:
         self.last_fill_price: Optional[Decimal] = None  # último nivel ejecutado
         self.current_price: Optional[Decimal] = None  # último precio conocido
 
-        # Historial de fills REALES en memoria para el submenú de monitorización.
-        # No incluye activaciones de órdenes virtuales de trailing.
+        # Historial de fills en memoria para el submenú de monitorización
         # Cada entrada: {"side": str, "price": str, "order_id": str, "ts": float}
         self.fill_history: List[Dict[str, Any]] = []
 
         self._stop_event = threading.Event()
+        self._state_lock = threading.RLock()
 
     def _is_virtual_order(self, info: Optional["OrderInfo"]) -> bool:
         """Retorna True si el snapshot corresponde a un centinela virtual."""
@@ -88,15 +89,19 @@ class GridEngine:
         log_fill(info["side"], price_key, fmt_amount(self.base_size))
 
     # ----------------------------------------------------------
-    # STATE
+    # SNAPSHOTS / THREAD SAFETY
     # ----------------------------------------------------------
 
-    def save_state(self) -> None:
-        """
-        Persiste el estado actual del motor en STATE_PATH (grid_state.json).
-        Se llama automáticamente tras cada cambio relevante.
-        """
-        state = {
+    def _clone_order_info(self, info: OrderInfo) -> OrderInfo:
+        return {
+            "side": str(info["side"]),
+            "order_id": str(info["order_id"]),
+            "price": info["price"],
+            "placed_at": float(info["placed_at"]),
+        }
+
+    def _build_state_snapshot_locked(self) -> Dict[str, Any]:
+        return {
             "version": VERSION,
             "steps_each_side": self.steps_each_side,
             "levels_below": self.levels_below,
@@ -105,7 +110,7 @@ class GridEngine:
             "base_size": str(self.base_size),
             "center_price": str(self.center_price) if self.center_price else None,
             "step": str(self.step) if self.step else None,
-            "levels": [str(l) for l in self.levels],
+            "levels": [str(level) for level in self.levels],
             "active_orders": {
                 key: {
                     "side": info["side"],
@@ -119,6 +124,124 @@ class GridEngine:
             "last_fill_price": str(self.last_fill_price) if self.last_fill_price is not None else None,
             "saved_at": int(time.time()),
         }
+
+    def get_runtime_snapshot(self, *, fill_history_limit: Optional[int] = None) -> Dict[str, Any]:
+        with self._state_lock:
+            history = self.fill_history
+            if fill_history_limit is not None:
+                history = history[-fill_history_limit:]
+
+            return {
+                "center_price": self.center_price,
+                "step": self.step,
+                "current_price": self.current_price,
+                "last_fill_side": self.last_fill_side,
+                "last_fill_price": self.last_fill_price,
+                "base_size": self.base_size,
+                "levels": list(self.levels),
+                "active_orders": {
+                    key: self._clone_order_info(info)
+                    for key, info in self.active_orders.items()
+                },
+                "fill_history": [dict(entry) for entry in history],
+            }
+
+    def get_order_info(self, key: str) -> Optional[OrderInfo]:
+        with self._state_lock:
+            info = self.active_orders.get(key)
+            if info is None:
+                return None
+            return self._clone_order_info(info)
+
+    def place_manual_order(
+        self,
+        price: Decimal,
+        side: str,
+        base_size: Optional[Decimal] = None,
+    ) -> Tuple[Optional[str], List[LogEntry], Optional[str]]:
+        size = Decimal(str(base_size)) if base_size is not None else self.base_size
+        key = _price_key(price)
+
+        with self._state_lock:
+            existing = self.active_orders.get(key)
+            if existing is not None:
+                existing_oid = str(existing["order_id"])
+                return None, [], (
+                    f"El nivel {key} ya tiene una orden {str(existing['side']).upper()} "
+                    f"({existing_oid[:8]}...)."
+                )
+
+            self.active_orders[key] = {
+                "side": side,
+                "order_id": "pending_manual",
+                "price": price,
+                "placed_at": time.time(),
+            }
+
+        order_id, logs = api_place_order(side, price, size)
+
+        if not order_id:
+            with self._state_lock:
+                current = self.active_orders.get(key)
+                if current is not None and current["order_id"] == "pending_manual":
+                    del self.active_orders[key]
+            return None, logs, None
+
+        with self._state_lock:
+            self.active_orders[key] = {
+                "side": side,
+                "order_id": order_id,
+                "price": price,
+                "placed_at": time.time(),
+            }
+
+        self.save_state()
+        return order_id, logs, None
+
+    def cancel_order_by_key(
+        self,
+        key: str,
+        expected_order_id: Optional[str] = None,
+    ) -> Tuple[bool, List[LogEntry], Optional[str]]:
+        info = self.get_order_info(key)
+        if info is None:
+            return False, [], f"No hay orden en {key}."
+
+        order_id = str(info["order_id"])
+        if expected_order_id is not None and order_id != expected_order_id:
+            return False, [], f"La orden en {key} cambió antes de confirmar la cancelación."
+
+        if order_id in {"virtual", "pending_post_only", "pending_manual"}:
+            return False, [], f"La orden en {key} no existe todavía en el exchange."
+
+        response, logs = self.cancel_order(order_id)
+        if isinstance(response, dict) and response.get("error"):
+            return False, logs, f"No se pudo cancelar la orden en {key}."
+
+        removed = False
+        with self._state_lock:
+            current = self.active_orders.get(key)
+            if current is not None and current["order_id"] == order_id:
+                del self.active_orders[key]
+                removed = True
+
+        if removed:
+            self.save_state()
+
+        return True, logs, None
+
+    # ----------------------------------------------------------
+    # STATE
+    # ----------------------------------------------------------
+
+    def save_state(self) -> None:
+        """
+        Persiste el estado actual del motor en STATE_PATH (grid_state.json).
+        Se llama automáticamente tras cada cambio relevante.
+        """
+        with self._state_lock:
+            state = self._build_state_snapshot_locked()
+
         try:
             STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
         except Exception as e:
@@ -137,43 +260,57 @@ class GridEngine:
             raw = json.loads(STATE_PATH.read_text(encoding="utf-8"))
 
             raw_steps = int(raw.get("steps_each_side", 0))
-            self.levels_below = int(raw.get("levels_below", raw_steps))
-            self.levels_above = int(raw.get("levels_above", raw_steps))
-            self.steps_each_side = raw_steps or max(self.levels_below, self.levels_above)
-            self.step_percent    = Decimal(raw["step_percent"])
-            self.base_size       = Decimal(raw["base_size"])
-            self.center_price    = Decimal(raw["center_price"]) if raw.get("center_price") else None
-            self.step            = Decimal(raw["step"]) if raw.get("step") else None
-            self.levels          = [Decimal(l) for l in raw.get("levels", [])]
-            self.active_orders   = {
+            levels_below = int(raw.get("levels_below", raw_steps))
+            levels_above = int(raw.get("levels_above", raw_steps))
+            steps_each_side = raw_steps or max(levels_below, levels_above)
+            step_percent = Decimal(raw["step_percent"])
+            base_size = Decimal(raw["base_size"])
+            center_price = Decimal(raw["center_price"]) if raw.get("center_price") else None
+            step = Decimal(raw["step"]) if raw.get("step") else None
+            levels = [Decimal(level) for level in raw.get("levels", [])]
+            active_orders = {
                 key: {
-                    "side":      info["side"],
-                    "order_id":  info["order_id"],
-                    "price":     Decimal(info["price"]),
-                    "placed_at": float(info.get("placed_at", 0)),  # 0 = sin gracia (estado antiguo)
+                    "side": info["side"],
+                    "order_id": info["order_id"],
+                    "price": Decimal(info["price"]),
+                    "placed_at": float(info.get("placed_at", 0)),
                 }
                 for key, info in raw.get("active_orders", {}).items()
             }
-            self.last_fill_side = raw.get("last_fill_side")
-            self.last_fill_price = (
+            last_fill_side = raw.get("last_fill_side")
+            last_fill_price = (
                 Decimal(raw["last_fill_price"])
                 if raw.get("last_fill_price") is not None else None
             )
-            if self.last_fill_price is None:
+
+            if last_fill_price is None:
                 missing_levels = [
-                    level for level in self.levels
-                    if _price_key(level) not in self.active_orders
+                    level for level in levels
+                    if _price_key(level) not in active_orders
                 ]
                 if len(missing_levels) == 1:
-                    self.last_fill_price = missing_levels[0]
+                    last_fill_price = missing_levels[0]
+
+            with self._state_lock:
+                self.levels_below = levels_below
+                self.levels_above = levels_above
+                self.steps_each_side = steps_each_side
+                self.step_percent = step_percent
+                self.base_size = base_size
+                self.center_price = center_price
+                self.step = step
+                self.levels = levels
+                self.active_orders = active_orders
+                self.last_fill_side = last_fill_side
+                self.last_fill_price = last_fill_price
 
             saved_at = raw.get("saved_at", 0)
-            age_min  = (time.time() - saved_at) / 60
+            age_min = (time.time() - saved_at) / 60
             log_event(
                 f"[STATE] Estado recuperado de {STATE_PATH} "
                 f"(guardado hace {age_min:.1f} min, "
-                f"{len(self.active_orders)} órdenes, "
-                f"{len(self.levels)} niveles)",
+                f"{len(active_orders)} órdenes, "
+                f"{len(levels)} niveles)",
                 "info"
             )
             return True
@@ -241,17 +378,22 @@ class GridEngine:
 
         price = self._resolve_initial_price()
 
-        self.center_price = price
-        self.step = (price * self.step_percent).quantize(TICK_SIZE, rounding=ROUND_DOWN)
-        self.levels = []
+        center_price = price
+        step = (price * self.step_percent).quantize(TICK_SIZE, rounding=ROUND_DOWN)
+        levels: List[Decimal] = []
 
         for i in range(-self.levels_below, self.levels_above + 1):
-            lvl = (price + (Decimal(i) * self.step)).quantize(TICK_SIZE, rounding=ROUND_DOWN)
-            self.levels.append(lvl)
+            lvl = (price + (Decimal(i) * step)).quantize(TICK_SIZE, rounding=ROUND_DOWN)
+            levels.append(lvl)
 
-        self.levels = sorted(set(self.levels))
+        levels = sorted(set(levels))
 
-        ok, _ = check_balances_for_grid(self.base_size, self.levels, center_price=self.center_price)
+        with self._state_lock:
+            self.center_price = center_price
+            self.step = step
+            self.levels = levels
+
+        ok, _ = check_balances_for_grid(self.base_size, levels, center_price=center_price)
         if not ok:
             raise RuntimeError("Saldos insuficientes para inicializar grid.")
 
@@ -303,6 +445,7 @@ class GridEngine:
         resp, _ = send_request("POST", "/api/1.0/orders", body=body)
 
         order_id: Optional[str] = None
+        state: Optional[str] = None
         if isinstance(resp, dict):
             data = resp.get("data")
             if isinstance(data, dict):
@@ -311,14 +454,16 @@ class GridEngine:
                 if isinstance(venue, str):
                     order_id = venue
 
+        key = _price_key(price)
+
         if state == "rejected":
-            key = _price_key(price)
-            self.active_orders[key] = {
-                "side":      side,
-                "order_id":  "pending_post_only",
-                "price":     price,
-                "placed_at": time.time(),
-            }
+            with self._state_lock:
+                self.active_orders[key] = {
+                    "side": side,
+                    "order_id": "pending_post_only",
+                    "price": price,
+                    "placed_at": time.time(),
+                }
             log_event(
                 f"[ENGINE] Orden {side} en {_price_key(price)} rechazada por post_only "
                 f"(venue_order_id: {order_id}) — nivel marcado como latente",
@@ -327,18 +472,20 @@ class GridEngine:
             _notify(f"⏳ Orden latente\n{side.upper()} en {_price_key(price)} — esperando lado correcto")
             self.save_state()
             return
+
         if order_id is None:
             log_event(f"[ENGINE] No se encontró venue_order_id en respuesta {resp}", "error")
             _notify(f"❌ Error colocando orden {side.upper()} en {_price_key(price)}")
             return
 
-        key = _price_key(price)
-        self.active_orders[key] = {
-            "side":      side,
-            "order_id":  order_id,
-            "price":     price,
-            "placed_at": time.time(),
-        }
+        with self._state_lock:
+            self.active_orders[key] = {
+                "side": side,
+                "order_id": order_id,
+                "price": price,
+                "placed_at": time.time(),
+            }
+
         log_event(f"[ENGINE] Orden {side} registrada en {_price_key(price)} -> {order_id}")
         self.save_state()
 
@@ -352,7 +499,13 @@ class GridEngine:
         if self.step is None:
             return False
 
+        key = _price_key(price)
+
         for attempt in range(1, max_retries + 1):
+            with self._state_lock:
+                if key in self.active_orders:
+                    return False
+
             balances_resp, _ = get_all_balances()
             usdc_balance, btc_balance = _parse_balances(balances_resp)
 
@@ -397,7 +550,8 @@ class GridEngine:
 
             # Saldo OK en este intento
             self.place_order(price, side)
-            return _price_key(price) in self.active_orders
+            with self._state_lock:
+                return key in self.active_orders
 
         return False  # nunca debería llegar aquí, pero por seguridad
 
@@ -431,16 +585,22 @@ class GridEngine:
                 log_event(f"[DETECT_FILLS] {l['msg']}", l["level"], logs)
 
         # Pide historico de ordenes para detectar fills confirmados
-        hist_limit = len(self.active_orders) + 50
+        with self._state_lock:
+            active_orders_snapshot = {
+                key: self._clone_order_info(info)
+                for key, info in self.active_orders.items()
+            }
+
+        hist_limit = len(active_orders_snapshot) + 50
         hist_resp, hist_logs = get_historical_orders(limit=hist_limit)
         for l in hist_logs:
             log_event(f"[DETECT_FILLS] {l['msg']}", l["level"], logs)
 
-        confirmed_filled_ids: set = set()
+        confirmed_filled_ids: set[str] = set()
         if isinstance(hist_resp, dict) and isinstance(hist_resp.get("data"), list):
-            for o in hist_resp["data"]:
-                oid = o.get("id")
-                if isinstance(oid, str) and o.get("status") == "filled":
+            for order in hist_resp["data"]:
+                oid = order.get("id")
+                if isinstance(oid, str) and order.get("status") == "filled":
                     confirmed_filled_ids.add(oid)
         
         # Pide ordenes activas a la API para detectar inconsistencias (órdenes desaparecidas que no están en self.active_orders).
@@ -448,18 +608,19 @@ class GridEngine:
         for l in active_logs:
             log_event(f"[DETECT_FILLS] {l['msg']}", l["level"], logs)
 
-        current_api_ids: set = set()
+        current_api_ids: set[str] = set()
         if isinstance(active_api_resp, dict) and isinstance(active_api_resp.get("data"), list):
-            for o in active_api_resp["data"]:
-                oid = o.get("id")
+            for order in active_api_resp["data"]:
+                oid = order.get("id")
                 if isinstance(oid, str):
                     current_api_ids.add(oid)
         
         # Compara self.active.orders con los datos obtenidos para detectar fills confirmados, cancelaciones externas u otras inconsistencias
         # y actualiza self.active_orders para reflejar las actualizaciones.
         filled_keys: List[str] = []
+        state_changed = False
 
-        for key, info in list(self.active_orders.items()):
+        for key, info in active_orders_snapshot.items():
             oid = info.get("order_id")
             oside = info["side"]
             if not isinstance(oid, str):
@@ -469,10 +630,10 @@ class GridEngine:
             if oid == "virtual":
                 if current_price is not None:
                     v_price = info["price"]
-                    v_side  = info["side"]
+                    v_side = info["side"]
                     triggered = (
                         (v_side == "sell" and current_price >= v_price) or
-                        (v_side == "buy"  and current_price <= v_price)
+                        (v_side == "buy" and current_price <= v_price)
                     )
                     if triggered:
                         filled_keys.append(key)
@@ -483,13 +644,15 @@ class GridEngine:
                         )
                 continue  # las virtuales nunca son cancelación externa
 
-            # Orden latente -- esperando lado correcto para reintentar post_only
+            if oid == "pending_manual":
+                continue
+
             if oid == "pending_post_only":
                 if current_price is not None:
                     lvl_price = info["price"]
                     can_place = (
                         (oside == "sell" and current_price < lvl_price) or
-                        (oside == "buy"  and current_price > lvl_price)
+                        (oside == "buy" and current_price > lvl_price)
                     )
                     if can_place:
                         log_event(
@@ -497,79 +660,98 @@ class GridEngine:
                             f"(precio actual {_price_key(current_price)})",
                             "info", logs
                         )
-                        del self.active_orders[key]
-                        self._place_order_safe(lvl_price, oside)
-                continue  # nunca cuenta como fill ni cancelación externa
+                        should_retry = False
+                        with self._state_lock:
+                            current = self.active_orders.get(key)
+                            if current is not None and current["order_id"] == "pending_post_only":
+                                del self.active_orders[key]
+                                state_changed = True
+                                should_retry = True
+                        if should_retry:
+                            self._place_order_safe(lvl_price, oside)
+                continue
 
             if oid in confirmed_filled_ids:
                 filled_keys.append(key)
                 log_event(f"[DETECT_FILLS] {oside} confirmado para {key} (order_id: {oid})", "info", logs)
+                continue
 
-            elif oid not in current_api_ids:
-                age = time.time() - info.get("placed_at", 0)
-                if age < EXTERNAL_CANCEL_GRACE:
-                    # Demasiado reciente — puede que la API aún no la haya propagado
-                    continue
+            if oid in current_api_ids:
+                continue
 
-                # Confirmar estado real con get_order_by_id antes de decidir
-                TERMINAL_STATES  = {"cancelled", "rejected", "replaced"}
-                ACTIVE_STATES    = {"pending_new", "new", "partially_filled"}
-                MAX_RETRIES      = 3
-                RETRY_DELAY      = 2  # segundos
+            age = time.time() - info.get("placed_at", 0)
+            if age < EXTERNAL_CANCEL_GRACE:
+                continue
 
-                confirmed_status: Optional[str] = None
-                for attempt in range(1, MAX_RETRIES + 1):
-                    order_resp, order_logs = get_order_by_id(oid)
-                    for l in order_logs:
-                        log_event(f"[DETECT_FILLS] {l['msg']}", l["level"], logs)
+            ACTIVE_STATES = {"pending_new", "new", "partially_filled"}
+            MAX_RETRIES = 3
+            RETRY_DELAY = 2
 
-                    if isinstance(order_resp, dict) and not order_resp.get("error"):
-                        data = order_resp.get("data", {})
-                        confirmed_status = data.get("status")
-                        break
+            confirmed_status: Optional[str] = None
+            for attempt in range(1, MAX_RETRIES + 1):
+                order_resp, order_logs = get_order_by_id(oid)
+                for l in order_logs:
+                    log_event(f"[DETECT_FILLS] {l['msg']}", l["level"], logs)
 
-                    log_event(
-                        f"[DETECT_FILLS] get_order_by_id intento {attempt}/{MAX_RETRIES} "
-                        f"fallido para {oid} — reintentando en {RETRY_DELAY}s",
-                        "warning", logs
-                    )
-                    if attempt < MAX_RETRIES:
-                        time.sleep(RETRY_DELAY)
+                if isinstance(order_resp, dict) and not order_resp.get("error"):
+                    data = order_resp.get("data", {})
+                    confirmed_status = data.get("status")
+                    break
 
-                if confirmed_status == "rejected":
-                    self.active_orders[key]["order_id"] = "pending_post_only"
-                    self.active_orders[key]["placed_at"] = time.time()
-                    log_event(
-                        f"[DETECT_FILLS] Orden {oside} {key} (order_id: {oid}) rechazada (post_only) "
-                        f"— nivel marcado como latente",
-                        "warning", logs
-                    )
-                elif confirmed_status in {"cancelled", "replaced"}:
-                    log_event(
-                        f"[DETECT_FILLS] Orden {oside} {key} (order_id: {oid}) confirmada como "
-                        f"'{confirmed_status}' — cancelación externa. Se elimina sin rebalancear.",
-                        "warning", logs
-                    )
-                    del self.active_orders[key]
+                log_event(
+                    f"[DETECT_FILLS] get_order_by_id intento {attempt}/{MAX_RETRIES} "
+                    f"fallido para {oid} — reintentando en {RETRY_DELAY}s",
+                    "warning", logs
+                )
+                if attempt < MAX_RETRIES:
+                    time.sleep(RETRY_DELAY)
 
-                elif confirmed_status == "filled":
-                    log_event(
-                        f"[DETECT_FILLS] Orden {oside} {key} (order_id: {oid}) confirmada como "
-                        f"'filled' vía get_order_by_id — añadida a fills.",
-                        "info", logs
-                    )
-                    filled_keys.append(key)
+            if confirmed_status == "rejected":
+                with self._state_lock:
+                    current = self.active_orders.get(key)
+                    if current is not None and current["order_id"] == oid:
+                        current["order_id"] = "pending_post_only"
+                        current["placed_at"] = time.time()
+                        state_changed = True
+                log_event(
+                    f"[DETECT_FILLS] Orden {oside} {key} (order_id: {oid}) rechazada (post_only) "
+                    f"— nivel marcado como latente",
+                    "warning", logs
+                )
 
-                elif confirmed_status in ACTIVE_STATES:
-                    pass  # orden sigue viva, ignorar en silencio
+            elif confirmed_status in {"cancelled", "replaced"}:
+                log_event(
+                    f"[DETECT_FILLS] Orden {oside} {key} (order_id: {oid}) confirmada como "
+                    f"'{confirmed_status}' — cancelación externa. Se elimina sin rebalancear.",
+                    "warning", logs
+                )
+                with self._state_lock:
+                    current = self.active_orders.get(key)
+                    if current is not None and current["order_id"] == oid:
+                        del self.active_orders[key]
+                        state_changed = True
 
-                else:
-                    # No se pudo confirmar tras MAX_RETRIES intentos
-                    log_event(
-                        f"[DETECT_FILLS] No se pudo confirmar estado de {oside} {key} (order_id: {oid}) "
-                        f"tras {MAX_RETRIES} intentos (status: {confirmed_status!r}) — conservando orden.",
-                        "warning", logs
-                    )
+            elif confirmed_status == "filled":
+                log_event(
+                    f"[DETECT_FILLS] Orden {oside} {key} (order_id: {oid}) confirmada como "
+                    f"'filled' vía get_order_by_id — añadida a fills.",
+                    "info", logs
+                )
+                filled_keys.append(key)
+
+            elif confirmed_status in ACTIVE_STATES:
+                pass  # orden sigue viva, ignorar en silencio
+
+            else:
+                # No se pudo confirmar tras MAX_RETRIES intentos
+                log_event(
+                    f"[DETECT_FILLS] No se pudo confirmar estado de {oside} {key} (order_id: {oid}) "
+                    f"tras {MAX_RETRIES} intentos (status: {confirmed_status!r}) — conservando orden.",
+                    "warning", logs
+                )
+
+        if state_changed:
+            self.save_state()
 
         return filled_keys, logs
 
@@ -591,95 +773,116 @@ class GridEngine:
           - SELL intermedio        → coloca BUY un step abajo.
         """
 
-        side:  str     = info["side"]
+        side: str = info["side"]
         price: Decimal = info["price"]
 
-        self.last_fill_side = side
-        self.last_fill_price = price
+        cancel_order_id: Optional[str] = None
+        cancel_level_key: Optional[str] = None
+        order_to_place: Optional[Tuple[Decimal, str]] = None
+        virtual_order_to_add: Optional[Tuple[str, OrderInfo]] = None
+        trailing_log: Optional[str] = None
 
-        levels_snapshot = sorted(set(self.levels))
-        lowest   = min(levels_snapshot)
-        highest  = max(levels_snapshot)
-        max_levels = self.levels_below + self.levels_above + 2
+        with self._state_lock:
+            self.last_fill_side = side
+            self.last_fill_price = price
 
-        if self.step is None:
-            log_event("[ENGINE] step es None", "error")
-            return
+            if self.step is None or not self.levels:
+                log_event("[ENGINE] step es None o no hay niveles para rebalancear", "error")
+                return
 
-        # CASO 1: BUY en nivel más bajo — trailing down
-        if side == "buy" and price == lowest:
-            trail_down_price = (price - self.step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
-            self.levels.append(trail_down_price)
+            step = self.step
+            levels_snapshot = sorted(set(self.levels))
+            lowest = min(levels_snapshot)
+            highest = max(levels_snapshot)
+            max_levels = self.levels_below + self.levels_above + 2
 
-            if len(self.levels) > max_levels:
-                self.levels.remove(highest)
-                highest_key = _price_key(highest)
-                if highest_key in self.active_orders:
-                    oid = self.active_orders[highest_key]["order_id"]
-                    if oid != "virtual":
-                        log_event(f"[ENGINE] Cancelando orden en {highest_key} ({oid}) — nivel eliminado por trailing down", "info")
-                        self.cancel_order(oid)
-                    del self.active_orders[highest_key]
+            if side == "buy" and price == lowest:
+                trail_down_price = (price - step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
+                self.levels.append(trail_down_price)
 
-            new_sell_price = (price + self.step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
-            self._place_order_safe(new_sell_price, "sell")
+                if len(self.levels) > max_levels:
+                    self.levels.remove(highest)
+                    highest_key = _price_key(highest)
+                    removed = self.active_orders.pop(highest_key, None)
+                    if removed is not None and removed["order_id"] not in {"virtual", "pending_post_only", "pending_manual"}:
+                        cancel_order_id = str(removed["order_id"])
+                        cancel_level_key = highest_key
 
-            trail_down_key = _price_key(trail_down_price)
-            if trail_down_key not in self.active_orders:
-                self.active_orders[trail_down_key] = {
-                    "side":      "buy",
-                    "order_id":  "virtual",
-                    "price":     trail_down_price,
-                    "placed_at": time.time(),
-                }
-                log_event(f"[ENGINE] Orden virtual BUY registrada en {trail_down_key} (centinela de suelo)", "info")
+                order_to_place = ((price + step).quantize(TICK_SIZE, rounding=ROUND_DOWN), "sell")
+                trail_down_key = _price_key(trail_down_price)
+                if trail_down_key not in self.active_orders:
+                    virtual_order_to_add = (
+                        trail_down_key,
+                        {
+                            "side": "buy",
+                            "order_id": "virtual",
+                            "price": trail_down_price,
+                            "placed_at": time.time(),
+                        },
+                    )
 
-            log_event(f"[ENGINE] Rebalance trailing down: grid extendido a {_price_key(trail_down_price)}", "info")
+                trailing_log = f"[ENGINE] Rebalance trailing down: grid extendido a {_price_key(trail_down_price)}"
 
-        # CASO 2: SELL en nivel más alto — trailing up
-        elif side == "sell" and price == highest:
-            trail_up_price = (price + self.step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
-            self.levels.append(trail_up_price)
+            elif side == "sell" and price == highest:
+                trail_up_price = (price + step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
+                self.levels.append(trail_up_price)
 
-            if len(self.levels) > max_levels:
-                self.levels.remove(lowest)
-                lowest_key = _price_key(lowest)
-                if lowest_key in self.active_orders:
-                    oid = self.active_orders[lowest_key]["order_id"]
-                    if oid != "virtual":
-                        log_event(f"[ENGINE] Cancelando orden en {lowest_key} ({oid}) — nivel eliminado por trailing up", "info")
-                        self.cancel_order(oid)
-                    del self.active_orders[lowest_key]
+                if len(self.levels) > max_levels:
+                    self.levels.remove(lowest)
+                    lowest_key = _price_key(lowest)
+                    removed = self.active_orders.pop(lowest_key, None)
+                    if removed is not None and removed["order_id"] not in {"virtual", "pending_post_only", "pending_manual"}:
+                        cancel_order_id = str(removed["order_id"])
+                        cancel_level_key = lowest_key
 
-            new_buy_price = (price - self.step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
-            self._place_order_safe(new_buy_price, "buy")
+                order_to_place = ((price - step).quantize(TICK_SIZE, rounding=ROUND_DOWN), "buy")
+                trail_up_key = _price_key(trail_up_price)
+                if trail_up_key not in self.active_orders:
+                    virtual_order_to_add = (
+                        trail_up_key,
+                        {
+                            "side": "sell",
+                            "order_id": "virtual",
+                            "price": trail_up_price,
+                            "placed_at": time.time(),
+                        },
+                    )
 
-            trail_up_key = _price_key(trail_up_price)
-            if trail_up_key not in self.active_orders:
-                self.active_orders[trail_up_key] = {
-                    "side":      "sell",
-                    "order_id":  "virtual",
-                    "price":     trail_up_price,
-                    "placed_at": time.time(),
-                }
-                log_event(f"[ENGINE] Orden virtual SELL registrada en {trail_up_key} (centinela de techo)", "info")
+                trailing_log = f"[ENGINE] Rebalance trailing up: grid extendido a {_price_key(trail_up_price)}"
 
-            log_event(f"[ENGINE] Rebalance trailing up: grid extendido a {_price_key(trail_up_price)}", "info")
+            elif side == "buy":
+                order_to_place = ((price + step).quantize(TICK_SIZE, rounding=ROUND_DOWN), "sell")
 
-        # CASO 3: BUY intermedio
-        elif side == "buy":
-            new_price = (price + self.step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
-            self._place_order_safe(new_price, "sell")
+            elif side == "sell":
+                order_to_place = ((price - step).quantize(TICK_SIZE, rounding=ROUND_DOWN), "buy")
 
-        # CASO 4: SELL intermedio
-        elif side == "sell":
-            new_price = (price - self.step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
-            self._place_order_safe(new_price, "buy")
+            self.levels = sorted(set(self.levels))
 
-        self.levels = sorted(set(self.levels))
+        if cancel_order_id is not None and cancel_level_key is not None:
+            log_event(
+                f"[ENGINE] Cancelando orden en {cancel_level_key} ({cancel_order_id}) — nivel eliminado por rebalance",
+                "info"
+            )
+            self.cancel_order(cancel_order_id)
+
+        if order_to_place is not None:
+            self._place_order_safe(order_to_place[0], order_to_place[1])
+
+        if virtual_order_to_add is not None:
+            virtual_key, virtual_info = virtual_order_to_add
+            with self._state_lock:
+                if virtual_key not in self.active_orders:
+                    self.active_orders[virtual_key] = virtual_info
+            log_event(
+                f"[ENGINE] Orden virtual {str(virtual_info['side']).upper()} registrada en {virtual_key}",
+                "info"
+            )
+
+        if trailing_log:
+            log_event(trailing_log, "info")
+
         log_event(f"[ENGINE] Rebalance completado tras fill en {filled_price_key}")
         self.save_state()
-
 
     def stop(self) -> None:
         """Señaliza al loop principal que debe detenerse limpiamente."""
@@ -705,38 +908,45 @@ class GridEngine:
         Esto evita recrear una orden justo en el último fill si el precio oscila
         ligeramente antes de ejecutar la recuperación.
         """
-        if self.step is None:
+        snapshot = self.get_runtime_snapshot()
+        step = snapshot["step"]
+        if step is None:
             return
 
-        levels_sorted = sorted(self.levels)
+        levels_sorted = sorted(snapshot["levels"])
+        active_orders = snapshot["active_orders"]
+        last_fill_price = snapshot["last_fill_price"]
+        last_fill_side = snapshot["last_fill_side"]
+
         skip_level: Optional[Decimal] = None
         skip_reason = "heurística"
 
-        if self.last_fill_price is not None:
-            last_fill_level = self.last_fill_price.quantize(TICK_SIZE, rounding=ROUND_DOWN)
+        if last_fill_price is not None:
+            last_fill_level = last_fill_price.quantize(TICK_SIZE, rounding=ROUND_DOWN)
             last_fill_key = _price_key(last_fill_level)
-            if last_fill_level in levels_sorted and last_fill_key not in self.active_orders:
+            if last_fill_level in levels_sorted and last_fill_key not in active_orders:
                 skip_level = last_fill_level
                 skip_reason = "último fill"
 
         if skip_level is None:
-            if self.last_fill_side == "buy":
-                skip_level = next((l for l in levels_sorted if l > current_price), None)
-            elif self.last_fill_side == "sell":
-                skip_level = next((l for l in reversed(levels_sorted) if l < current_price), None)
+            if last_fill_side == "buy":
+                skip_level = next((level for level in levels_sorted if level > current_price), None)
+            elif last_fill_side == "sell":
+                skip_level = next((level for level in reversed(levels_sorted) if level < current_price), None)
             else:
-                skip_level = min(self.levels, key=lambda l: abs(l - current_price), default=None)
+                skip_level = min(levels_sorted, key=lambda level: abs(level - current_price), default=None)
 
         for level in levels_sorted:
             key = _price_key(level)
 
-            if key in self.active_orders:
-                continue
+            with self._state_lock:
+                if key in self.active_orders:
+                    continue
 
             if skip_level is not None and level == skip_level:
                 log_event(
                     f"[ENGINE] Nivel {key} dejado vacío intencionalmente "
-                    f"({skip_reason}, último fill: {self.last_fill_side or 'desconocido'})"
+                    f"({skip_reason}, último fill: {last_fill_side or 'desconocido'})"
                 )
                 continue
 
@@ -778,45 +988,49 @@ class GridEngine:
                     log_event("[ENGINE] No se pudo obtener precio actual, reintentando...", "warning")
                     continue
 
-                self.current_price = current_price  # exponer para el submenú
+                with self._state_lock:
+                    self.current_price = current_price
 
                 filled, _ = self.detect_fills(current_price)
 
                 if filled:
-                    # Fase 1: guardar snapshot y eliminar todos los fills/activaciones
-                    # antes de rebalancear, para que cada rebalance vea el estado limpio.
-                    # Solo los fills REALES se registran en fill_history y fills.csv.
-                    fill_snapshots: Dict[str, "OrderInfo"] = {}
-                    for key in filled:
-                        info = self.active_orders.get(key)
-                        if info:
-                            fill_snapshots[key] = info
-                            if self._is_virtual_order(info):
-                                log_event(
-                                    f"[ENGINE] Activación virtual detectada en {key} "
-                                    f"({info['side']}) - se rebalancea sin registrar fill real"
-                                )
-                            else:
-                                log_event(f"[ENGINE] Orden ejecutada: {info['order_id']}")
-                                self._record_real_fill(key, info)
+                    fill_snapshots: Dict[str, OrderInfo] = {}
+                    fill_log_entries: List[Tuple[str, str]] = []
+
+                    with self._state_lock:
+                        for key in filled:
+                            info = self.active_orders.get(key)
+                            if info is None:
+                                continue
+
+                            fill_snapshots[key] = self._clone_order_info(info)
+                            self.fill_history.append({
+                                "side": info["side"],
+                                "price": key,
+                                "order_id": info["order_id"],
+                                "ts": time.time(),
+                            })
+                            fill_log_entries.append((str(info["side"]), key))
                             del self.active_orders[key]
 
-                    # Fase 2: rebalancear en orden correcto
-                    # SELLs de menor a mayor precio (subida), BUYs de mayor a menor (bajada)
+                    for side, key in fill_log_entries:
+                        log_event(f"[ENGINE] Orden ejecutada: {fill_snapshots[key]['order_id']}")
+                        log_fill(side, key, fmt_amount(self.base_size))
+
                     sells = sorted(
-                        [(k, s) for k, s in fill_snapshots.items() if s["side"] == "sell"],
-                        key=lambda x: Decimal(x[0])
+                        [(key, snapshot) for key, snapshot in fill_snapshots.items() if snapshot["side"] == "sell"],
+                        key=lambda item: Decimal(item[0])
                     )
                     buys = sorted(
-                        [(k, s) for k, s in fill_snapshots.items() if s["side"] == "buy"],
-                        key=lambda x: Decimal(x[0]), reverse=True
+                        [(key, snapshot) for key, snapshot in fill_snapshots.items() if snapshot["side"] == "buy"],
+                        key=lambda item: Decimal(item[0]),
+                        reverse=True,
                     )
                     for key, snapshot in sells + buys:
                         self.rebalance_after_fill(key, snapshot)
 
                 now = time.time()
                 if now - last_recovery >= recovery_interval:
-                    # self.fill_empty_levels(current_price)
                     log_event(f"[ENGINE] Precio actual: {current_price}", "info")
                     last_recovery = now
 

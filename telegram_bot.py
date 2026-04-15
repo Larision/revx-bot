@@ -205,13 +205,15 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await message.reply_text("⚪ Engine no disponible.")
         return
 
-    price = f"{eng.current_price:.2f}" if eng.current_price else "N/A"
+    snapshot = eng.get_runtime_snapshot()
+    current_price = snapshot["current_price"]
+    price = f"{current_price:.2f}" if current_price else "N/A"
     lines = [
         "📊 *STATUS*",
         f"Precio actual : `{price} USDC`",
-        f"Órdenes activas: `{len(eng.active_orders)}`",
-        f"Fills sesión  : `{len(eng.fill_history)}`",
-        f"Último fill   : `{eng.last_fill_side or 'ninguno'}`",
+        f"Órdenes activas: `{len(snapshot['active_orders'])}`",
+        f"Fills sesión  : `{len(snapshot['fill_history'])}`",
+        f"Último fill   : `{snapshot['last_fill_side'] or 'ninguno'}`",
     ]
     await message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -234,21 +236,33 @@ async def cmd_grid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await message.reply_text("⚪ Engine no disponible.")
         return
 
-    levels = sorted(eng.levels, reverse=True)
+    snapshot = eng.get_runtime_snapshot()
+    levels = sorted(snapshot["levels"], reverse=True)
+    active_orders = snapshot["active_orders"]
+
     lines = ["📋 *GRID*", "```"]
     for lvl in levels:
         key = _price_key(lvl)
-        if key in eng.active_orders:
-            info = eng.active_orders[key]
+        info = active_orders.get(key)
+        if info is not None:
             side = str(info["side"]).upper()
             oid = str(info["order_id"])
-            tag = "[V]" if oid == "virtual" else ""
+            if oid == "virtual":
+                tag = "[V]"
+            elif oid == "pending_post_only":
+                tag = "[P]"
+            elif oid == "pending_manual":
+                tag = "[M]"
+            else:
+                tag = ""
             lines.append(f"{key:>12}  {side:<4} {tag}")
         else:
             lines.append(f"{key:>12}  ---  vacío")
     lines.append("```")
-    if eng.current_price:
-        lines.append(f"Precio actual: `{eng.current_price:.2f} USDC`")
+
+    current_price = snapshot["current_price"]
+    if current_price:
+        lines.append(f"Precio actual: `{current_price:.2f} USDC`")
 
     await message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -367,8 +381,11 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await message.reply_text("⚪ Engine no disponible.")
         return
 
+    active_orders = eng.get_runtime_snapshot()["active_orders"]
     real_orders = {
-        key: info for key, info in eng.active_orders.items() if info["order_id"] != "virtual"
+        key: info
+        for key, info in active_orders.items()
+        if str(info["order_id"]) not in {"virtual", "pending_post_only", "pending_manual"}
     }
 
     if not real_orders:
@@ -376,7 +393,7 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     lines = ["📋 *Órdenes activas* — responde con el precio a cancelar:\n```"]
-    for key, info in sorted(real_orders.items(), key=lambda x: Decimal(x[0]), reverse=True):
+    for key, info in sorted(real_orders.items(), key=lambda item: Decimal(item[0]), reverse=True):
         lines.append(f"{key:>12}  {str(info['side']).upper()}")
     lines.append("```")
     await message.reply_text("\n".join(lines), parse_mode="Markdown")
@@ -408,27 +425,18 @@ async def cmd_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         size = cast(Decimal, data["size"])
         key = _price_key(price)
 
-        if key in eng.active_orders:
-            await message.reply_text(f"⚠️ El nivel {key} ya tiene una orden. Abortado.")
-            return
-
-        from api import place_order
-
-        order_id, logs = place_order(side, price, size)
+        order_id, logs, error_msg = eng.place_manual_order(price, side, size)
         for log_item in logs:
             log_event(f"[TELEGRAM] {log_item['msg']}", log_item["level"])
+
+        if error_msg:
+            await message.reply_text(f"⚠️ {error_msg}")
+            return
 
         if not order_id:
             await message.reply_text("❌ No se pudo colocar la orden. Revisa el log.")
             return
 
-        eng.active_orders[key] = {
-            "side": side,
-            "order_id": order_id,
-            "price": price,
-            "placed_at": time.time(),
-        }
-        eng.save_state()
         log_event(f"[TELEGRAM] Orden manual {side.upper()} registrada en {key} -> {order_id}", "info")
         await message.reply_text(f"✅ Orden {side.upper()} registrada en `{key}`.", parse_mode="Markdown")
         return
@@ -462,12 +470,14 @@ async def cmd_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await message.reply_text("⚪ Engine no disponible.")
             return
 
-        from api import cancel_order
+        ok, logs, error_msg = eng.cancel_order_by_key(key, expected_order_id=order_id)
+        for log_item in logs:
+            log_event(f"[TELEGRAM] {log_item['msg']}", log_item["level"])
 
-        cancel_order(order_id)
-        if key in eng.active_orders:
-            del eng.active_orders[key]
-            eng.save_state()
+        if not ok:
+            await message.reply_text(error_msg or "❌ No se pudo cancelar la orden.")
+            return
+
         log_event(f"[TELEGRAM] Orden cancelada en {key} via Telegram.", "info")
         await message.reply_text(f"✅ Orden en {key} cancelada.")
         return
@@ -597,7 +607,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if eng is None:
             await message.reply_text("⚪ Engine no disponible.")
             return
-        default = fmt_amount(eng.base_size)
+        default = fmt_amount(eng.get_runtime_snapshot()["base_size"])
         await message.reply_text(f"Tamaño BTC (Enter para {default}):")
         return
 
@@ -606,8 +616,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if eng is None:
             await message.reply_text("⚪ Engine no disponible.")
             return
+        default_size = eng.get_runtime_snapshot()["base_size"]
         try:
-            size = Decimal(text) if text else eng.base_size
+            size = Decimal(text) if text else default_size
         except Exception:
             await message.reply_text("Tamaño inválido:")
             return
@@ -641,14 +652,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 await message.reply_text("Precio inválido.")
                 return
 
-            if target_key not in eng.active_orders:
+            info = eng.get_order_info(target_key)
+            if info is None:
                 await message.reply_text(f"No hay orden en {target_key}.")
                 _state.pending_confirm = None
                 return
 
-            info = eng.active_orders[target_key]
-            if info["order_id"] == "virtual":
-                await message.reply_text("Esa es una orden virtual, no se puede cancelar.")
+            if str(info["order_id"]) in {"virtual", "pending_post_only", "pending_manual"}:
+                await message.reply_text("Esa orden no se puede cancelar desde aquí.")
                 _state.pending_confirm = None
                 return
 

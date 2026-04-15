@@ -424,13 +424,14 @@ def show_grid_preview(
 
 def _show_grid_levels(engine: "GridEngine") -> None:
     """Muestra los niveles del grid con el estado de cada orden."""
-    levels = sorted(engine.levels, reverse=True)
-    price  = engine.current_price
-    orders = engine.active_orders
+    snapshot = engine.get_runtime_snapshot()
+    levels = sorted(snapshot["levels"], reverse=True)
+    price = snapshot["current_price"]
+    orders = snapshot["active_orders"]
 
     closest = (
-        min(engine.levels, key=lambda l: abs(l - price))
-        if price and engine.levels else None
+        min(levels, key=lambda level: abs(level - price))
+        if price is not None and levels else None
     )
 
     SEP = "  " + "-" * 62
@@ -438,25 +439,28 @@ def _show_grid_levels(engine: "GridEngine") -> None:
     print(SEP)
 
     for lvl in levels:
-        key  = _price_key(lvl)
+        key = _price_key(lvl)
         info = orders.get(key)
 
         if info:
-            side    = info["side"].upper()
-            oid     = info["order_id"]
+            side = str(info["side"]).upper()
+            oid = str(info["order_id"])
             if oid == "virtual":
-                tag     = " [V]"
+                tag = " [V]"
                 oid_str = "virtual"
             elif oid == "pending_post_only":
-                tag     = " [P]"
+                tag = " [P]"
                 oid_str = "latente (post_only)"
+            elif oid == "pending_manual":
+                tag = " [M]"
+                oid_str = "reservada (manual)"
             else:
-                tag     = "    "
+                tag = "    "
                 oid_str = oid[:36]
         else:
-            side    = "---"
+            side = "---"
             oid_str = "vacío"
-            tag     = "    "
+            tag = "    "
 
         marker = " ◄" if closest is not None and lvl == closest else "  "
         print(f"  {key:>12}  {side:<5}  {oid_str:<38}{tag}{marker}")
@@ -468,27 +472,29 @@ def _show_grid_levels(engine: "GridEngine") -> None:
 
 def _show_active_orders(engine: "GridEngine") -> None:
     """Lista las órdenes activas ordenadas por precio, separadas por side."""
-    orders = engine.active_orders
+    orders = engine.get_runtime_snapshot()["active_orders"]
 
     if not orders:
         print("  No hay órdenes activas registradas en el engine.")
         return
 
-    buys  = sorted([(k, v) for k, v in orders.items() if v["side"] == "buy"],
-                   key=lambda x: Decimal(x[0]), reverse=True)
+    buys = sorted([(k, v) for k, v in orders.items() if v["side"] == "buy"],
+                  key=lambda item: Decimal(item[0]), reverse=True)
     sells = sorted([(k, v) for k, v in orders.items() if v["side"] == "sell"],
-                   key=lambda x: Decimal(x[0]), reverse=True)
+                   key=lambda item: Decimal(item[0]), reverse=True)
 
     SEP = "  " + "-" * 62
     print(f"\n  {'Side':<5}  {'Precio':>12}  {'Order ID'}")
     print(SEP)
 
     for key, info in sells:
-        oid = info["order_id"]
+        oid = str(info["order_id"])
         if oid == "virtual":
             tag = " [virtual]"
         elif oid == "pending_post_only":
             tag = " [latente]"
+        elif oid == "pending_manual":
+            tag = " [reservada]"
         else:
             tag = ""
         print(f"  {'SELL':<5}  {key:>12}  {oid}{tag}")
@@ -496,11 +502,13 @@ def _show_active_orders(engine: "GridEngine") -> None:
     print(f"  {'---':<5}  {'--- centro ---':>12}")
 
     for key, info in buys:
-        oid = info["order_id"]
+        oid = str(info["order_id"])
         if oid == "virtual":
             tag = " [virtual]"
         elif oid == "pending_post_only":
             tag = " [latente]"
+        elif oid == "pending_manual":
+            tag = " [reservada]"
         else:
             tag = ""
         print(f"  {'BUY':<5}  {key:>12}  {oid}{tag}")
@@ -511,27 +519,27 @@ def _show_active_orders(engine: "GridEngine") -> None:
 
 def _show_fill_history(engine: "GridEngine", n: int = 20) -> None:
     """Muestra los últimos N fills registrados en esta sesión."""
-    history = engine.fill_history
+    history = engine.get_runtime_snapshot(fill_history_limit=n)["fill_history"]
 
     if not history:
         print("  No hay fills registrados en esta sesión.")
         return
 
-    recent = history[-n:][::-1]  # más recientes primero
+    recent = history[::-1]
 
     SEP = "  " + "-" * 62
     print(f"\n  {'Hora':<10}  {'Side':<5}  {'Precio':>12}  {'Order ID'}")
     print(SEP)
 
     for entry in recent:
-        ts    = time.strftime("%H:%M:%S", time.localtime(entry["ts"]))
-        side  = entry["side"].upper()
+        ts = time.strftime("%H:%M:%S", time.localtime(entry["ts"]))
+        side = str(entry["side"]).upper()
         price = entry["price"]
-        oid   = entry["order_id"]
+        oid = entry["order_id"]
         print(f"  {ts:<10}  {side:<5}  {price:>12}  {oid}")
 
     print(SEP)
-    print(f"  Total fills esta sesión: {len(history)}")
+    print(f"  Total fills esta sesión: {len(engine.get_runtime_snapshot()["fill_history"])}")
 
 
 def format_balances_live(engine: Optional["GridEngine"] = None) -> str:
@@ -547,30 +555,36 @@ def format_balances_live(engine: Optional["GridEngine"] = None) -> str:
         f"USDC disponible : {_price_key(usdc)}",
     ]
 
-    if engine is not None and engine.active_orders:
-        btc_en_grid = Decimal("0")
-        usdc_en_grid = Decimal("0")
+    if engine is not None:
+        snapshot = engine.get_runtime_snapshot()
+        active_orders = snapshot["active_orders"]
+        base_size = snapshot["base_size"]
 
-        for info in engine.active_orders.values():
-            if info["order_id"] in ("virtual", "pending_post_only"):
-                continue
-            if info["side"] == "sell":
-                btc_en_grid += engine.base_size
-            elif info["side"] == "buy":
-                usdc_en_grid += info["price"] * engine.base_size
+        if active_orders:
+            btc_en_grid = Decimal("0")
+            usdc_en_grid = Decimal("0")
 
-        lines.extend([
-            "",
-            "EN LA REJILLA",
-            "──────────────────────────────────────",
-            f"BTC  en órdenes : {fmt_amount(btc_en_grid)}",
-            f"USDC en órdenes : {_price_key(usdc_en_grid)}",
-            "",
-            "TOTAL",
-            "──────────────────────────────────────",
-            f"BTC  total      : {fmt_amount(btc + btc_en_grid)}",
-            f"USDC total      : {_price_key(usdc + usdc_en_grid)}",
-        ])
+            for info in active_orders.values():
+                order_id = str(info["order_id"])
+                if order_id in {"virtual", "pending_post_only", "pending_manual"}:
+                    continue
+                if info["side"] == "sell":
+                    btc_en_grid += base_size
+                elif info["side"] == "buy":
+                    usdc_en_grid += info["price"] * base_size
+
+            lines.extend([
+                "",
+                "EN LA REJILLA",
+                "──────────────────────────────────────",
+                f"BTC  en órdenes : {fmt_amount(btc_en_grid)}",
+                f"USDC en órdenes : {_price_key(usdc_en_grid)}",
+                "",
+                "TOTAL",
+                "──────────────────────────────────────",
+                f"BTC  total      : {fmt_amount(btc + btc_en_grid)}",
+                f"USDC total      : {_price_key(usdc + usdc_en_grid)}",
+            ])
 
     lines.append("──────────────────────────────────────")
     return "\n".join(lines)
@@ -586,11 +600,8 @@ def _show_balances_live(engine: Optional["GridEngine"] = None) -> None:
 def _add_manual_order(engine: "GridEngine") -> None:
     """
     Permite colocar una orden manual y registrarla en active_orders del engine.
-    Verifica que el nivel no esté ya ocupado antes de enviar.
+    Reserva el nivel antes de enviar para evitar carreras con el hilo del engine.
     """
-    from api import place_order
-
-    # Pedir precio
     while True:
         try:
             price_val = Decimal(input("  Precio: ").strip())
@@ -600,56 +611,40 @@ def _add_manual_order(engine: "GridEngine") -> None:
 
     key = _price_key(price_val)
 
-    # Comprobar que el nivel está vacío
-    if key in engine.active_orders:
-        existing = engine.active_orders[key]
-        print(f"  [!] El nivel {key} ya tiene una orden {existing['side'].upper()} ({existing['order_id'][:8]}...). Abortando.")
-        return
-
-    # Pedir lado
     while True:
         side = input("  Lado (buy/sell): ").strip().lower()
         if side in ("buy", "sell"):
             break
         print("  Lado inválido. Debe ser buy o sell.")
 
-    # Pedir tamaño
+    default_size = engine.get_runtime_snapshot()["base_size"]
     while True:
         try:
-            bs_input = input(f"  Tamaño [{fmt_amount(engine.base_size)}]: ").strip()
-            base_size = Decimal(bs_input) if bs_input else engine.base_size
+            bs_input = input(f"  Tamaño [{fmt_amount(default_size)}]: ").strip()
+            base_size = Decimal(bs_input) if bs_input else default_size
             break
         except Exception:
             print("  Tamaño inválido.")
 
-    # Confirmar
     confirm = input(f"  Colocar {side.upper()} en {key} tamaño {fmt_amount(base_size)}? (s/n): ").strip().lower()
     if not confirm.startswith("s"):
         print("  Abortado.")
         return
 
-    # Colocar orden
-    order_id, logs = place_order(side, price_val, base_size)
-    for l in logs:
-        log_event(f"[MANUAL] {l['msg']}", l["level"])
+    order_id, logs, error_msg = engine.place_manual_order(price_val, side, base_size)
+    for entry in logs:
+        log_event(f"[MANUAL] {entry['msg']}", entry["level"])
+
+    if error_msg:
+        print(f"  [!] {error_msg}")
+        return
 
     if not order_id:
         print("  [!] No se pudo colocar la orden. Revisa el log.")
         return
 
-    # Registrar en active_orders del engine
-    import time
-    engine.active_orders[key] = {
-        "side":      side,
-        "order_id":  order_id,
-        "price":     price_val,
-        "placed_at": time.time(),
-    }
-    engine.save_state()
     log_event(f"[MANUAL] Orden {side.upper()} registrada en {key} -> {order_id}", "info")
-    print(f"  ✓ Orden registrada en el engine.")
-
-
+    print("  ✓ Orden registrada en el engine.")
 
 
 def _fill_empty_levels(engine: "GridEngine") -> None:
@@ -658,7 +653,7 @@ def _fill_empty_levels(engine: "GridEngine") -> None:
     current_price, _ = get_current_price()
 
     if current_price is None:
-        current_price = engine.current_price
+        current_price = engine.get_runtime_snapshot()["current_price"]
 
     if current_price is None:
         print("  [!] No se pudo obtener el precio actual.")
@@ -686,18 +681,20 @@ def _fill_empty_levels(engine: "GridEngine") -> None:
 def run_engine_menu(engine: "GridEngine", engine_thread: threading.Thread) -> None:
     """
     Submenú interactivo mientras el engine corre en segundo plano.
-    El engine escribe en su estado, este menú solo lee — seguro con el GIL.
+    Las lecturas de estado se hacen sobre snapshots coherentes.
     """
     while engine_thread.is_alive():
-        price_str = _price_key(engine.current_price) if engine.current_price else "N/A"
+        snapshot = engine.get_runtime_snapshot()
+        current_price = snapshot["current_price"]
+        price_str = _price_key(current_price) if current_price else "N/A"
 
         print("\n" + "=" * 40)
         print("  ENGINE EN MARCHA  ●")
         print("=" * 40)
         print(f"  Precio          : {price_str} USDC")
-        print(f"  Órdenes activas : {len(engine.active_orders)}")
-        print(f"  Fills sesión    : {len(engine.fill_history)}")
-        print(f"  Último fill     : {engine.last_fill_side or 'ninguno'}")
+        print(f"  Órdenes activas : {len(snapshot['active_orders'])}")
+        print(f"  Fills sesión    : {len(snapshot['fill_history'])}")
+        print(f"  Último fill     : {snapshot['last_fill_side'] or 'ninguno'}")
         print("=" * 40)
         print("  1. Ver niveles del grid")
         print("  2. Ver órdenes activas")
