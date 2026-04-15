@@ -714,8 +714,8 @@ def _fill_empty_levels(engine: "GridEngine") -> None:
 
 def run_engine_menu(engine: "GridEngine", engine_thread: threading.Thread) -> None:
     """
-    Submenú interactivo mientras el engine corre en segundo plano.
-    Las lecturas de estado se hacen sobre snapshots coherentes.
+    Submenú interactivo del engine.
+    Permite monitorizar sin bloquear el menú principal.
     """
     while engine_thread.is_alive():
         snapshot = engine.get_runtime_snapshot()
@@ -736,7 +736,7 @@ def run_engine_menu(engine: "GridEngine", engine_thread: threading.Thread) -> No
         print("  4. Ver balances")
         print("  5. Añadir orden manual")
         print("  6. Fill empty levels")
-        print("  0. Detener engine")
+        print("  v. Volver al menú principal")
         print("=" * 40)
 
         try:
@@ -762,30 +762,9 @@ def run_engine_menu(engine: "GridEngine", engine_thread: threading.Thread) -> No
         elif opcion == "6":
             _fill_empty_levels(engine)
 
-        elif opcion == "0":
-            print("\n  Deteniendo engine...")
-            engine.stop()
-            engine_thread.join(timeout=10)
-
-            if engine_thread.is_alive():
-                print("  [!] El engine no respondió en 10s.")
-            else:
-                print("  Engine detenido.")
-
-            try:
-                resp = input("  ¿Cancelar todas las órdenes? (s/n): ").strip().lower()
-                if resp.startswith("s"):
-                    log_event("[ENGINE] Cancelando todas las órdenes...", "info")
-                    cancel_all_orders()
-                    engine.clear_state()
-                else:
-                    log_event("[ENGINE] Órdenes conservadas — estado guardado para recuperación.", "info")
-            except Exception as e:
-                log_event(f"[ENGINE] Error al procesar respuesta: {e}", "error")
+        elif opcion.lower() == "v":
+            print("  Volviendo al menú principal...")
             break
-
-        else:
-            print("  Opción no válida.")
 
     # El hilo murió solo (error inesperado)
     if not engine_thread.is_alive() and engine.is_running():
@@ -1077,6 +1056,17 @@ def run_cli() -> None:
                 print("El engine no respondió en 10s.")
             else:
                 print("Engine detenido.")
+            
+            try:
+                resp = input("  ¿Cancelar todas las órdenes? (s/n): ").strip().lower()
+                if resp.startswith("s"):
+                    log_event("[ENGINE] Cancelando todas las órdenes...", "info")
+                    cancel_all_orders()
+                    engine.clear_state()
+                else:
+                    log_event("[ENGINE] Órdenes conservadas — estado guardado para recuperación.", "info")
+            except Exception as e:
+                log_event(f"[ENGINE] Error al procesar respuesta: {e}", "error")
 
             engine = None
             engine_thread = None
