@@ -796,22 +796,24 @@ def run_engine_menu(engine: "GridEngine", engine_thread: threading.Thread) -> No
 # ========================= MENU ==========================
 # =========================================================
 
-def show_menu() -> str:
+def show_menu(engine_running: bool = False) -> str:
     print("=" * 40)
     print("MENÚ PRINCIPAL")
     print("=" * 40)
     print(f"1. Precio actual {SYMBOL}")
     print("2. Ver balances")
     print("3. Obtener y exportar datos")
-    print("4. Orden manual")
+    print("4. Orden manual" + (" (bloqueada con engine)" if engine_running else ""))
     print("5. Ver órdenes activas")
     print("6. Ver orden por ID")
-    print("7. Cancelar todas órdenes")
-    print("8. Iniciar Grid Engine")
+    print("7. Cancelar todas órdenes" + (" (bloqueada con engine)" if engine_running else ""))
+    print("8. Iniciar Grid Engine" if not engine_running else "8. Engine ya en marcha")
+    print("9. Monitor del engine")
+    print("s. Detener engine")
     print("c. Configuración manual")
     print("0. Salir")
     print("=" * 40)
-    return input("Selecciona una opción (0-9, c): ")
+    return input("Selecciona una opción: ").strip().lower()
 
 
 # =========================================================
@@ -843,9 +845,13 @@ def run_cli() -> None:
         start_telegram_bot()
     else:
         log_event("[TELEGRAM] Bot deshabilitado por configuración ([telegram] enabled = false).", "info")
+    
+    engine: Optional[GridEngine] = None
+    engine_thread: Optional[threading.Thread] = None
 
     while True:
-        opcion = show_menu()
+        engine_running = engine_thread is not None and engine_thread.is_alive()
+        opcion = show_menu(engine_running)
 
         # --------------------------------------------------
         # 1. Precio actual
@@ -892,6 +898,11 @@ def run_cli() -> None:
         # 4. Orden manual
         # --------------------------------------------------
         elif opcion == "4":
+            if engine_running:
+                print("\n[!] El engine está en marcha.")
+                print("    Usa el monitor del engine (opción 9) para añadir órdenes manuales.")
+                continue
+
             print("\n=== Orden manual ===")
             print(
                 "ATENCION: RECUERDA cancelar todas ordenes manuales antes "
@@ -968,6 +979,11 @@ def run_cli() -> None:
         # 7. Cancelar todas ordenes
         # --------------------------------------------------
         elif opcion == "7":
+            if engine_running:
+                print("\n[!] El engine está en marcha.")
+                print("    Detén el engine (opción 's') antes de cancelar todas las órdenes.")
+                continue
+
             print("\n=== Cancelar todas las órdenes ===")
             confirmacion = input("¿Está seguro? Esto cancelará TODAS las órdenes (s/n): ")
             if confirmacion.strip().lower().startswith("s"):
@@ -979,6 +995,10 @@ def run_cli() -> None:
         # 8. Iniciar Grid Engine
         # --------------------------------------------------
         elif opcion == "8":
+            if engine_running:
+                print("El engine ya está en marcha.")
+                continue
+
             if base_size_default <= 0:
                 print("Configura primero un base_size válido.")
                 continue
@@ -1020,29 +1040,47 @@ def run_cli() -> None:
                 log_event(f"[ERROR] No se pudo inicializar el motor: {exc}", "error")
                 continue
 
-            def _sigterm_handler(signum, frame):
-                log_event("[ENGINE] SIGTERM recibido — deteniendo engine...", "info")
-                engine.stop()
-
-            signal.signal(signal.SIGTERM, _sigterm_handler)
-            
-            # Lanzar el engine en un hilo secundario
             engine_thread = threading.Thread(
                 target=engine.run,
                 daemon=True,
                 name="GridEngineThread"
             )
             engine_thread.start()
-            log_event("[ENGINE] Corriendo en segundo plano.", "info")
 
-            # Registrar en estado de Telegram para que /status y /grid funcionen
-            if tg_state is not None:
-                tg_state.engine = engine
-                tg_state.engine_thread = engine_thread
+            print("\n[ENGINE] Arrancado en segundo plano.")
+            print("Puedes seguir usando el menú principal.")
+            continue
 
-            # Entrar al submenú de monitorización
+        # --------------------------------------------------
+        # 9. Monitor del engine
+        # --------------------------------------------------
+        elif opcion == "9":
+            if not engine_running or engine is None or engine_thread is None:
+                print("No hay engine en marcha.")
+                continue
+
             run_engine_menu(engine, engine_thread)
+        
+        # --------------------------------------------------
+        # S. Detener engine
+        # --------------------------------------------------
+        elif opcion == "s":
+            if not engine_running or engine is None or engine_thread is None:
+                print("No hay engine en marcha.")
+                continue
 
+            print("\nDeteniendo engine...")
+            engine.stop()
+            engine_thread.join(timeout=10)
+
+            if engine_thread.is_alive():
+                print("El engine no respondió en 10s.")
+            else:
+                print("Engine detenido.")
+
+            engine = None
+            engine_thread = None
+        
         # --------------------------------------------------
         # Configuración
         # --------------------------------------------------
