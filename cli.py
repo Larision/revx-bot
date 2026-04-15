@@ -145,6 +145,124 @@ def _export_trades_history_to_csv(days_back: int) -> Tuple[Optional[Path], int]:
     return filename, len([row for row in rows if isinstance(row, dict)])
 
 
+def menu_exportar_datos():
+    while True:
+        print("\n=== Obtener y exportar datos ===")
+        print("1. Histórico de trades globales")
+        print("2. Histórico de candles")
+        print("3. Atrás")
+
+        opcion = input("Selecciona una opción: ").strip()
+
+        if opcion == "1":
+            exportar_trades_menu()
+        elif opcion == "2":
+            exportar_candles_menu()
+        elif opcion == "3":
+            break
+        else:
+            print("Opción inválida")
+
+
+def exportar_trades_menu():
+    print("\n=== Obtener y exportar histórico de trades globales a CSV ===")
+
+    while True:
+        raw_days = input(
+            "¿De cuántos días atrás desde el momento actual quieres el histórico? [7]: "
+        ).strip()
+
+        if not raw_days:
+            days_back = 7
+            break
+
+        try:
+            days_back = int(raw_days)
+            if days_back < 1:
+                raise ValueError
+            break
+        except ValueError:
+            print("Introduce un número entero mayor o igual que 1.")
+
+    csv_path, row_count = _export_trades_history_to_csv(days_back)
+    if csv_path is None:
+        print("No se pudo generar el CSV. Revisa el log.")
+        return
+
+    print(f"CSV generado: {csv_path}")
+    print(f"Trades exportados: {row_count}")
+    log_event(f"Histórico de trades exportado a {csv_path} ({row_count} filas).", "info")
+
+
+def exportar_candles_menu():
+    print("\n=== Obtener y exportar histórico de candles ===")
+
+    symbol = input(f"Symbol [{SYMBOL}]: ").strip() or SYMBOL
+
+    while True:
+        interval = input(
+            "Intervalo de candles? [1, 5, 15, 30, 60, 240, 1440, 2880, 5760, 10080, 20160, 40320]: "
+        ).strip()
+        try:
+            interval = int(interval)
+            break
+        except ValueError:
+            print("Intervalo inválido.")
+
+    while True:
+        dias = input("Días atrás desde hoy: ").strip()
+        try:
+            dias = int(dias)
+            if dias < 1:
+                raise ValueError
+            break
+        except ValueError:
+            print("Introduce un número válido >= 1")
+
+    now = int(time.time() * 1000)
+    since = now - dias * 24 * 60 * 60 * 1000
+
+    from api import get_candles
+
+    response, logs = get_candles(
+        symbol=symbol,
+        interval=interval,
+        since=since,
+        until=now
+    )
+
+    for l in logs:
+        log_event(f"[LOG] {l['msg']}", l.get("level", "info"))
+
+    if not isinstance(response, dict) or response.get("error"):
+        print("Error obteniendo candles")
+        return
+
+    data = response.get("data", [])
+
+    if not data:
+        print("No hay datos.")
+        return
+
+    filename = Path(f"candles-{symbol}-{interval}-{dias}d.csv")
+
+    with filename.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["start", "open", "high", "low", "close", "volume"])
+
+        for c in data:
+            writer.writerow([
+                c.get("start"),
+                c.get("open"),
+                c.get("high"),
+                c.get("low"),
+                c.get("close"),
+                c.get("volume"),
+            ])
+
+    print(f"CSV generado: {filename}")
+    print(f"Candles exportados: {len(data)}")
+
 
 
 # =========================================================
@@ -653,7 +771,7 @@ def show_menu() -> str:
     print("=" * 40)
     print(f"1. Precio actual {SYMBOL}")
     print("2. Ver balances")
-    print("3. Exportar histórico de trades globales a CSV")
+    print("3. Obtener y exportar datos")
     print("4. Orden manual")
     print("5. Ver órdenes activas")
     print("6. Ver orden por ID")
@@ -734,36 +852,10 @@ def run_cli() -> None:
             log_event(f"{json.dumps(balances, indent=2, ensure_ascii=False)}", "info")
 
         # --------------------------------------------------
-        # 3. Exportar histórico de trades a CSV
+        # 3. Obtener y exportar datos
         # --------------------------------------------------
         elif opcion == "3":
-            print("\n=== Exportar histórico de trades globales a CSV ===")
-
-            while True:
-                raw_days = input(
-                    "¿De cuántos días atrás desde el momento actual quieres el histórico? [7]: "
-                ).strip()
-
-                if not raw_days:
-                    days_back = 7
-                    break
-
-                try:
-                    days_back = int(raw_days)
-                    if days_back < 1:
-                        raise ValueError
-                    break
-                except ValueError:
-                    print("Introduce un número entero mayor o igual que 1.")
-
-            csv_path, row_count = _export_trades_history_to_csv(days_back)
-            if csv_path is None:
-                print("No se pudo generar el CSV. Revisa el log.")
-                continue
-
-            print(f"CSV generado: {csv_path}")
-            print(f"Trades exportados: {row_count}")
-            log_event(f"Histórico de trades exportado a {csv_path} ({row_count} filas).", "info")
+            menu_exportar_datos()
 
         # --------------------------------------------------
         # 4. Orden manual

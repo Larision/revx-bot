@@ -380,6 +380,29 @@ def get_all_trades_history_days_back(
     )
 
 
+def get_candles(
+    symbol: str,
+    interval: int,
+    since: Optional[int] = None,
+    until: Optional[int] = None,
+):
+    params = {"interval": interval}
+
+    if since:
+        params["since"] = since
+    if until:
+        params["until"] = until
+
+    query = urlencode(params)
+
+    response, logs = send_request(
+        "GET",
+        f"/api/1.0/candles/{symbol}",
+        query=query
+    )
+
+    return response, logs
+
 
 def get_current_price() -> Tuple[Optional[Decimal], List[LogEntry]]:
     """
