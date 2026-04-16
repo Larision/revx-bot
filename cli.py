@@ -1026,6 +1026,10 @@ def run_cli() -> None:
             )
             engine_thread.start()
 
+            if tg_state is not None:
+                tg_state.engine = engine
+                tg_state.engine_thread = engine_thread
+
             print("\n[ENGINE] Arrancado en segundo plano.")
             print("Puedes seguir usando el menú principal.")
             continue
@@ -1051,6 +1055,10 @@ def run_cli() -> None:
             print("\nDeteniendo engine...")
             engine.stop()
             engine_thread.join(timeout=10)
+
+            if tg_state is not None:
+                tg_state.engine = None
+                tg_state.engine_thread = None
 
             if engine_thread.is_alive():
                 print("El engine no respondió en 10s.")
