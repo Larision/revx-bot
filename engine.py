@@ -4,7 +4,7 @@ import threading
 import time
 import uuid
 from decimal import Decimal, ROUND_DOWN
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 from config import MIN_USDC_RESERVE, STATE_PATH, SYMBOL, TICK_SIZE, VERSION
 from types_ import LogEntry, OrderInfo
@@ -269,12 +269,12 @@ class GridEngine:
             step = Decimal(raw["step"]) if raw.get("step") else None
             levels = [Decimal(level) for level in raw.get("levels", [])]
             active_orders = {
-                key: {
+                key: cast(OrderInfo, {
                     "side": info["side"],
                     "order_id": info["order_id"],
                     "price": Decimal(info["price"]),
                     "placed_at": float(info.get("placed_at", 0)),
-                }
+                })
                 for key, info in raw.get("active_orders", {}).items()
             }
             last_fill_side = raw.get("last_fill_side")
