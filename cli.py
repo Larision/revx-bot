@@ -551,29 +551,47 @@ def _show_active_orders(engine: "GridEngine") -> None:
     print(f"  Total: {len(sells)} SELL  |  {len(buys)} BUY")
 
 
-def _show_fill_history(engine: "GridEngine", n: int = 20) -> None:
-    """Muestra los últimos N fills registrados en esta sesión."""
-    history = engine.get_runtime_snapshot(fill_history_limit=n)["fill_history"]
+def _trailing_menu(engine: "GridEngine") -> None:
+    """
+    Interfaz de línea de comandos para configurar trailing up y down en vivo.
 
-    if not history:
-        print("  No hay fills registrados en esta sesión.")
-        return
+    Muestra un menú con opciones para habilitar/deshabilitar trailing up y down,
+    y permite aplicar cambios en caliente o descartarlos.
 
-    recent = history[::-1]
+    No devuelve nada.
+    """
+    original_up = engine.trailing_up_enabled
+    original_down = engine.trailing_down_enabled
 
-    SEP = "  " + "-" * 62
-    print(f"\n  {'Hora':<10}  {'Side':<5}  {'Precio':>12}  {'Order ID'}")
-    print(SEP)
+    new_up = original_up
+    new_down = original_down
 
-    for entry in recent:
-        ts = time.strftime("%H:%M:%S", time.localtime(entry["ts"]))
-        side = str(entry["side"]).upper()
-        price = entry["price"]
-        oid = entry["order_id"]
-        print(f"  {ts:<10}  {side:<5}  {price:>12}  {oid}")
+    while True:
+        print("\n=== CONFIGURAR TRAILINGS ===")
+        print(f"1. Trailing up   > {'ON' if new_up else 'OFF'}")
+        print(f"2. Trailing down > {'ON' if new_down else 'OFF'}")
+        print("3. Atrás")
 
-    print(SEP)
-    print(f"  Total fills esta sesión: {len(engine.get_runtime_snapshot()["fill_history"])}")
+        opcion = input("Opción: ").strip()
+
+        if opcion == "1":
+            new_up = not new_up
+
+        elif opcion == "2":
+            new_down = not new_down
+
+        elif opcion == "3":
+            if new_up != original_up or new_down != original_down:
+                confirm = input("¿Aplicar cambios? (s/n): ").strip().lower()
+                if confirm.startswith("s"):
+                    engine.set_trailing(new_up, new_down)
+                    print("✓ Cambios aplicados en caliente")
+                else:
+                    print("Cambios descartados")
+            return
+
+        else:
+            print("Opción inválida")
 
 
 def format_balances_live(engine: Optional["GridEngine"] = None) -> str:
@@ -732,7 +750,7 @@ def run_engine_menu(engine: "GridEngine", engine_thread: threading.Thread) -> No
         print("=" * 40)
         print("  1. Ver niveles del grid")
         print("  2. Ver órdenes activas")
-        print("  3. Ver fills de esta sesión")
+        print("  3. Activar-Desactivar trailings")
         print("  4. Ver balances")
         print("  5. Añadir orden manual")
         print("  6. Fill empty levels")
@@ -751,7 +769,7 @@ def run_engine_menu(engine: "GridEngine", engine_thread: threading.Thread) -> No
             _show_active_orders(engine)
 
         elif opcion == "3":
-            _show_fill_history(engine)
+            _trailing_menu(engine)
 
         elif opcion == "4":
             _show_balances_live(engine)

@@ -71,6 +71,10 @@ class GridEngine:
         self._stop_event = threading.Event()
         self._state_lock = threading.RLock()
 
+        # Guarda el estado de trailings
+        self.trailing_up_enabled: bool = True
+        self.trailing_down_enabled: bool = True
+
     def _is_virtual_order(self, info: Optional["OrderInfo"]) -> bool:
         """Retorna True si el snapshot corresponde a un centinela virtual."""
         return bool(info) and info.get("order_id") == "virtual"
@@ -87,6 +91,16 @@ class GridEngine:
             "ts": time.time(),
         })
         log_fill(info["side"], price_key, fmt_amount(self.base_size))
+
+    def set_trailing(self, up: bool, down: bool) -> None:
+        with self._state_lock:
+            self.trailing_up_enabled = up
+            self.trailing_down_enabled = down
+
+        log_event(
+            f"[ENGINE] Trailing actualizado → up: {'ON' if up else 'OFF'} | down: {'ON' if down else 'OFF'}",
+            "info"
+        )
 
     # ----------------------------------------------------------
     # SNAPSHOTS / THREAD SAFETY
@@ -797,58 +811,64 @@ class GridEngine:
             max_levels = self.levels_below + self.levels_above + 2
 
             if side == "buy" and price == lowest:
-                trail_down_price = (price - step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
-                self.levels.append(trail_down_price)
+                if not self.trailing_down_enabled:
+                    log_event("[ENGINE] Trailing DOWN desactivado → no se extiende grid", "info")
+                else:
+                    trail_down_price = (price - step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
+                    self.levels.append(trail_down_price)
 
-                if len(self.levels) > max_levels:
-                    self.levels.remove(highest)
-                    highest_key = _price_key(highest)
-                    removed = self.active_orders.pop(highest_key, None)
-                    if removed is not None and removed["order_id"] not in {"virtual", "pending_post_only", "pending_manual"}:
-                        cancel_order_id = str(removed["order_id"])
-                        cancel_level_key = highest_key
+                    if len(self.levels) > max_levels:
+                        self.levels.remove(highest)
+                        highest_key = _price_key(highest)
+                        removed = self.active_orders.pop(highest_key, None)
+                        if removed is not None and removed["order_id"] not in {"virtual", "pending_post_only", "pending_manual"}:
+                            cancel_order_id = str(removed["order_id"])
+                            cancel_level_key = highest_key
 
-                order_to_place = ((price + step).quantize(TICK_SIZE, rounding=ROUND_DOWN), "sell")
-                trail_down_key = _price_key(trail_down_price)
-                if trail_down_key not in self.active_orders:
-                    virtual_order_to_add = (
-                        trail_down_key,
-                        {
-                            "side": "buy",
-                            "order_id": "virtual",
-                            "price": trail_down_price,
-                            "placed_at": time.time(),
-                        },
-                    )
+                    order_to_place = ((price + step).quantize(TICK_SIZE, rounding=ROUND_DOWN), "sell")
+                    trail_down_key = _price_key(trail_down_price)
+                    if trail_down_key not in self.active_orders:
+                        virtual_order_to_add = (
+                            trail_down_key,
+                            {
+                                "side": "buy",
+                                "order_id": "virtual",
+                                "price": trail_down_price,
+                                "placed_at": time.time(),
+                            },
+                        )
 
-                trailing_log = f"[ENGINE] Rebalance trailing down: grid extendido a {_price_key(trail_down_price)}"
+                    trailing_log = f"[ENGINE] Rebalance trailing down: grid extendido a {_price_key(trail_down_price)}"
 
             elif side == "sell" and price == highest:
-                trail_up_price = (price + step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
-                self.levels.append(trail_up_price)
+                if not self.trailing_up_enabled:
+                    log_event("[ENGINE] Trailing UP desactivado → no se extiende grid", "info")
+                else:
+                    trail_up_price = (price + step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
+                    self.levels.append(trail_up_price)
 
-                if len(self.levels) > max_levels:
-                    self.levels.remove(lowest)
-                    lowest_key = _price_key(lowest)
-                    removed = self.active_orders.pop(lowest_key, None)
-                    if removed is not None and removed["order_id"] not in {"virtual", "pending_post_only", "pending_manual"}:
-                        cancel_order_id = str(removed["order_id"])
-                        cancel_level_key = lowest_key
+                    if len(self.levels) > max_levels:
+                        self.levels.remove(lowest)
+                        lowest_key = _price_key(lowest)
+                        removed = self.active_orders.pop(lowest_key, None)
+                        if removed is not None and removed["order_id"] not in {"virtual", "pending_post_only", "pending_manual"}:
+                            cancel_order_id = str(removed["order_id"])
+                            cancel_level_key = lowest_key
 
-                order_to_place = ((price - step).quantize(TICK_SIZE, rounding=ROUND_DOWN), "buy")
-                trail_up_key = _price_key(trail_up_price)
-                if trail_up_key not in self.active_orders:
-                    virtual_order_to_add = (
-                        trail_up_key,
-                        {
-                            "side": "sell",
-                            "order_id": "virtual",
-                            "price": trail_up_price,
-                            "placed_at": time.time(),
-                        },
-                    )
+                    order_to_place = ((price - step).quantize(TICK_SIZE, rounding=ROUND_DOWN), "buy")
+                    trail_up_key = _price_key(trail_up_price)
+                    if trail_up_key not in self.active_orders:
+                        virtual_order_to_add = (
+                            trail_up_key,
+                            {
+                                "side": "sell",
+                                "order_id": "virtual",
+                                "price": trail_up_price,
+                                "placed_at": time.time(),
+                            },
+                        )
 
-                trailing_log = f"[ENGINE] Rebalance trailing up: grid extendido a {_price_key(trail_up_price)}"
+                    trailing_log = f"[ENGINE] Rebalance trailing up: grid extendido a {_price_key(trail_up_price)}"
 
             elif side == "buy":
                 order_to_place = ((price + step).quantize(TICK_SIZE, rounding=ROUND_DOWN), "sell")
