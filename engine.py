@@ -811,9 +811,13 @@ class GridEngine:
             max_levels = self.levels_below + self.levels_above + 2
 
             if side == "buy" and price == lowest:
-                if not self.trailing_down_enabled:
-                    log_event("[ENGINE] Trailing DOWN desactivado → no se extiende grid", "info")
-                else:
+                # Siempre colocar SELL una línea arriba
+                order_to_place = (
+                    (price + step).quantize(TICK_SIZE, rounding=ROUND_DOWN),
+                    "sell",
+                )
+
+                if self.trailing_down_enabled:
                     trail_down_price = (price - step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
                     self.levels.append(trail_down_price)
 
@@ -825,7 +829,6 @@ class GridEngine:
                             cancel_order_id = str(removed["order_id"])
                             cancel_level_key = highest_key
 
-                    order_to_place = ((price + step).quantize(TICK_SIZE, rounding=ROUND_DOWN), "sell")
                     trail_down_key = _price_key(trail_down_price)
                     if trail_down_key not in self.active_orders:
                         virtual_order_to_add = (
@@ -839,11 +842,17 @@ class GridEngine:
                         )
 
                     trailing_log = f"[ENGINE] Rebalance trailing down: grid extendido a {_price_key(trail_down_price)}"
+                else:
+                    trailing_log = "[ENGINE] Trailing down desactivado: se mantiene el grid sin extenderse"
 
             elif side == "sell" and price == highest:
-                if not self.trailing_up_enabled:
-                    log_event("[ENGINE] Trailing UP desactivado → no se extiende grid", "info")
-                else:
+                # Siempre colocar BUY una línea abajo
+                order_to_place = (
+                    (price - step).quantize(TICK_SIZE, rounding=ROUND_DOWN),
+                    "buy",
+                )
+
+                if self.trailing_up_enabled:
                     trail_up_price = (price + step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
                     self.levels.append(trail_up_price)
 
@@ -855,7 +864,6 @@ class GridEngine:
                             cancel_order_id = str(removed["order_id"])
                             cancel_level_key = lowest_key
 
-                    order_to_place = ((price - step).quantize(TICK_SIZE, rounding=ROUND_DOWN), "buy")
                     trail_up_key = _price_key(trail_up_price)
                     if trail_up_key not in self.active_orders:
                         virtual_order_to_add = (
@@ -869,6 +877,8 @@ class GridEngine:
                         )
 
                     trailing_log = f"[ENGINE] Rebalance trailing up: grid extendido a {_price_key(trail_up_price)}"
+                else:
+                    trailing_log = "[ENGINE] Trailing up desactivado: se mantiene el grid sin extenderse"
 
             elif side == "buy":
                 order_to_place = ((price + step).quantize(TICK_SIZE, rounding=ROUND_DOWN), "sell")
