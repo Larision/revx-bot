@@ -30,7 +30,6 @@ from api import (
     get_active_orders,
     get_all_balances,
     get_current_price,
-    get_all_trades_history_days_back,
     get_order_by_id,
     get_ticker_price,
     place_order,
@@ -93,69 +92,17 @@ def _epoch_ms_to_iso(ms: object) -> str:
     return datetime.fromtimestamp(value / 1000, tz=timezone.utc).isoformat()
 
 
-def _export_trades_history_to_csv(days_back: int) -> Tuple[Optional[Path], int]:
-    """Descarga el histórico de trades y lo exporta a CSV."""
-    safe_days = max(1, int(days_back))
-    response, logs = get_all_trades_history_days_back(safe_days)
-
-    for l in logs:
-        log_event(f"[LOG] {l['msg']}", l.get('level', 'info'))
-
-    if not isinstance(response, dict):
-        log_event('[ERROR] Respuesta inesperada al descargar histórico de trades.', 'error')
-        return None, 0
-
-    if response.get('error'):
-        log_event(f"[ERROR] No se pudo descargar el histórico de trades: {json.dumps(response, ensure_ascii=False)}", 'error')
-        return None, 0
-
-    rows = response.get('data', [])
-    if not isinstance(rows, list):
-        log_event('[ERROR] El campo data del histórico de trades no es una lista.', 'error')
-        return None, 0
-
-    filename = Path(f"historical-orderdata-{safe_days}-{SYMBOL}.csv")
-
-    preferred_fields = [
-        'tdt', 'tdt_iso',
-        'aid', 'anm',
-        'p', 'pc', 'pn',
-        'q', 'qc', 'qn',
-        've', 'pdt', 'pdt_iso', 'vp', 'tid',
-    ]
-    extra_fields = sorted({
-        key
-        for row in rows if isinstance(row, dict)
-        for key in row.keys()
-        if key not in {'tdt_iso', 'pdt_iso'} and key not in preferred_fields
-    })
-    fieldnames = preferred_fields + extra_fields
-
-    with filename.open('w', newline='', encoding='utf-8-sig') as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction='ignore')
-        writer.writeheader()
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            out = dict(row)
-            out['tdt_iso'] = _epoch_ms_to_iso(row.get('tdt'))
-            out['pdt_iso'] = _epoch_ms_to_iso(row.get('pdt'))
-            writer.writerow(out)
-
-    return filename, len([row for row in rows if isinstance(row, dict)])
-
-
 def menu_exportar_datos():
     while True:
         print("\n=== Obtener y exportar datos ===")
-        print("1. Histórico de trades globales")
+        print("1. Histórico de mercado")
         print("2. Histórico de candles")
         print("3. Atrás")
 
         opcion = input("Selecciona una opción: ").strip()
 
         if opcion == "1":
-            exportar_trades_menu()
+            exportar_mercado_menu()
         elif opcion == "2":
             exportar_candles_menu()
         elif opcion == "3":
@@ -164,34 +111,143 @@ def menu_exportar_datos():
             print("Opción inválida")
 
 
-def exportar_trades_menu():
-    print("\n=== Obtener y exportar histórico de trades globales a CSV ===")
+def exportar_mercado_menu():
+    print("\n=== Obtener histórico de mercado (trades públicos) ===")
+    print("=== Rango máximo por petición: 30 días (auto-splitting activado) ===")
+
+    symbol = input(f"Symbol [{SYMBOL}]: ").strip() or SYMBOL
+
+    from datetime import datetime, timezone
+
+    def _parse_date_to_ms(date_str: str, end_of_day: bool = False) -> int:
+        dt = datetime.strptime(date_str, "%Y%m%d")
+
+        if end_of_day:
+            dt = dt.replace(hour=23, minute=59, second=59, microsecond=999000)
+        else:
+            dt = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        return int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+    def _epoch_ms_to_iso(ms):
+        try:
+            return datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc).isoformat()
+        except Exception:
+            return ""
+
+    # =========================
+    # INPUT FECHAS
+    # =========================
 
     while True:
-        raw_days = input(
-            "¿De cuántos días atrás desde el momento actual quieres el histórico? [7]: "
-        ).strip()
+        start_str = input("Fecha inicio (YYYYMMDD): ").strip()
+        try:
+            since = _parse_date_to_ms(start_str)
+            break
+        except ValueError:
+            print("Formato inválido. Usa YYYYMMDD")
 
-        if not raw_days:
-            days_back = 7
+    while True:
+        end_str = input("Fecha fin (YYYYMMDD) [hoy]: ").strip()
+
+        if not end_str:
+            until = int(time.time() * 1000)
             break
 
         try:
-            days_back = int(raw_days)
-            if days_back < 1:
-                raise ValueError
+            until = _parse_date_to_ms(end_str, end_of_day=True)
             break
         except ValueError:
-            print("Introduce un número entero mayor o igual que 1.")
+            print("Formato inválido. Usa YYYYMMDD")
 
-    csv_path, row_count = _export_trades_history_to_csv(days_back)
-    if csv_path is None:
-        print("No se pudo generar el CSV. Revisa el log.")
+    if since > until:
+        print("La fecha de inicio no puede ser mayor que la fecha de fin.")
         return
 
-    print(f"CSV generado: {csv_path}")
-    print(f"Trades exportados: {row_count}")
-    log_event(f"Histórico de trades exportado a {csv_path} ({row_count} filas).", "info")
+    from api import get_market_trades_page
+
+    WINDOW_MS = 30 * 24 * 60 * 60 * 1000
+
+    all_rows = []
+    seen_ids = set()
+
+    window_start = since
+
+    # =========================
+    # LOOP POR VENTANAS
+    # =========================
+
+    while window_start <= until:
+        window_end = min(window_start + WINDOW_MS - 1, until)
+
+        print(f"\n--- Descargando ventana ---")
+        print(f"Desde: {datetime.fromtimestamp(window_start/1000)}")
+        print(f"Hasta: {datetime.fromtimestamp(window_end/1000)}")
+
+        cursor = None
+
+        while True:
+            response, logs = get_market_trades_page(
+                symbol=symbol,
+                start_date=window_start,
+                end_date=window_end,
+                cursor=cursor
+            )
+
+            for l in logs:
+                log_event(f"[LOG] {l['msg']}", l.get("level", "info"))
+
+            if not isinstance(response, dict) or response.get("error"):
+                print("Error obteniendo datos de mercado")
+                return
+
+            data = response.get("data", [])
+
+            if isinstance(data, list):
+                for row in data:
+                    tid = row.get("tid")
+
+                    # deduplicación REAL
+                    if tid and tid in seen_ids:
+                        continue
+
+                    if tid:
+                        seen_ids.add(tid)
+
+                    row["tdt_iso"] = _epoch_ms_to_iso(row.get("tdt"))
+                    all_rows.append(row)
+
+            metadata = response.get("metadata", {})
+            cursor = metadata.get("next_cursor")
+
+            if not cursor:
+                break
+
+        window_start = window_end + 1
+
+    # =========================
+    # EXPORT CSV
+    # =========================
+
+    if not all_rows:
+        print("No hay datos.")
+        return
+
+    end_label = end_str if end_str else "now"
+    filename = Path(f"market-{symbol}-{start_str}_to_{end_label}.csv")
+
+    fieldnames = sorted({k for row in all_rows for k in row.keys()})
+
+    with filename.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for row in all_rows:
+            writer.writerow(row)
+
+    print("\n=== EXPORT COMPLETADO ===")
+    print(f"CSV generado: {filename}")
+    print(f"Trades únicos exportados: {len(all_rows)}")
 
 
 def exportar_candles_menu():
@@ -278,7 +334,7 @@ def exportar_candles_menu():
         return
 
     end_label = end_str if end_str else "now"
-    filename = Path(f"candles-{symbol}-{interval}-{start_str}_to_{end_label}.csv")
+    filename = Path(f"candles-{symbol}-{interval}m-{start_str}_to_{end_label}.csv")
 
     with filename.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)

@@ -225,27 +225,20 @@ def get_historical_orders(limit: int = 50) -> Tuple[Dict[str, Any], List[LogEntr
     return response, logs
 
 
-
 MAX_TRADES_HISTORY_LIMIT = 1900
-_TRADES_HISTORY_WINDOW_MS = 30 * 24 * 60 * 60 * 1000
 
 
-def get_trades_history_page(
-    symbol: str = SYMBOL,
+def get_market_trades_page(
+    symbol: str,
     start_date: Optional[int] = None,
     end_date: Optional[int] = None,
     cursor: Optional[str] = None,
     limit: int = MAX_TRADES_HISTORY_LIMIT,
-) -> Tuple[Dict[str, Any], List[LogEntry]]:
-    """
-    Recupera una página del endpoint de trades histórico.
+):
+    params: Dict[str, Any] = {
+        "limit": max(1, min(int(limit), MAX_TRADES_HISTORY_LIMIT))
+    }
 
-    Endpoint:
-      GET /api/1.0/trades/all/{symbol}
-    """
-    safe_limit = max(1, min(int(limit), MAX_TRADES_HISTORY_LIMIT))
-
-    params: Dict[str, Any] = {"limit": safe_limit}
     if start_date is not None:
         params["start_date"] = int(start_date)
     if end_date is not None:
@@ -254,130 +247,14 @@ def get_trades_history_page(
         params["cursor"] = cursor
 
     query = urlencode(params)
-    response, logs = send_request("GET", f"/api/1.0/trades/all/{symbol}", query=query)
-    return response, logs
 
-
-def get_all_trades_history(
-    symbol: str = SYMBOL,
-    start_date: Optional[int] = None,
-    end_date: Optional[int] = None,
-    limit: int = MAX_TRADES_HISTORY_LIMIT,
-) -> Tuple[Dict[str, Any], List[LogEntry]]:
-    """
-    Recupera todo el histórico de trades para un rango arbitrario,
-    dividiendo automáticamente el periodo en ventanas de 30 días y
-    recorriendo toda la paginación mediante metadata.next_cursor.
-    """
-    logs: List[LogEntry] = []
-    safe_limit = max(1, min(int(limit), MAX_TRADES_HISTORY_LIMIT))
-
-    now_ms = int(time.time() * 1000)
-    if end_date is None:
-        end_date = now_ms
-    if start_date is None:
-        start_date = end_date - (7 * 24 * 60 * 60 * 1000)
-
-    start_date = int(start_date)
-    end_date = int(end_date)
-
-    if start_date > end_date:
-        log_event(
-            f"[API] get_all_trades_history: start_date > end_date ({start_date} > {end_date})",
-            "error",
-            logs,
-        )
-        return {
-            "error": True,
-            "status_code": None,
-            "body": "start_date must be <= end_date",
-        }, logs
-
-    all_rows: List[Dict[str, Any]] = []
-    last_timestamp = now_ms
-    window_start = start_date
-
-    while window_start <= end_date:
-        window_end = min(window_start + _TRADES_HISTORY_WINDOW_MS - 1, end_date)
-        cursor: Optional[str] = None
-
-        while True:
-            response, req_logs = get_trades_history_page(
-                symbol=symbol,
-                start_date=window_start,
-                end_date=window_end,
-                cursor=cursor,
-                limit=safe_limit,
-            )
-            logs.extend(req_logs)
-
-            if isinstance(response, dict) and response.get("error"):
-                return response, logs
-
-            if not isinstance(response, dict):
-                log_event(
-                    f"[API] get_all_trades_history: respuesta inesperada: {response}",
-                    "error",
-                    logs,
-                )
-                return {
-                    "error": True,
-                    "status_code": None,
-                    "body": "unexpected response format",
-                }, logs
-
-            data = response.get("data", [])
-            if isinstance(data, list):
-                all_rows.extend(item for item in data if isinstance(item, dict))
-
-            metadata = response.get("metadata", {})
-            if isinstance(metadata, dict) and isinstance(metadata.get("timestamp"), (int, float)):
-                last_timestamp = int(metadata["timestamp"])
-
-            next_cursor = metadata.get("next_cursor") if isinstance(metadata, dict) else None
-            if not next_cursor:
-                break
-
-            cursor = str(next_cursor)
-
-        window_start = window_end + 1
-
-    return {
-        "data": all_rows,
-        "metadata": {
-            "timestamp": last_timestamp,
-            "next_cursor": "",
-            "start_date": start_date,
-            "end_date": end_date,
-            "records": len(all_rows),
-        },
-    }, logs
-
-
-def get_all_trades_history_days_back(
-    days_back: int,
-    symbol: str = SYMBOL,
-    limit: int = MAX_TRADES_HISTORY_LIMIT,
-) -> Tuple[Dict[str, Any], List[LogEntry]]:
-    """
-    Recupera todo el histórico de trades de los últimos ``days_back`` días
-    contando hacia atrás desde el instante actual.
-
-    Args:
-        days_back: número de días hacia atrás desde ahora. Debe ser >= 1.
-        symbol: par de trading, por ejemplo ``BTC-USDC``.
-        limit: tamaño de página por request (1..1900).
-    """
-    safe_days = max(1, int(days_back))
-    end_date = int(time.time() * 1000)
-    start_date = end_date - (safe_days * 24 * 60 * 60 * 1000)
-
-    return get_all_trades_history(
-        symbol=symbol,
-        start_date=start_date,
-        end_date=end_date,
-        limit=limit,
+    response, logs = send_request(
+        "GET",
+        f"/api/1.0/trades/all/{symbol}",
+        query=query
     )
+
+    return response, logs
 
 
 def get_candles(
