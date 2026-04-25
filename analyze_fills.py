@@ -7,9 +7,6 @@ Añade métricas para detectar pares con step extendido/anómalo respecto al ste
   - gt_1x         : si step_usdc > 1 * step_base
   - gt_2x         : si step_usdc > 2 * step_base
   - gt_3x         : si step_usdc > 3 * step_base
-
-Uso:
-  python analyze_fills_anomalies.py [fills.csv]
 """
 
 import csv
