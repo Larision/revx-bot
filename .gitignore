@@ -216,3 +216,4 @@ __pycache__/
 *.csv
 *.xlsx
 start.sh
+grid_state.json
