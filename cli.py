@@ -616,16 +616,32 @@ def _trailing_menu(engine: "GridEngine") -> None:
 
     No devuelve nada.
     """
+    def _normalize_down_mode(value: object) -> str:
+        if isinstance(value, bool):
+            return "on" if value else "off"
+        mode = str(value).strip().lower()
+        if mode in {"off", "on", "extended", "extendido"}:
+            return "extended" if mode == "extendido" else mode
+        return "off"
+
+    def _mode_label(mode: str) -> str:
+        return {
+            "off": "OFF",
+            "on": "ON",
+            "extended": "EXTENDIDO",
+        }.get(mode, mode.upper())
+
     original_up = engine.trailing_up_enabled
-    original_down = engine.trailing_down_enabled
+    original_down = _normalize_down_mode(getattr(engine, "trailing_down_mode", engine.trailing_down_enabled))
 
     new_up = original_up
     new_down = original_down
+    cycle = ["off", "on", "extended"]
 
     while True:
         print("\n=== CONFIGURAR TRAILINGS ===")
         print(f"1. Trailing up   > {'ON' if new_up else 'OFF'}")
-        print(f"2. Trailing down > {'ON' if new_down else 'OFF'}")
+        print(f"2. Trailing down > {_mode_label(new_down)}")
         print("3. Atrás")
 
         opcion = input("Opción: ").strip()
@@ -634,7 +650,8 @@ def _trailing_menu(engine: "GridEngine") -> None:
             new_up = not new_up
 
         elif opcion == "2":
-            new_down = not new_down
+            idx = cycle.index(new_down) if new_down in cycle else 0
+            new_down = cycle[(idx + 1) % len(cycle)]
 
         elif opcion == "3":
             if new_up != original_up or new_down != original_down:
@@ -676,10 +693,11 @@ def format_balances_live(engine: Optional["GridEngine"] = None) -> str:
                 order_id = str(info["order_id"])
                 if order_id in {"virtual", "pending_post_only", "pending_manual"}:
                     continue
+                order_size = Decimal(str(info.get("size", base_size)))
                 if info["side"] == "sell":
-                    btc_en_grid += base_size
+                    btc_en_grid += order_size
                 elif info["side"] == "buy":
-                    usdc_en_grid += info["price"] * base_size
+                    usdc_en_grid += info["price"] * order_size
 
             lines.extend([
                 "",
@@ -891,7 +909,7 @@ def run_cli() -> None:
     base_size_default:    Decimal = DEFAULT_BASE_SIZE
     step_percent_default: Decimal = DEFAULT_STEP_PERCENT
 
-    print("GRID ENGINE v1.0 — CLI INTERACTIVO")
+    print("GRID ENGINE v1.1 — CLI INTERACTIVO")
 
     # Arrancar bot de Telegram solo si está habilitado en private_config.ini
     if telegram_enabled and start_telegram_bot is not None:
