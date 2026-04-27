@@ -637,7 +637,7 @@ class GridEngine:
     # STATE
     # ----------------------------------------------------------
 
-    def save_state(self) -> None:
+    def save_state(self) -> bool:
         """
         Persiste el estado actual del motor en STATE_PATH (grid_state.json).
         Se llama automáticamente tras cada cambio relevante.
@@ -647,8 +647,10 @@ class GridEngine:
 
         try:
             STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
+            return True
         except Exception as e:
             log_event(f"[STATE] Error guardando estado: {e}", "error")
+            return False
 
     def load_state(self) -> bool:
         """
@@ -1865,4 +1867,5 @@ class GridEngine:
 
         # Parada limpia (por stop() o Ctrl-C)
         log_event("[ENGINE] Detenido.", "info")
-        self.save_state()
+        if self.save_state():
+            log_event(f"[STATE] Estado guardado al salir en {STATE_PATH}", "info")
