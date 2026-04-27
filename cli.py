@@ -875,12 +875,10 @@ def show_menu(engine_running: bool = False) -> str:
     print("2. Ver balances")
     print("3. Obtener y exportar datos")
     print("4. Orden manual" + (" (bloqueada con engine)" if engine_running else ""))
-    print("5. Ver órdenes activas")
-    print("6. Ver orden por ID")
-    print("7. Cancelar todas órdenes" + (" (bloqueada con engine)" if engine_running else ""))
-    print("8. Iniciar Grid Engine" if not engine_running else "8. Engine ya en marcha")
-    print("9. Monitor del engine")
-    print("s. Detener engine")
+    print("5. Cancelar todas órdenes" + (" (bloqueada con engine)" if engine_running else ""))
+    print("6. Iniciar Grid Engine" if not engine_running else "8. Engine ya en marcha")
+    print("7. Monitor del engine")
+    print("8. Detener engine")
     print("c. Configuración manual")
     print("0. Salir")
     print("=" * 40)
@@ -996,60 +994,9 @@ def run_cli() -> None:
                 log_event("No se pudo colocar la orden manual.", "error")
 
         # --------------------------------------------------
-        # 5. Órdenes activas
+        # 5. Cancelar todas ordenes
         # --------------------------------------------------
         elif opcion == "5":
-            print("\n=== Órdenes activas ===")
-            resp, logs = get_active_orders()
-            for l in logs:
-                log_event(f"[LOG] {l['msg']}", "info")
-            log_event(f"{json.dumps(resp, indent=2, ensure_ascii=False)}", "info")
-
-        # --------------------------------------------------
-        # 6. Ver orden por ID
-        # --------------------------------------------------
-        elif opcion == "6":
-            print("\n=== Ver orden por ID ===")
-            order_id = input("Introduce el ID de la orden: ").strip()
-
-            if not order_id:
-                print("ID vacío. Operación abortada.")
-                continue
-
-            try:
-                resp, logs = get_order_by_id(order_id)
-
-                for l in logs:
-                    log_event(f"[LOG] {l['msg']}", "info")
-
-                if not resp:
-                    print("No se recibió respuesta del servidor.")
-                    log_event(f"[ERROR] Respuesta vacía al consultar la orden {order_id}.", "error")
-                    continue
-
-                if isinstance(resp, dict) and resp.get("error"):
-                    print(f"No se pudo encontrar la orden {order_id}: {resp.get('error')}")
-                    log_event(f"[ERROR] Consulta de orden {order_id}: {json.dumps(resp, indent=2, ensure_ascii=False)}", "error")
-                    continue
-
-                data = resp.get("data") if isinstance(resp, dict) else None
-                if not data:
-                    print(f"No existe una orden con ID {order_id}.")
-                    log_event(f"[WARNING] La orden {order_id} no existe o no devolvió datos.", "warning")
-                    if isinstance(resp, dict):
-                        log_event(f"{json.dumps(resp, indent=2, ensure_ascii=False)}", "warning")
-                    continue
-
-                log_event(f"{json.dumps(resp, indent=2, ensure_ascii=False)}", "info")
-
-            except Exception as exc:
-                log_event(f"[ERROR] No se pudo consultar la orden {order_id}: {exc}", "error")
-                print("No se pudo consultar la orden. Revisa el log.")
-
-        # --------------------------------------------------
-        # 7. Cancelar todas ordenes
-        # --------------------------------------------------
-        elif opcion == "7":
             if engine_running:
                 print("\n[!] El engine está en marcha.")
                 print("    Detén el engine (opción 's') antes de cancelar todas las órdenes.")
@@ -1063,9 +1010,9 @@ def run_cli() -> None:
                 log_event("Cancelación abortada.", "info")
 
         # --------------------------------------------------
-        # 8. Iniciar Grid Engine
+        # 6. Iniciar Grid Engine
         # --------------------------------------------------
-        elif opcion == "8":
+        elif opcion == "6":
             if engine_running:
                 print("El engine ya está en marcha.")
                 continue
@@ -1127,9 +1074,9 @@ def run_cli() -> None:
             continue
 
         # --------------------------------------------------
-        # 9. Monitor del engine
+        # 7. Monitor del engine
         # --------------------------------------------------
-        elif opcion == "9":
+        elif opcion == "7":
             if not engine_running or engine is None or engine_thread is None:
                 print("No hay engine en marcha.")
                 continue
@@ -1137,9 +1084,9 @@ def run_cli() -> None:
             run_engine_menu(engine, engine_thread)
         
         # --------------------------------------------------
-        # S. Detener engine
+        # 8. Detener engine
         # --------------------------------------------------
-        elif opcion == "s":
+        elif opcion == "8":
             if not engine_running or engine is None or engine_thread is None:
                 print("No hay engine en marcha.")
                 continue

@@ -2,9 +2,10 @@
 telegram_bot.py — Interfaz de control y monitorización via Telegram.
 
 Comandos disponibles:
-  /status    — precio actual, órdenes activas, fills de sesión
+  /status    — precio actual, órdenes activas, fills de sesión y trailings
   /grid      — niveles del grid con órdenes
   /balance   — balances disponibles y fondos comprometidos en el grid
+  /trailings — muestra o configura trailing up/down
   /start_engine  — arranca el engine (recupera estado si existe)
   /stop      — detiene el engine (requiere confirmación)
   /add_order — añade una orden manual (guiado por pasos)
@@ -24,7 +25,6 @@ Seguridad:
 import asyncio
 import logging
 import threading
-import time
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, cast
@@ -38,9 +38,15 @@ from telegram.ext import (
     filters,
 )
 
-from api import _price_key, fmt_amount
+from api import _price_key, fmt_amount, get_current_price
 from cli import format_balances_live
-from config import DEFAULT_BASE_SIZE, DEFAULT_GRID_STEPS, DEFAULT_STEP_PERCENT, STATE_PATH
+from config import (
+    DEFAULT_BASE_SIZE,
+    DEFAULT_GRID_LEVELS_ABOVE,
+    DEFAULT_GRID_LEVELS_BELOW,
+    DEFAULT_STEP_PERCENT,
+    STATE_PATH,
+)
 from logger import log_event
 
 if TYPE_CHECKING:
@@ -152,6 +158,89 @@ def _engine_running() -> bool:
     return engine is not None and thread is not None and thread.is_alive()
 
 
+def _normalize_trailing_down_mode(value: object) -> str:
+    """Normaliza el modo de trailing down usado por el engine."""
+    if isinstance(value, bool):
+        return "on" if value else "off"
+
+    mode = str(value).strip().lower()
+    if mode in {"off", "on", "extended"}:
+        return mode
+    if mode == "extendido":
+        return "extended"
+    return "off"
+
+
+def _trailing_mode_label(mode: str) -> str:
+    return {
+        "off": "OFF",
+        "on": "ON",
+        "extended": "EXTENDIDO",
+    }.get(mode, mode.upper())
+
+
+def _get_trailing_down_mode(engine: "GridEngine") -> str:
+    raw_mode = getattr(engine, "trailing_down_mode", None)
+    if raw_mode is None:
+        raw_mode = getattr(engine, "trailing_down_enabled", False)
+    return _normalize_trailing_down_mode(raw_mode)
+
+
+def _format_trailing_status(engine: "GridEngine") -> str:
+    up_enabled = bool(getattr(engine, "trailing_up_enabled", False))
+    down_mode = _get_trailing_down_mode(engine)
+
+    return (
+        "⚙️ *TRAILINGS*\n"
+        f"Trailing up   : `{'ON' if up_enabled else 'OFF'}`\n"
+        f"Trailing down : `{_trailing_mode_label(down_mode)}`\n\n"
+        "Cambiar configuración:\n"
+        "`/trailings up on` o `/trailings up off`\n"
+        "`/trailings down off`, `/trailings down on` o `/trailings down extended`"
+    )
+
+
+def _parse_on_off(value: str) -> Optional[bool]:
+    normalized = value.strip().lower()
+    if normalized in {"on", "true", "1", "si", "sí", "s", "enable", "enabled"}:
+        return True
+    if normalized in {"off", "false", "0", "no", "n", "disable", "disabled"}:
+        return False
+    return None
+
+
+def _parse_trailing_down_mode(value: str) -> Optional[str]:
+    normalized = value.strip().lower()
+    if normalized in {"off", "on", "extended"}:
+        return normalized
+    if normalized == "extendido":
+        return "extended"
+    return None
+
+
+def _apply_trailing_config(
+    engine: "GridEngine",
+    *,
+    trailing_up: Optional[bool] = None,
+    trailing_down: Optional[str] = None,
+) -> tuple[bool, str]:
+    """Aplica cambios de trailing en caliente usando GridEngine.set_trailing()."""
+    if not hasattr(engine, "set_trailing"):
+        return False, "El engine no expone set_trailing()."
+
+    current_up = bool(getattr(engine, "trailing_up_enabled", False))
+    current_down = _get_trailing_down_mode(engine)
+
+    new_up = current_up if trailing_up is None else trailing_up
+    new_down = current_down if trailing_down is None else _normalize_trailing_down_mode(trailing_down)
+
+    if new_down not in {"off", "on", "extended"}:
+        return False, "Modo de trailing down inválido."
+
+    engine.set_trailing(new_up, new_down)
+    return True, _format_trailing_status(engine)
+
+
 # =========================================================
 # Notificaciones (llamadas desde el engine)
 # =========================================================
@@ -214,6 +303,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Órdenes activas: `{len(snapshot['active_orders'])}`",
         f"Fills sesión  : `{len(snapshot['fill_history'])}`",
         f"Último fill   : `{snapshot['last_fill_side'] or 'ninguno'}`",
+        f"Trailing up   : `{'ON' if bool(getattr(eng, 'trailing_up_enabled', False)) else 'OFF'}`",
+        f"Trailing down : `{_trailing_mode_label(_get_trailing_down_mode(eng))}`",
     ]
     await message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -288,6 +379,63 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await message.reply_text(f"💰 *BALANCE*\n```\n{balance_text}\n```", parse_mode="Markdown")
 
 
+async def cmd_trailings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        return
+
+    message = _get_message(update)
+    if message is None:
+        return
+
+    if not _engine_running():
+        await message.reply_text("⚪ El engine no está corriendo.")
+        return
+
+    eng = _get_engine()
+    if eng is None:
+        await message.reply_text("⚪ Engine no disponible.")
+        return
+
+    raw_args = context.args or []
+    args = [arg.strip().lower() for arg in raw_args]
+    if not args:
+        await message.reply_text(_format_trailing_status(eng), parse_mode="Markdown")
+        return
+
+    if len(args) != 2 or args[0] not in {"up", "down"}:
+        await message.reply_text(
+            "Uso:\n"
+            "`/trailings`\n"
+            "`/trailings up on|off`\n"
+            "`/trailings down off|on|extended`",
+            parse_mode="Markdown",
+        )
+        return
+
+    target, value = args
+
+    if target == "up":
+        parsed = _parse_on_off(value)
+        if parsed is None:
+            await message.reply_text("Valor inválido. Usa `on` u `off`.", parse_mode="Markdown")
+            return
+        ok, response = _apply_trailing_config(eng, trailing_up=parsed)
+
+    else:
+        mode = _parse_trailing_down_mode(value)
+        if mode is None:
+            await message.reply_text("Valor inválido. Usa `off`, `on` o `extended`.", parse_mode="Markdown")
+            return
+        ok, response = _apply_trailing_config(eng, trailing_down=mode)
+
+    if not ok:
+        await message.reply_text(f"❌ {response}")
+        return
+
+    log_event("[TELEGRAM] Configuración de trailings modificada via Telegram.", "info")
+    await message.reply_text(response, parse_mode="Markdown")
+
+
 async def cmd_start_engine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     del context
     if not _authorized(update):
@@ -303,18 +451,46 @@ async def cmd_start_engine(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     from engine import GridEngine
 
-    engine = GridEngine(
-        steps_each_side=DEFAULT_GRID_STEPS,
-        step_percent=DEFAULT_STEP_PERCENT,
-        base_size=DEFAULT_BASE_SIZE,
-    )
+    recover_state = STATE_PATH.exists()
+    initial_price: Optional[Decimal] = None
 
-    if STATE_PATH.exists():
+    if recover_state:
         await message.reply_text("📂 Estado previo detectado — recuperando grid...")
     else:
-        await message.reply_text("🚀 Iniciando grid desde cero...")
+        current_price, logs = get_current_price()
+        for log_item in logs:
+            log_event(f"[TELEGRAM] {log_item['msg']}", log_item.get("level", "info"))
 
-    thread = threading.Thread(target=engine.run, daemon=True)
+        if current_price is None:
+            await message.reply_text("❌ No se pudo obtener precio actual para iniciar el grid.")
+            return
+
+        initial_price = current_price
+        await message.reply_text(
+            f"🚀 Iniciando grid desde cero con precio inicial `{_price_key(initial_price)} USDC`...",
+            parse_mode="Markdown",
+        )
+
+    engine = GridEngine(
+        levels_below=DEFAULT_GRID_LEVELS_BELOW,
+        levels_above=DEFAULT_GRID_LEVELS_ABOVE,
+        step_percent=DEFAULT_STEP_PERCENT,
+        base_size=DEFAULT_BASE_SIZE,
+        initial_price=initial_price,
+    )
+
+    try:
+        engine.initialize(recover_state=recover_state)
+    except Exception as exc:
+        log_event(f"[TELEGRAM] No se pudo inicializar el engine: {exc}", "error")
+        await message.reply_text(f"❌ No se pudo inicializar el engine: {exc}")
+        return
+
+    thread = threading.Thread(
+        target=engine.run,
+        daemon=True,
+        name="GridEngineThread",
+    )
     thread.start()
 
     _state.engine = engine
@@ -322,7 +498,6 @@ async def cmd_start_engine(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     log_event("[TELEGRAM] Engine iniciado via Telegram.", "info")
     await message.reply_text("✅ Engine en marcha.")
-
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     del context
@@ -458,6 +633,8 @@ async def cmd_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await message.reply_text("🛑 Deteniendo engine...")
         engine.stop()
         thread.join(timeout=10)
+        _state.engine = None
+        _state.engine_thread = None
         log_event("[TELEGRAM] Engine detenido via Telegram.", "info")
         await message.reply_text("✅ Engine detenido. Órdenes conservadas.")
         return
@@ -703,6 +880,7 @@ def start_telegram_bot() -> None:
         app.add_handler(CommandHandler("status", cmd_status))
         app.add_handler(CommandHandler("grid", cmd_grid))
         app.add_handler(CommandHandler("balance", cmd_balance))
+        app.add_handler(CommandHandler("trailings", cmd_trailings))
         app.add_handler(CommandHandler("start_engine", cmd_start_engine))
         app.add_handler(CommandHandler("stop", cmd_stop))
         app.add_handler(CommandHandler("add_order", cmd_add_order))
