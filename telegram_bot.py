@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, cast
 
 from telegram import Message, Update
+from telegram.error import NetworkError, TimedOut
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -270,6 +271,23 @@ def notify(message: str) -> None:
         )
     except Exception as exc:
         log_event(f"[TELEGRAM] Error enviando notificación: {exc}", "warning")
+
+
+# =========================================================
+# Handler global de errores
+# =========================================================
+
+async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Registra errores del bot sin volcar tracebacks completos en consola."""
+    del update
+
+    err = context.error
+
+    if isinstance(err, (NetworkError, TimedOut)):
+        log_event(f"[TELEGRAM] Error de red: {err}", "warning")
+        return
+
+    log_event(f"[TELEGRAM] Error no controlado: {type(err).__name__}: {err}", "error")
 
 
 # =========================================================
@@ -888,6 +906,7 @@ def start_telegram_bot() -> None:
         app.add_handler(CommandHandler("confirm", cmd_confirm))
         app.add_handler(CommandHandler("abort", cmd_abort))
         app.add_handler(CommandHandler("analyze", cmd_analyze))
+        app.add_error_handler(telegram_error_handler)
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
         log_event("[TELEGRAM] Bot iniciado.", "info")
