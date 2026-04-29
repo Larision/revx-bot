@@ -297,8 +297,7 @@ def exportar_candles_menu():
         end_str = input("Fecha fin (YYYYMMDD) [hoy]: ").strip()
 
         if not end_str:
-            now = int(time.time() * 1000)
-            until = now
+            until = int(time.time() * 1000)
             break
 
         try:
@@ -317,7 +316,7 @@ def exportar_candles_menu():
         symbol=symbol,
         interval=interval,
         since=since,
-        until=now
+        until=until
     )
 
     for l in logs:
