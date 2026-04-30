@@ -12,12 +12,14 @@ from logger import log_event, log_fill
 
 
 def _notify(msg: str) -> None:
-    """Wrapper seguro para notificaciones Telegram — no falla si el bot no está activo."""
+    """Envía notificación por Telegram si el bot está activo, ignora errores."""
     try:
         from telegram_bot import notify
         notify(msg)
     except Exception:
         pass
+
+
 from http_client import send_request
 from api import (
     _parse_balances,
@@ -36,6 +38,24 @@ from api import (
 
 
 class GridEngine:
+    """
+    Motor de grid trading para un par de trading (ej. BTC/USDC).
+
+    Gestiona una rejilla de órdenes limit con trailing dinámico (up y down)
+    y capacidad de extender el grid por debajo del nivel principal con
+    tamaños reducidos y pasos variables.
+
+    Atributos principales:
+        levels_below: Número de niveles por debajo del centro.
+        levels_above: Número de niveles por encima del centro.
+        step_percent: Porcentaje de separación entre niveles.
+        base_size: Tamaño base de cada orden (en el activo base, ej. BTC).
+        trailing_up_enabled: Habilita expansión hacia arriba.
+        trailing_down_mode: 'off', 'on' o 'extended' (expansión reducida).
+
+    El estado se persiste automáticamente en STATE_PATH para permitir
+    recuperación tras reinicios.
+    """
 
     def __init__(
         self,
@@ -45,7 +65,19 @@ class GridEngine:
         initial_price: Optional[Decimal] = None,
         levels_below: Optional[int] = None,
         levels_above: Optional[int] = None,
-    ):
+    ) -> None:
+        """
+        Inicializa el motor del grid.
+
+        Args:
+            steps_each_side: (deprecated) número de niveles a cada lado.
+            step_percent: Porcentaje de separación entre niveles (ej. 0.01 = 1%).
+            base_size: Tamaño base de cada orden (en el activo base).
+            initial_price: Precio inicial para centrar el grid (opcional).
+            levels_below: Niveles por debajo del centro.
+            levels_above: Niveles por encima del centro.
+        """
+        # Parámetros de configuración
         legacy_steps = int(steps_each_side) if steps_each_side is not None else 0
         self.levels_below: int       = int(levels_below) if levels_below is not None else legacy_steps
         self.levels_above: int       = int(levels_above) if levels_above is not None else legacy_steps
@@ -56,6 +88,7 @@ class GridEngine:
             Decimal(str(initial_price)) if initial_price is not None else None
         )
 
+        # Estado dinámico del grid
         self.center_price: Optional[Decimal] = None
         self.step: Optional[Decimal]         = None
         self.base_step: Optional[Decimal]    = None  # para restaurar el step original tras un trailing extendido
@@ -70,10 +103,11 @@ class GridEngine:
         # Cada entrada: {"side": str, "price": str, "order_id": str, "ts": float}
         self.fill_history: List[Dict[str, Any]] = []
 
+        # Control de hilos y sincronización
         self._stop_event = threading.Event()
         self._state_lock = threading.RLock()
 
-        # Guarda el estado de trailings
+        # Flags de trailing
         self.trailing_up_enabled: bool = True
         self.trailing_down_mode: str = 'on'  # 'off' | 'on' | 'extended'
         self.trailing_down_enabled: bool = True  # compatibilidad con estado antiguo
@@ -129,6 +163,7 @@ class GridEngine:
         return Decimal(str(step))
 
     def _decimal_from_meta(self, value: object, default: Decimal) -> Decimal:
+        """Convierte un valor desde metadatos a Decimal, con fallback."""
         try:
             parsed = Decimal(str(value))
             if parsed > 0:
@@ -138,6 +173,7 @@ class GridEngine:
         return default
 
     def _price_from_meta(self, value: object, default: Decimal) -> Decimal:
+        """Extrae un precio desde metadatos, lo redondea según TICK_SIZE."""
         try:
             return Decimal(str(value)).quantize(TICK_SIZE, rounding=ROUND_DOWN)
         except Exception:
@@ -148,6 +184,7 @@ class GridEngine:
         order_info: OrderInfo,
         metadata: Optional[Dict[str, Any]],
     ) -> OrderInfo:
+        """Aplica metadatos adicionales a una orden (extended, grid_step, etc.)."""
         if not metadata:
             return order_info
 
@@ -189,10 +226,15 @@ class GridEngine:
         return protected
 
     def _get_available_usdc(self) -> Decimal:
+        """Calcula USDC disponible para nuevas órdenes (reservando MIN_USDC_RESERVE)."""
         balances_resp, _ = get_all_balances()
         usdc_balance, _ = _parse_balances(balances_resp)
         available = usdc_balance - MIN_USDC_RESERVE
         return available if available > 0 else Decimal('0')
+
+    # ----------------------------------------------------------------------
+    #  Métodos de manipulación de órdenes virtuales y selección
+    # ----------------------------------------------------------------------
 
     def _find_highest_real_sell_order(self) -> Optional[Tuple[str, OrderInfo]]:
         """Devuelve la orden SELL real más alta para poder liberar saldo en trailing extendido."""
@@ -296,6 +338,10 @@ class GridEngine:
             ]
             self.extended_levels.pop(ceiling_key, None)
             return ceiling_key
+
+    # ----------------------------------------------------------------------
+    #  Gestión de trailing up (liberación de USDC)
+    # ----------------------------------------------------------------------
 
     def _release_usdc_for_trailing_up_buy(
         self,
@@ -452,6 +498,7 @@ class GridEngine:
     # ----------------------------------------------------------
 
     def _clone_order_info(self, info: OrderInfo) -> OrderInfo:
+        """Crea una copia superficial de OrderInfo, convirtiendo valores a tipos básicos."""
         cloned: OrderInfo = {
             "side": str(info["side"]),
             "order_id": str(info["order_id"]),
@@ -475,6 +522,7 @@ class GridEngine:
         return cloned
 
     def _serialise_order_info(self, info: OrderInfo) -> Dict[str, Any]:
+        """Prepara OrderInfo para serialización JSON."""
         payload: Dict[str, Any] = {
             "side": info["side"],
             "order_id": info["order_id"],
@@ -493,6 +541,7 @@ class GridEngine:
         return payload
 
     def _build_state_snapshot_locked(self) -> Dict[str, Any]:
+        """Construye el diccionario de estado completo para persistencia."""
         return {
             "version": VERSION,
             "steps_each_side": self.steps_each_side,
@@ -522,11 +571,19 @@ class GridEngine:
         }
 
     def get_runtime_snapshot(self, *, fill_history_limit: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Retorna una copia del estado actual del motor para monitorización.
+
+        Args:
+            fill_history_limit: Número máximo de entradas del historial de fills a incluir.
+
+        Returns:
+            Diccionario con precios, niveles, órdenes activas e historial.
+        """
         with self._state_lock:
             history = self.fill_history
             if fill_history_limit is not None:
                 history = history[-fill_history_limit:]
-
             return {
                 "center_price": self.center_price,
                 "step": self.step,
@@ -548,6 +605,7 @@ class GridEngine:
             }
 
     def get_order_info(self, key: str) -> Optional[OrderInfo]:
+        """Retorna información de una orden por su clave de precio, o None."""
         with self._state_lock:
             info = self.active_orders.get(key)
             if info is None:
@@ -644,7 +702,6 @@ class GridEngine:
         """
         with self._state_lock:
             state = self._build_state_snapshot_locked()
-
         try:
             STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
             return True
@@ -660,10 +717,9 @@ class GridEngine:
         """
         if not STATE_PATH.exists():
             return False
-
         try:
             raw = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-
+            # Recuperar parámetros básicos
             raw_steps = int(raw.get("steps_each_side", 0))
             levels_below = int(raw.get("levels_below", raw_steps))
             levels_above = int(raw.get("levels_above", raw_steps))
@@ -748,6 +804,7 @@ class GridEngine:
             )
             trailing_down_extended_drops = int(raw.get("trailing_down_extended_drops", 0) or 0)
 
+            # Si falta last_fill_price pero hay un solo nivel sin orden, inferir
             if last_fill_price is None:
                 missing_levels = [
                     level for level in levels
@@ -991,7 +1048,6 @@ class GridEngine:
         """
         if self.step is None:
             return False
-
         order_size = Decimal(str(size)) if size is not None else self.base_size
         key = _price_key(price)
 
@@ -1202,14 +1258,17 @@ class GridEngine:
                             self._place_order_safe(lvl_price, oside, self._order_size(info), metadata=retry_metadata or None)
                 continue
 
+            # Orden confirmada como filled en histórico
             if oid in confirmed_filled_ids:
                 filled_keys.append(key)
                 log_event(f"[DETECT_FILLS] {oside} confirmado para {key} (order_id: {oid})", "info", logs)
                 continue
 
+            # Orden aún activa en API -> ok
             if oid in current_api_ids:
                 continue
 
+            # Orden desaparecida pero reciente: esperar gracia
             age = time.time() - info.get("placed_at", 0)
             if age < EXTERNAL_CANCEL_GRACE:
                 continue
@@ -1692,6 +1751,7 @@ class GridEngine:
         last_fill_price = snapshot["last_fill_price"]
         last_fill_side = snapshot["last_fill_side"]
 
+        # Determinar qué nivel debe permanecer vacío (último fill)
         skip_level: Optional[Decimal] = None
         skip_reason = "heurística"
 

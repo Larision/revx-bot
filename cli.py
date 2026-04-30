@@ -27,10 +27,8 @@ from api import (
     _price_key,
     cancel_all_orders,
     fmt_amount,
-    get_active_orders,
     get_all_balances,
     get_current_price,
-    get_order_by_id,
     get_ticker_price,
     place_order,
 )
@@ -41,7 +39,13 @@ from api import (
 # =========================================================
 
 def manual_order() -> Tuple[Optional[str], Optional[Decimal], Optional[Decimal]]:
+    """
+    Pregunta al usuario el precio, lado y tamaño base de forma interactiva.
+    Confirma antes de devolver los valores.
 
+    Retorna:
+        Tupla (side, price, base_size) si se confirma, de lo contrario (None, None, None).
+    """
     while True:
         try:
             price_input = input("Precio: ")
@@ -76,9 +80,16 @@ def manual_order() -> Tuple[Optional[str], Optional[Decimal], Optional[Decimal]]
     return None, None, None
 
 
-
 def _epoch_ms_to_iso(ms: object) -> str:
-    """Convierte epoch ms a ISO UTC. Devuelve cadena vacía si no es válido."""
+    """
+    Convierte una marca de tiempo epoch (milisegundos) a una cadena ISO 8601 UTC.
+
+    Args:
+        ms: int, float o str que representa epoch en milisegundos.
+
+    Returns:
+        Cadena con formato ISO, o cadena vacía si falla la conversión.
+    """
     if ms is None or isinstance(ms, bool):
         return ''
     if not isinstance(ms, (int, float, str)):
@@ -92,7 +103,32 @@ def _epoch_ms_to_iso(ms: object) -> str:
     return datetime.fromtimestamp(value / 1000, tz=timezone.utc).isoformat()
 
 
+def _parse_date_to_ms(date_str: str, end_of_day: bool = False) -> int:
+    """
+    Convierte una cadena YYYYMMDD a milisegundos epoch en UTC.
+
+    Args:
+        date_str: Fecha en formato YYYYMMDD.
+        end_of_day: Si es True, establece la hora a 23:59:59.999 UTC; de lo contrario, medianoche.
+
+    Returns:
+        Milisegundos enteros desde epoch.
+
+    Raises:
+        ValueError: Si el formato de date_str es inválido.
+    """
+    dt = datetime.strptime(date_str, "%Y%m%d")
+    if end_of_day:
+        dt = dt.replace(hour=23, minute=59, second=59, microsecond=999000)
+    else:
+        dt = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    return int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+
 def menu_exportar_datos():
+    """
+    Submenú para obtener y exportar datos históricos de mercado (trades o velas).
+    """
     while True:
         print("\n=== Obtener y exportar datos ===")
         print("1. Histórico de mercado")
@@ -112,33 +148,16 @@ def menu_exportar_datos():
 
 
 def exportar_mercado_menu():
+    """
+    Submenú interactivo para descargar y exportar trades públicos de mercado (hasta 30 días por solicitud, con auto‑división).
+    Los resultados se guardan como un archivo CSV.
+    """
     print("\n=== Obtener histórico de mercado (trades públicos) ===")
     print("=== Rango máximo por petición: 30 días (auto-splitting activado) ===")
 
     symbol = input(f"Symbol [{SYMBOL}]: ").strip() or SYMBOL
 
-    from datetime import datetime, timezone
-
-    def _parse_date_to_ms(date_str: str, end_of_day: bool = False) -> int:
-        dt = datetime.strptime(date_str, "%Y%m%d")
-
-        if end_of_day:
-            dt = dt.replace(hour=23, minute=59, second=59, microsecond=999000)
-        else:
-            dt = dt.replace(hour=0, minute=0, second=0, microsecond=0)
-
-        return int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
-
-    def _epoch_ms_to_iso(ms):
-        try:
-            return datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc).isoformat()
-        except Exception:
-            return ""
-
-    # =========================
-    # INPUT FECHAS
-    # =========================
-
+    # Fechas de inicio y fin
     while True:
         start_str = input("Fecha inicio (YYYYMMDD): ").strip()
         try:
@@ -149,11 +168,9 @@ def exportar_mercado_menu():
 
     while True:
         end_str = input("Fecha fin (YYYYMMDD) [hoy]: ").strip()
-
         if not end_str:
             until = int(time.time() * 1000)
             break
-
         try:
             until = _parse_date_to_ms(end_str, end_of_day=True)
             break
@@ -167,25 +184,18 @@ def exportar_mercado_menu():
     from api import get_market_trades_page
 
     WINDOW_MS = 30 * 24 * 60 * 60 * 1000
-
     all_rows = []
     seen_ids = set()
-
     window_start = since
 
-    # =========================
-    # LOOP POR VENTANAS
-    # =========================
-
+    # Descargar por ventanas de 30 días
     while window_start <= until:
         window_end = min(window_start + WINDOW_MS - 1, until)
-
         print(f"\n--- Descargando ventana ---")
         print(f"Desde: {datetime.fromtimestamp(window_start/1000)}")
         print(f"Hasta: {datetime.fromtimestamp(window_end/1000)}")
 
         cursor = None
-
         while True:
             response, logs = get_market_trades_page(
                 symbol=symbol,
@@ -193,7 +203,6 @@ def exportar_mercado_menu():
                 end_date=window_end,
                 cursor=cursor
             )
-
             for l in logs:
                 log_event(f"[LOG] {l['msg']}", l.get("level", "info"))
 
@@ -202,32 +211,22 @@ def exportar_mercado_menu():
                 return
 
             data = response.get("data", [])
-
             if isinstance(data, list):
                 for row in data:
                     tid = row.get("tid")
-
-                    # deduplicación REAL
                     if tid and tid in seen_ids:
                         continue
-
                     if tid:
                         seen_ids.add(tid)
-
                     row["tdt_iso"] = _epoch_ms_to_iso(row.get("tdt"))
                     all_rows.append(row)
 
             metadata = response.get("metadata", {})
             cursor = metadata.get("next_cursor")
-
             if not cursor:
                 break
 
         window_start = window_end + 1
-
-    # =========================
-    # EXPORT CSV
-    # =========================
 
     if not all_rows:
         print("No hay datos.")
@@ -237,11 +236,9 @@ def exportar_mercado_menu():
     filename = Path(f"market-{symbol}-{start_str}_to_{end_label}.csv")
 
     fieldnames = sorted({k for row in all_rows for k in row.keys()})
-
     with filename.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-
         for row in all_rows:
             writer.writerow(row)
 
@@ -251,6 +248,10 @@ def exportar_mercado_menu():
 
 
 def exportar_candles_menu():
+    """
+    Submenú interactivo para descargar y exportar datos históricos de velas.
+    Los resultados se guardan como un archivo CSV.
+    """
     print("\n=== Obtener y exportar histórico de candles ===")
     print("\n=== Maximo intervalo permitido = 50000 candles (ej: 1 mes con 1 min) ===")
 
@@ -266,24 +267,6 @@ def exportar_candles_menu():
         except ValueError:
             print("Intervalo inválido.")
 
-    from datetime import datetime, timezone
-
-    def _parse_date_to_ms(date_str: str, end_of_day: bool = False) -> int:
-        """
-        Convierte YYYYMMDD a timestamp ms en UTC.
-        Si end_of_day=True → 23:59:59.999
-        """
-        dt = datetime.strptime(date_str, "%Y%m%d")
-
-        if end_of_day:
-            dt = dt.replace(hour=23, minute=59, second=59, microsecond=999000)
-        else:
-            dt = dt.replace(hour=0, minute=0, second=0, microsecond=0)
-
-        return int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
-
-
-    # Fecha inicio
     while True:
         start_str = input("Fecha inicio (YYYYMMDD): ").strip()
         try:
@@ -292,20 +275,17 @@ def exportar_candles_menu():
         except ValueError:
             print("Formato inválido. Usa YYYYMMDD (ej: 20260415)")
 
-    # Fecha fin (default = ahora)
     while True:
         end_str = input("Fecha fin (YYYYMMDD) [hoy]: ").strip()
-
         if not end_str:
             until = int(time.time() * 1000)
             break
-
         try:
             until = _parse_date_to_ms(end_str, end_of_day=True)
             break
         except ValueError:
             print("Formato inválido. Usa YYYYMMDD (ej: 20260415)")
-    
+
     if since > until:
         print("La fecha de inicio no puede ser mayor que la fecha de fin.")
         return
@@ -318,7 +298,6 @@ def exportar_candles_menu():
         since=since,
         until=until
     )
-
     for l in logs:
         log_event(f"[LOG] {l['msg']}", l.get("level", "info"))
 
@@ -327,7 +306,6 @@ def exportar_candles_menu():
         return
 
     data = response.get("data", [])
-
     if not data:
         print("No hay datos.")
         return
@@ -338,7 +316,6 @@ def exportar_candles_menu():
     with filename.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["start", "open", "high", "low", "close", "volume"])
-
         for c in data:
             writer.writerow([
                 c.get("start"),
@@ -353,15 +330,17 @@ def exportar_candles_menu():
     print(f"Candles exportados: {len(data)}")
 
 
-
 # =========================================================
 # =================== GRID PREVIEW ========================
 # =========================================================
 
 def choose_initial_grid_price() -> Optional[Decimal]:
     """
-    Consulta bid/ask/mid con get_ticker_price() y pide al usuario el precio
-    inicial del grid. El valor por defecto es mid.
+    Obtiene el bid/ask/mid actual del ticker y pregunta al usuario el precio inicial del grid.
+    El valor predeterminado es el precio medio.
+
+    Retorna:
+        Precio Decimal cuantizado a TICK_SIZE, o None en caso de fallo.
     """
     print("\n  Consultando bid/ask/mid...")
 
@@ -421,10 +400,20 @@ def show_grid_preview(
     step_percent: Decimal,
 ) -> Tuple[bool, Optional[Decimal]]:
     """
-    Muestra la configuración del grid y los fondos necesarios antes de iniciar.
-    Devuelve (confirmado, precio_inicial).
+    Muestra un resumen de la configuración del grid, los fondos requeridos y los saldos actuales.
+    Solicita al usuario confirmar el inicio del motor.
+
+    Args:
+        levels_below: Número de niveles de compra por debajo del precio inicial.
+        levels_above: Número de niveles de venta por encima del precio inicial.
+        base_size: Tamaño de orden por nivel.
+        step_percent: Porcentaje de paso entre niveles (como Decimal, ej. 0.01 para 1%).
+
+    Retorna:
+        Tupla (confirmado: bool, initial_price: Optional[Decimal]).
     """
     def _lp(msg: str = "", level: str = "info") -> None:
+        """Imprime y registra un mensaje."""
         print(msg)
         if msg.strip():
             log_file(msg.strip(), level)
@@ -450,6 +439,7 @@ def show_grid_preview(
     _lp(f"\n  Precio inicial   : {_price_key(initial_price)} USDC")
     _lp(f"  Step calculado   : {_price_key(step_val)} USDC entre niveles  ({fmt_amount(step_percent * 100)}%)")
 
+    # Build all grid levels
     levels = []
     for i in range(-levels_below, levels_above + 1):
         lvl = (initial_price + (Decimal(i) * step_val)).quantize(TICK_SIZE, rounding=ROUND_DOWN)
@@ -512,7 +502,9 @@ def show_grid_preview(
 # =========================================================
 
 def _show_grid_levels(engine: "GridEngine") -> None:
-    """Muestra los niveles del grid con el estado de cada orden."""
+    """
+    Imprime los niveles del grid con el estado de cada orden (filled, virtual, pendiente, etc.).
+    """
     snapshot = engine.get_runtime_snapshot()
     levels = sorted(snapshot["levels"], reverse=True)
     price = snapshot["current_price"]
@@ -560,7 +552,9 @@ def _show_grid_levels(engine: "GridEngine") -> None:
 
 
 def _show_active_orders(engine: "GridEngine") -> None:
-    """Lista las órdenes activas ordenadas por precio, separadas por side."""
+    """
+    Lista todas las órdenes activas registradas por el motor, agrupadas por lado y ordenadas por precio.
+    """
     orders = engine.get_runtime_snapshot()["active_orders"]
 
     if not orders:
@@ -608,14 +602,11 @@ def _show_active_orders(engine: "GridEngine") -> None:
 
 def _trailing_menu(engine: "GridEngine") -> None:
     """
-    Interfaz de línea de comandos para configurar trailing up y down en vivo.
-
-    Muestra un menú con opciones para habilitar/deshabilitar trailing up y down,
-    y permite aplicar cambios en caliente o descartarlos.
-
-    No devuelve nada.
+    Menú interactivo para la configuración en vivo de trailing up/down.
+    Los cambios se pueden aplicar inmediatamente o descartar.
     """
     def _normalize_down_mode(value: object) -> str:
+        """Normaliza el modo de trailing down a 'off', 'on' o 'extended'."""
         if isinstance(value, bool):
             return "on" if value else "off"
         mode = str(value).strip().lower()
@@ -624,6 +615,7 @@ def _trailing_menu(engine: "GridEngine") -> None:
         return "off"
 
     def _mode_label(mode: str) -> str:
+        """Devuelve una etiqueta de visualización para el modo de trailing down."""
         return {
             "off": "OFF",
             "on": "ON",
@@ -647,11 +639,9 @@ def _trailing_menu(engine: "GridEngine") -> None:
 
         if opcion == "1":
             new_up = not new_up
-
         elif opcion == "2":
             idx = cycle.index(new_down) if new_down in cycle else 0
             new_down = cycle[(idx + 1) % len(cycle)]
-
         elif opcion == "3":
             if new_up != original_up or new_down != original_down:
                 confirm = input("¿Aplicar cambios? (s/n): ").strip().lower()
@@ -661,13 +651,20 @@ def _trailing_menu(engine: "GridEngine") -> None:
                 else:
                     print("Cambios descartados")
             return
-
         else:
             print("Opción inválida")
 
 
 def format_balances_live(engine: Optional["GridEngine"] = None) -> str:
-    """Devuelve un resumen legible de balances, incluyendo fondos comprometidos en la rejilla."""
+    """
+    Construye una cadena legible para humanos que muestra los saldos disponibles y los fondos asignados en el grid.
+
+    Args:
+        engine: Instancia opcional de GridEngine; si se proporciona, se contabilizan las órdenes del grid.
+
+    Retorna:
+        Cadena de varias líneas con los saldos.
+    """
     balances_resp, _ = get_all_balances()
     usdc, btc = _parse_balances(balances_resp)
 
@@ -716,7 +713,9 @@ def format_balances_live(engine: Optional["GridEngine"] = None) -> str:
 
 
 def _show_balances_live(engine: Optional["GridEngine"] = None) -> None:
-    """Consulta y muestra los balances en tiempo real, incluyendo lo comprometido en la rejilla."""
+    """
+    Imprime los balances actuales (incluyendo asignaciones del grid) en la consola.
+    """
     print("  Consultando balances...")
     summary = format_balances_live(engine)
     print("\n" + "\n".join(f"  {line}" if line else "" for line in summary.splitlines()) + "\n")
@@ -724,8 +723,8 @@ def _show_balances_live(engine: Optional["GridEngine"] = None) -> None:
 
 def _add_manual_order(engine: "GridEngine") -> None:
     """
-    Permite colocar una orden manual y registrarla en active_orders del engine.
-    Reserva el nivel antes de enviar para evitar carreras con el hilo del engine.
+    Función interactiva para colocar una orden manual y registrarla en las órdenes activas del motor.
+    Reserva el nivel antes de enviar para evitar condiciones de carrera.
     """
     while True:
         try:
@@ -773,7 +772,9 @@ def _add_manual_order(engine: "GridEngine") -> None:
 
 
 def _fill_empty_levels(engine: "GridEngine") -> None:
-    """Ejecuta manualmente fill_empty_levels usando un precio fresco."""
+    """
+    Activa un llenado manual de los niveles vacíos del grid utilizando un precio fresco.
+    """
     print("  Consultando precio actual...")
     current_price, _ = get_current_price()
 
@@ -805,8 +806,11 @@ def _fill_empty_levels(engine: "GridEngine") -> None:
 
 def run_engine_menu(engine: "GridEngine", engine_thread: threading.Thread) -> None:
     """
-    Submenú interactivo del engine.
-    Permite monitorizar sin bloquear el menú principal.
+    Submenú de monitor interactivo para una instancia de GridEngine en ejecución.
+
+    Args:
+        engine: El objeto GridEngine en ejecución.
+        engine_thread: El hilo en el que se está ejecutando el motor.
     """
     while engine_thread.is_alive():
         snapshot = engine.get_runtime_snapshot()
@@ -837,27 +841,21 @@ def run_engine_menu(engine: "GridEngine", engine_thread: threading.Thread) -> No
 
         if opcion == "1":
             _show_grid_levels(engine)
-
         elif opcion == "2":
             _show_active_orders(engine)
-
         elif opcion == "3":
             _trailing_menu(engine)
-
         elif opcion == "4":
             _show_balances_live(engine)
-
         elif opcion == "5":
             _add_manual_order(engine)
-
         elif opcion == "6":
             _fill_empty_levels(engine)
-
         elif opcion.lower() == "v":
             print("  Volviendo al menú principal...")
             break
 
-    # El hilo murió solo (error inesperado)
+    # If the engine stopped unexpectedly, warn the user
     if not engine_thread.is_alive() and engine.is_running():
         print("\n  [!] El engine se detuvo inesperadamente. Revisa el log.")
 
@@ -867,6 +865,15 @@ def run_engine_menu(engine: "GridEngine", engine_thread: threading.Thread) -> No
 # =========================================================
 
 def show_menu(engine_running: bool = False) -> str:
+    """
+    Muestra el menú principal de la CLI y devuelve la opción del usuario.
+
+    Args:
+        engine_running: Si es True, algunas opciones se muestran como bloqueadas.
+
+    Retorna:
+        Opción en minúsculas y sin espacios.
+    """
     print("=" * 40)
     print("MENÚ PRINCIPAL")
     print("=" * 40)
@@ -889,6 +896,10 @@ def show_menu(engine_running: bool = False) -> str:
 # =========================================================
 
 def run_cli() -> None:
+    """
+    Punto de entrada de la CLI interactiva.
+    Gestiona el bucle principal del menú, el ciclo de vida del motor y la integración con el bot de Telegram.
+    """
     from engine import GridEngine
     from private_config import get_telegram_enabled
 
@@ -913,7 +924,7 @@ def run_cli() -> None:
         start_telegram_bot()
     else:
         log_event("[TELEGRAM] Bot deshabilitado por configuración ([telegram] enabled = false).", "info")
-    
+
     engine: Optional[GridEngine] = None
     engine_thread: Optional[threading.Thread] = None
 
@@ -1081,7 +1092,7 @@ def run_cli() -> None:
                 continue
 
             run_engine_menu(engine, engine_thread)
-        
+
         # --------------------------------------------------
         # 8. Detener engine
         # --------------------------------------------------
@@ -1102,7 +1113,7 @@ def run_cli() -> None:
                 print("El engine no respondió en 10s.")
             else:
                 print("Engine detenido.")
-            
+
             try:
                 resp = input("  ¿Cancelar todas las órdenes? (s/n): ").strip().lower()
                 if resp.startswith("s"):
@@ -1116,9 +1127,9 @@ def run_cli() -> None:
 
             engine = None
             engine_thread = None
-        
+
         # --------------------------------------------------
-        # Configuración
+        # c.Configuración manual
         # --------------------------------------------------
         elif opcion.lower() == "c":
             print("\n=== Configuración manual ===")
@@ -1152,7 +1163,7 @@ def run_cli() -> None:
                     log_event("[ERROR] Valor de step percent inválido, conservando el anterior.", "error")
 
         # --------------------------------------------------
-        # Salir
+        # 0.Salir
         # --------------------------------------------------
         elif opcion == "0":
             print("¡Hasta luego!")
