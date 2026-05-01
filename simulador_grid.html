@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Grid Trading — Trailing Down Extended Simulator v4</title>
+<style>
+:root {
+  --bg:         #0f1117;
+  --bg2:        #1a1d27;
+  --bg3:        #22263a;
+  --border:     #2e3349;
+  --border2:    #3a4060;
+  --text:       #e2e8f0;
+  --text2:      #94a3b8;
+  --text3:      #64748b;
+  --green:      #22c55e;
+  --green-bg:   #052e16;
+  --green-bd:   #166534;
+  --red:        #ef4444;
+  --red-bg:     #2d0a0a;
+  --red-bd:     #7f1d1d;
+  --yellow:     #f59e0b;
+  --yellow-bg:  #2d1a00;
+  --blue:       #60a5fa;
+  --blue-bg:    #0d1f40;
+  --mono:       'JetBrains Mono', 'Fira Mono', 'Consolas', monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:var(--mono);font-size:13px;padding:18px}
+h1{font-size:15px;font-weight:600;color:var(--text);margin-bottom:14px;letter-spacing:.5px}
+.mbar{display:grid;grid-template-columns:repeat(6,1fr);gap:5px;margin-bottom:12px}
+.mc{background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:7px 10px}
+.ml{font-size:10px;color:var(--text3);margin-bottom:3px}
+.mv{font-size:13px;font-weight:600;color:var(--text)}
+.wrap{display:flex;gap:14px;align-items:flex-start}
+.ldr{flex:0 0 290px}
+.lhint{font-size:10px;color:var(--text3);margin-bottom:6px}
+.lrow{display:flex;align-items:center;gap:4px;margin-bottom:3px}
+.lp{color:var(--text3);width:64px;text-align:right;font-size:11px;flex-shrink:0}
+.ob{flex:1;display:flex;justify-content:space-between;align-items:center;padding:3px 8px;border-radius:4px;cursor:pointer;font-family:var(--mono);font-size:10px;transition:filter .12s;color:var(--text)}
+.ob:hover{filter:brightness(1.15)}
+.ob:active{transform:scale(.98)}
+.oe{flex:1;height:22px;border-bottom:1px dotted var(--border2)}
+.logbox{background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:10px;height:480px;overflow-y:auto;line-height:1.65}
+.ll{font-size:10px;color:var(--text2);white-space:pre-wrap;word-break:break-all}
+.ll.fill{color:var(--text);font-weight:600;border-top:1px solid var(--border);margin-top:5px;padding-top:5px}
+.ll.ok  {color:var(--green)}
+.ll.warn{color:var(--yellow)}
+.ll.err {color:var(--red)}
+.ll.info{color:var(--blue)}
+.btns{display:flex;gap:6px;margin-top:9px}
+button{background:var(--bg3);border:1px solid var(--border2);color:var(--text);border-radius:5px;padding:5px 10px;cursor:pointer;font-family:var(--mono);font-size:11px;transition:background .12s}
+button:hover{background:var(--border)}
+.sclabel{font-size:10px;color:var(--text3);margin-top:9px;background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:8px;line-height:1.7}
+.sclabel b{color:var(--text2)}
+.extbadge{font-size:8px;background:var(--blue-bg);color:var(--blue);padding:1px 3px;border-radius:2px;margin-left:3px}
+.tag-floor{font-size:8px;background:var(--yellow-bg);color:var(--yellow);padding:1px 3px;border-radius:2px;margin-left:3px}
+.tag-top  {font-size:8px;background:var(--blue-bg);color:var(--blue);padding:1px 3px;border-radius:2px;margin-left:3px}
+</style>
+</head>
+<body>
+<h1>Grid Trading · Trailing Down Extended · Simulator v4</h1>
+<div style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap">
+
+  <div>
+    <div style="font-size:10px;color:#64748b">Precio centro</div>
+    <input id="cfg_price" value="1000" style="width:80px">
+  </div>
+
+  <div>
+    <div style="font-size:10px;color:#64748b">Step</div>
+    <input id="cfg_step" value="20" style="width:60px">
+  </div>
+
+  <div>
+    <div style="font-size:10px;color:#64748b">Líneas por lado</div>
+    <input id="cfg_lines" value="5" style="width:60px">
+  </div>
+
+  <div>
+    <div style="font-size:10px;color:#64748b">Size</div>
+    <input id="cfg_size" value="0.01" style="width:70px">
+  </div>
+
+  <div style="display:flex;align-items:end">
+    <button onclick="applyConfig()">Aplicar</button>
+  </div>
+
+</div>
+<div id="mbar" class="mbar"></div>
+<div class="wrap">
+  <div class="ldr">
+    <div class="lhint">Click en una orden para ejecutar fill | borde amarillo = siguiente sugerido</div>
+    <div id="ldr"></div>
+    <div class="btns">
+      <button onclick="next()" style="flex:1">Siguiente ↗</button>
+      <button onclick="undo()">Undo</button>
+      <button onclick="reset()">Reset</button>
+    </div>
+    <div class="sclabel" id="sclabel">—</div>
+  </div>
+  <div style="flex:1"><div class="logbox" id="logbox"></div></div>
+</div>
+<script>
+const r2=n=>parseFloat(n.toFixed(2));
+const r5=n=>parseFloat(n.toFixed(5));
+const pk=p=>parseFloat(r2(p).toFixed(2)).toFixed(2);
+const eq=(a,b)=>Math.abs(a-b)<0.005;
+
+const STEPS=[
+  ["Toca suelo principal → fill BUY@960",             "buy_principal"],
+  ["1ª bajada virtual ext (drops→1, cancel impar)",   "vbuy_ext"],
+  ["2ª bajada virtual ext (drops→2, sin cancel)",     "vbuy_ext"],
+  ["3ª bajada virtual ext (drops→3, cancel)",         "vbuy_ext"],
+  ["Sube: fill SELL ext más bajo",                    "sell_ext_low"],
+  ["Sube: fill SELL ext siguiente",                   "sell_ext_low"],
+  ["Sube: fill SELL principal (real) → BUY directo",  "sell_principal_low"],
+  ["Sube: fill vSELL techo → BUY con check USDC",     "vsell_top"],
+  ["Baja: fill vBUY ext (drops→4, sin cancel)",       "vbuy_ext"],
+  ["Baja: fill vBUY ext (drops→5, cancel)",           "vbuy_ext"],
+];
+
+let history=[],S;
+
+function mkS(cfg = null) {
+
+  const price = cfg?.price ?? 1000;
+  const step = cfg?.step ?? 20;
+  const lines = cfg?.lines ?? 5;
+  const size = cfg?.size ?? 0.01;
+
+  const levels = [];
+
+  for (let i = -lines; i <= lines; i++) {
+    levels.push(r2(price + (i * step)));
+  }
+
+  const orders = {};
+
+  levels.forEach(lvl => {
+    const k = pk(lvl);
+
+    if (lvl < price) {
+      orders[k] = {
+        side: "buy",
+        oid: `r${k}`,
+        price: lvl,
+        size: size,
+        extended: false,
+        gs: null,
+        ps: null
+      };
+    }
+
+    if (lvl > price) {
+      orders[k] = {
+        side: "sell",
+        oid: `r${k}`,
+        price: lvl,
+        size: size,
+        extended: false,
+        gs: null,
+        ps: null
+      };
+    }
+  });
+
+  return {
+    base_step: step,
+    base_size: size,
+    drops: 0,
+    up_steps: 0,
+    fc: 0,
+    si: 0,
+    levels,
+    ext: Object.create(null),
+    orders,
+    usdc: 5.00,
+    btc: 0.00,
+    log: [
+      {c: "fill", t: `INIT | price=${price} step=${step} size=${size}`},
+      {c: "", t: `levels=${levels.length}`},
+      {c: "", t: " "}
+    ],
+  };
+}
+
+function applyConfig() {
+  const price = parseFloat(document.getElementById("cfg_price").value);
+  const step = parseFloat(document.getElementById("cfg_step").value);
+  const lines = parseInt(document.getElementById("cfg_lines").value);
+  const size = parseFloat(document.getElementById("cfg_size").value);
+
+  history = [];
+  S = mkS({price, step, lines, size});
+  render();
+}
+
+function cp(s){
+  return{...s,levels:[...s.levels],ext:{...s.ext},
+    orders:JSON.parse(JSON.stringify(s.orders)),log:[...s.log]};
+}
+const lg=(s,c,t)=>s.log.push({c,t});
+function principalLevels(s){return s.levels.filter(l=>!s.ext[pk(l)]);}
+function extSize(s){return r5(s.base_size*0.5);}
+
+// Simula _trailing_up_size_for_steps: decae exponencialmente con steps, suelo 25% base_size
+function trailingUpSize(s, steps) {
+  const reduction = 0.025;
+  const minFactor = 0.30;
+
+  let factor = 1 - (reduction * steps);
+  if (factor < minFactor) factor = minFactor;
+
+  return r5(s.base_size * factor);
+}
+
+// Simula _remove_highest_virtual_sell_order
+function removeHighestVirtualSell(s){
+  const vsells=Object.entries(s.orders)
+    .filter(([,o])=>o.side==="sell"&&o.oid==="virtual")
+    .sort(([a],[b])=>parseFloat(b)-parseFloat(a));
+  if(!vsells.length) return null;
+  const[k]=vsells[0];
+  delete s.orders[k];
+  s.levels=s.levels.filter(l=>!eq(l,parseFloat(k)));
+  lg(s,"warn",`  ~ vSELL techo ${k} eliminada tras cancel SELL real`);
+  return k;
+}
+function markExt(s,price,gs){
+  const k=pk(price);s.ext[k]=gs;
+  if(!s.levels.find(l=>eq(l,price)))s.levels.push(price);
+}
+
+function cancelHighSell(s){
+  const real=Object.entries(s.orders)
+    .filter(([,o])=>o.side==="sell"&&!["virtual","pending_post_only","pending_manual","pending_cancel"].includes(o.oid))
+    .sort(([a],[b])=>parseFloat(b)-parseFloat(a));
+  if(!real.length){lg(s,"warn","  ! Sin SELL real para cancelar");return;}
+  const[k,o]=real[0];
+  s.btc=r5(s.btc+o.size);
+  delete s.orders[k];delete s.ext[k];
+  s.levels=s.levels.filter(l=>!eq(l,parseFloat(k)));
+  lg(s,"err",`  x CANCEL SELL@${k} [${o.extended?"EXT":"PRINCIPAL"}] sz=${o.size.toFixed(5)} → btc+${o.size.toFixed(5)}=${s.btc.toFixed(5)}`);
+}
+
+function placeOrd(s, price, side, size, extended = false, gs = null, ps = null, tu_step = null) {
+  const k=pk(price);
+  if(s.orders[k]){lg(s,"warn",`  ! SKIP ${side.toUpperCase()}@${k} ocupado`);return false;}
+  if(side==="buy"){
+    const cost=r2(size*price);
+    if(s.usdc<cost-0.0001){lg(s,"warn",`  ! SKIP BUY@${k} usdc=${s.usdc.toFixed(4)} req=${cost.toFixed(4)}`);return false;}
+    s.usdc=r2(s.usdc-cost);
+  }else{
+    if(s.btc<size-0.000001){lg(s,"warn",`  ! SKIP SELL@${k} btc=${s.btc.toFixed(5)} req=${size.toFixed(5)}`);return false;}
+    s.btc=r5(s.btc-size);
+  }
+  s.orders[k]={side,oid:`${side[0]}_${k}`,price,size,extended,gs,ps,trailing_up_step: tu_step};
+  if(!s.levels.find(l=>eq(l,price)))s.levels.push(price);
+  const etag=extended?` [EXT gs=${gs!=null?r2(gs):"?"}]`:"";
+  lg(s,"ok",`  + ${side.toUpperCase()}@${k} sz=${size.toFixed(5)}${etag} | usdc=${s.usdc.toFixed(4)} btc=${s.btc.toFixed(5)}`);
+  return true;
+}
+
+function addVirt(s,price,side,size,extended=false,gs=null,ps=null,tu_step=null){
+  const k=pk(price);
+  if(s.orders[k])return;
+  s.orders[k]={side,oid:"virtual",price,size,extended,gs,ps,trailing_up_step: tu_step};
+  if(!s.levels.find(l=>eq(l,price)))s.levels.push(price);
+  const etag=extended?` [EXT gs=${gs!=null?r2(gs):"?"}]`:"";
+  lg(s,"info",`  v ${side.toUpperCase()}@${k} (virtual)${etag} sz=${size.toFixed(5)}`);
+}
+
+// Simula _release_btc_for_trailing_down_sell
+// Cancela SELLs reales altos hasta cubrir el BTC necesario para el SELL extended
+function releaseBtcForSell(s, target_key, required_size){
+  let estimated = s.btc;
+  let cancellations = 0;
+  if(estimated >= required_size - 0.000001) return true;
+  while(estimated < required_size - 0.000001){
+    const candidates = Object.entries(s.orders)
+      .filter(([, o]) =>
+        o.side === "sell" &&
+        !o.extended &&
+        !["virtual", "pending_post_only", "pending_manual", "pending_cancel"].includes(o.oid)
+      )
+      .sort(([a],[b])=>parseFloat(b)-parseFloat(a));
+    if(!candidates.length){
+      if(s.btc > estimated) estimated = s.btc;
+      if(estimated >= required_size - 0.000001) return true;
+      lg(s,"warn",`  ! Sin SELL real cancelable para liberar BTC (est=${estimated.toFixed(5)} < req=${required_size.toFixed(5)})`);
+      return false;
+    }
+    const[ck,co]=candidates[0];
+    estimated += co.size;
+    cancellations++;
+    s.btc = r5(s.btc + co.size);
+    delete s.orders[ck]; delete s.ext[ck];
+    s.levels = s.levels.filter(l=>!eq(l,parseFloat(ck)));
+    lg(s,"err",`  x CANCEL SELL@${ck} [${co.extended?"EXT":"PRIN"}] sz=${co.size.toFixed(5)} +BTC | est=${estimated.toFixed(5)}`);
+    // también eliminar la vSELL de techo
+    removeHighestVirtualSell(s);
+    if(estimated >= required_size - 0.000001){
+      lg(s,"info",`  ✓ BTC liberado tras ${cancellations} cancel(es) para SELL@${target_key}`);
+      return true;
+    }
+  }
+  return true;
+}
+
+function fill(key){
+  const o=S.orders[key];if(!o)return;
+  history.push(JSON.stringify(S));
+  const s=cp(S);s.fc++;
+  const isV=o.oid==="virtual";
+  const isExt=o.extended||(key in s.ext);
+  const base_step=s.base_step;
+  const ext_size=extSize(s);
+
+  lg(s,"fill",`── FILL #${s.fc}: ${o.side.toUpperCase()}@${key} [${isV?"VIRTUAL":"REAL"}]${isExt?" [EXT]":""} sz=${o.size.toFixed(5)}`);
+  if(!isV){
+    if(o.side==="buy"){s.btc=r5(s.btc+o.size);lg(s,"ok",`  BTC +${o.size.toFixed(5)} → ${s.btc.toFixed(5)}`);}
+    else{const u=r2(o.price*o.size);s.usdc=r2(s.usdc+u);lg(s,"ok",`  USDC +${u.toFixed(4)} → ${s.usdc.toFixed(4)}`);}
+  }else{lg(s,"info","  Virtual activado (sin trade real)");}
+
+  // _decrease_trailing_up_steps_locked: BUY no-extended → recupera tamaño progresivamente
+  if(o.side==="buy"&&!isExt){
+    const step = (o.trailing_up_step !== null && o.trailing_up_step !== undefined)
+      ? o.trailing_up_step
+      : s.up_steps;
+  s.up_steps = Math.max(0, step - 1);lg(s,"info",`  ↓ up_steps→${s.up_steps} (recuperando tamaño)`);
+  }
+
+  delete s.orders[key];
+  let handled=false;
+
+  // ── SELL extended ──────────────────────────────────────────────────────
+  if(o.side==="sell"&&isExt){
+    const gs=o.gs!=null?o.gs:(s.ext[key]!=null?s.ext[key]:base_step);
+    const buy_price=r2(o.price-gs);
+    markExt(s,buy_price,gs);
+    placeOrd(s,buy_price,"buy",o.size,true,gs,o.price);
+    lg(s,"fill",`  EXT SELL→BUY: gs=${r2(gs)}  BUY@${pk(buy_price)}`);
+    handled=true;
+  }
+
+  // ── BUY extended ───────────────────────────────────────────────────────
+  else if(o.side==="buy"&&isExt){
+    const gs=o.gs!=null?o.gs:(s.ext[key]!=null?s.ext[key]:base_step);
+    const sell_price=o.ps!=null?r2(o.ps):r2(o.price+gs);
+    markExt(s,o.price,gs);
+    lg(s,"fill",`  EXT BUY: gs=${r2(gs)}  SELL@${pk(sell_price)}`);
+    if(isV){
+      const new_step=parseFloat((gs*1.1).toFixed(2));
+      const next_buy=r2(o.price-new_step);
+      s.drops++;
+      markExt(s,next_buy,new_step);
+      lg(s,"fill",`  drop#${s.drops} | step ${r2(gs)}→${r2(new_step)} | next_buy@${pk(next_buy)}`);
+      // El SELL viene de BUY virtual: no se compró BTC real.
+      // Se libera BTC dinámicamente antes de colocarlo (_release_btc_for_trailing_down_sell).
+      const sell_key=pk(sell_price);
+      if(!releaseBtcForSell(s, sell_key, ext_size)){
+        lg(s,"warn",`  ! SELL@${sell_key} omitido: BTC insuficiente`);
+      }else{
+        placeOrd(s,sell_price,"sell",ext_size,true,gs,o.price);
+      }
+      addVirt(s,next_buy,"buy",ext_size,true,new_step,o.price);
+    }else{
+      placeOrd(s,sell_price,"sell",o.size,true,gs,o.price);
+    }
+    handled=true;
+  }
+
+  // ── BUY suelo principal (initiation extended) ──────────────────────────
+  if(!handled&&o.side==="buy"){
+    const pl=principalLevels(s);
+    const lowest_p=pl.length?Math.min(...pl):Math.min(...s.levels);
+    if(eq(o.price,lowest_p)){
+      const sell_price=r2(o.price+base_step);
+      const buy_price=r2(o.price-base_step);
+      markExt(s,buy_price,base_step);
+      placeOrd(s,sell_price,"sell",s.base_size,false,null,null);
+      addVirt(s,buy_price,"buy",ext_size,true,base_step,o.price);
+      lg(s,"fill",`  TRAILING EXT iniciado: SELL@${pk(sell_price)} (full) + vBUY@${pk(buy_price)} gs=${base_step}`);
+      handled=true;
+    }
+  }
+
+  // ── SELL en techo (trailing up) ────────────────────────────────────────
+  if(!handled&&o.side==="sell"){
+    const hi=Math.max(...s.levels);
+    if(eq(o.price,hi)){
+      const buy_price=r2(o.price-base_step);
+      const trail_up=r2(o.price+base_step);
+      const trail_up_key=pk(trail_up);
+      const step = (o.trailing_up_step !== null && o.trailing_up_step !== undefined)
+        ? o.trailing_up_step
+        : s.up_steps;
+
+      // BUY abajo — si era SELL virtual, necesita check de USDC
+      const needsRelease=isV;
+      let buyPlaced=false;
+
+      if(!needsRelease){
+        // SELL real: USDC liberado por el fill
+        buyPlaced=placeOrd(s,buy_price,"buy",o.size,false,null,null,step);
+      }else{
+        // SELL virtual: _release_usdc_for_trailing_up_buy
+        const required=r2(o.size*buy_price);
+        lg(s,"info",`  TRAILING UP (vSELL): BUY@${pk(buy_price)} req=${required.toFixed(4)} USDC`);
+        const excludedKeys=new Set([pk(buy_price)]);
+        let estimated=s.usdc;
+        let cancellations=0;
+        let funded=estimated>=required-0.0001;
+        while(!funded){
+          const candidates=Object.entries(s.orders)
+            .filter(([k,ord])=>ord.side==="buy"
+              &&!["virtual","pending_post_only","pending_manual","pending_cancel"].includes(ord.oid)
+              &&!excludedKeys.has(k))
+            .sort(([a],[b])=>parseFloat(a)-parseFloat(b));
+          if(!candidates.length){
+            if(s.usdc>estimated)estimated=s.usdc;
+            if(estimated>=required-0.0001){funded=true;break;}
+            lg(s,"warn",`  ! Sin BUY cancelable (est=${estimated.toFixed(4)} < req=${required.toFixed(4)})`);
+            break;
+          }
+          const[ck,co]=candidates[0];
+          const release=r2(co.size*co.price);
+          s.usdc=r2(s.usdc+release);estimated+=release;cancellations++;
+          delete s.orders[ck];delete s.ext[ck];
+          s.levels=s.levels.filter(l=>!eq(l,parseFloat(ck)));
+          if (cancellations === 1) {
+            const vb = Object.entries(s.orders)
+              .filter(([, o]) => o.side === "buy" && o.oid === "virtual")
+              .sort(([a], [b]) => parseFloat(a) - parseFloat(b));
+
+            if (vb.length) {
+              const [vk] = vb[0];
+              delete s.orders[vk];
+              s.levels = s.levels.filter(l => !eq(l, parseFloat(vk)));
+              lg(s, "warn", `  ~ vBUY suelo ${vk} eliminada`);
+            }
+          }
+          lg(s,"err",`  x CANCEL BUY@${ck} [${co.extended?"EXT":"PRIN"}] +${release.toFixed(4)} USDC | est=${estimated.toFixed(4)}`);
+          excludedKeys.add(ck);
+          if(estimated>=required-0.0001){
+            lg(s,"info",`  ✓ Liberado tras ${cancellations} cancel(es)`);funded=true;
+          }
+        }
+        if(funded){buyPlaced=placeOrd(s,buy_price,"buy",o.size,false,null,null,step);}
+        else{lg(s,"warn",`  ! BUY@${pk(buy_price)} omitido: USDC insuficiente`);}
+      }
+
+      // virtual SELL arriba: solo si no existe ya
+      if(!s.orders[trail_up_key]){
+        const current_step = (o.trailing_up_step !== null && o.trailing_up_step !== undefined)
+          ? o.trailing_up_step
+          : s.up_steps;
+        const next_steps = current_step + 1;
+
+        const factor = Math.max(0.30, 1 - (0.025 * next_steps));
+        const tu_size = r5(s.base_size * factor);
+        s.up_steps = next_steps;
+
+        addVirt(s, trail_up, "sell", tu_size, false, null, null, next_steps);
+        if(!s.levels.find(l=>eq(l,trail_up)))s.levels.push(trail_up);
+        lg(s,"fill",`  vSELL@${trail_up_key} sz=${tu_size.toFixed(5)} | up_steps=${s.up_steps} factor=${factor.toFixed(3)}`);
+      }else{
+        lg(s,"info",`  vSELL@${trail_up_key} ya existe — up_steps mantenido en ${s.up_steps}`);
+      }
+
+      const tag=isV?"(virtual SELL)":"(real SELL)";
+      lg(s,"fill",`  TRAILING UP ${tag}: BUY@${pk(buy_price)} placed=${buyPlaced}`);
+      handled=true;
+    }
+  }
+
+  // ── BUY intermedio ─────────────────────────────────────────────────────
+  if(!handled&&o.side==="buy"){
+    placeOrd(s,r2(o.price+base_step),"sell",o.size,false,null,null,o.trailing_up_step ?? null);
+    lg(s,"","  BUY intermedio → SELL arriba");handled=true;
+  }
+  // ── SELL intermedio ────────────────────────────────────────────────────
+  if(!handled&&o.side==="sell"){
+    placeOrd(s,r2(o.price-base_step),"buy",o.size,false,null,null,o.trailing_up_step ?? null);
+    lg(s,"","  SELL intermedio → BUY abajo");handled=true;
+  }
+
+  s.levels=[...new Set(s.levels)].sort((a,b)=>a-b);
+  const extKeys=Object.keys(s.ext).sort((a,b)=>parseFloat(a)-parseFloat(b));
+  lg(s,"",`  ▸ drops=${s.drops} up_steps=${s.up_steps} usdc=${s.usdc.toFixed(4)} btc=${s.btc.toFixed(5)}`);
+  lg(s,"",`    ext={${extKeys.map(k=>`${k}:${r2(s.ext[k])}`).join(", ")}}`);
+  s.si=(s.si||0)+1;
+  S=s;render();
+}
+
+function getSuggestedKey(){
+  const si=S.si||0;
+  if(si>=STEPS.length)return null;
+  const hint=STEPS[si][1];
+  const orders=S.orders;
+  if(hint==="buy_principal"){
+    const pl=principalLevels(S);
+    const lp=pl.length?Math.min(...pl):null;
+    return lp?pk(lp):null;
+  }
+  if(hint==="vbuy_ext"){
+    const vb=Object.entries(orders)
+      .filter(([,o])=>o.side==="buy"&&o.oid==="virtual"&&o.extended)
+      .sort(([a],[b])=>parseFloat(a)-parseFloat(b));
+    return vb.length?vb[0][0]:null;
+  }
+  if(hint==="sell_ext_low"){
+    const es=Object.entries(orders)
+      .filter(([,o])=>o.side==="sell"&&o.extended&&o.oid!=="virtual")
+      .sort(([a],[b])=>parseFloat(a)-parseFloat(b));
+    return es.length?es[0][0]:null;
+  }
+  if(hint==="sell_principal_low"){
+    const ps=Object.entries(orders)
+      .filter(([,o])=>o.side==="sell"&&!o.extended&&o.oid!=="virtual")
+      .sort(([a],[b])=>parseFloat(a)-parseFloat(b));
+    return ps.length?ps[0][0]:null;
+  }
+  if(hint==="vsell_top"){
+    // virtual SELL en el techo
+    const hi=Math.max(...S.levels);
+    const k=pk(hi);
+    return (orders[k]&&orders[k].oid==="virtual"&&orders[k].side==="sell")?k:null;
+  }
+  return null;
+}
+
+function next(){const k=getSuggestedKey();if(k&&S.orders[k])fill(k);}
+function undo(){if(!history.length)return;S=JSON.parse(history.pop());render();}
+function reset() {
+  applyConfig();
+}
+
+function render(){
+  // metrics bar
+  const mb=document.getElementById("mbar");mb.innerHTML="";
+  [["base_step",S.base_step],["ext_size",extSize(S).toFixed(5)],["drops",S.drops],
+   ["up_steps",S.up_steps],["USDC libre",S.usdc.toFixed(4)],["BTC libre",S.btc.toFixed(5)]]
+    .forEach(([l,v])=>{
+      const d=document.createElement("div");d.className="mc";
+      d.innerHTML=`<div class="ml">${l}</div><div class="mv">${v}</div>`;
+      mb.appendChild(d);
+    });
+
+  // scenario label
+  const si=S.si||0;
+  const sc=si<STEPS.length?STEPS[si]:null;
+  document.getElementById("sclabel").innerHTML=sc
+    ?`Paso ${si+1}/${STEPS.length}:<br><b>${sc[0]}</b>`
+    :"✓ Escenario completado";
+
+  // ladder
+  const ls=[...new Set(S.levels)].sort((a,b)=>b-a);
+  const lo=ls.length?ls[ls.length-1]:null,hi=ls.length?ls[0]:null;
+  const hlKey=getSuggestedKey();
+  const pl=new Set(principalLevels(S).map(l=>pk(l)));
+
+  document.getElementById("ldr").innerHTML=ls.map(lvl=>{
+    const k=pk(lvl),o=S.orders[k];
+    const isPrincipal=pl.has(k);
+    if(!o){
+      const tag=!isPrincipal&&S.ext[k]?`<span style="font-size:8px;color:var(--text3)"> gs=${r2(S.ext[k])}</span>`:"";
+      return`<div class="lrow"><span class="lp">${k}</span><div class="oe">${tag}</div></div>`;
+    }
+    const isV=o.oid==="virtual",isBuy=o.side==="buy",isExt=o.extended;
+    const isLo=eq(lvl,lo)&&isBuy,isHi=eq(lvl,hi)&&!isBuy,isHl=k===hlKey;
+    const bg=isBuy?"var(--green-bg)":"var(--red-bg)";
+    const clr=isBuy?"var(--green)":"var(--red)";
+    let bord;
+    if(isV&&isExt) bord=`2px dashed ${isBuy?"var(--green-bd)":"var(--red-bd)"}`;
+    else if(isV)   bord=`1px dashed ${isBuy?"var(--green-bd)":"var(--red-bd)"}`;
+    else if(isExt) bord=`2px solid ${isBuy?"var(--green-bd)":"var(--red-bd)"}`;
+    else           bord=`1px solid ${isBuy?"var(--green-bd)":"var(--red-bd)"}`;
+    const hl=isHl?"outline:2px solid var(--yellow);outline-offset:1px;":"";
+    const lo_t=isLo?`<span class="tag-floor">FLOOR</span>`:"";
+    const hi_t=isHi?`<span class="tag-top">TOP</span>`:"";
+    const ext_t=isExt?`<span class="extbadge">EXT${o.gs!=null?" gs="+r2(o.gs):""}</span>`:"";
+    const lbl=`${isBuy?"B":"S"}${isV?"v":" "} ${o.size.toFixed(5)}`;
+    return`<div class="lrow"><span class="lp">${k}</span><button class="ob" onclick="fill('${k}')" style="background:${bg};color:${clr};border:${bord};${hl}"><span>${lbl}${lo_t}${hi_t}${ext_t}</span></button></div>`;
+  }).join("");
+
+  // log
+  const lb=document.getElementById("logbox");
+  lb.innerHTML=S.log.map(e=>`<div class="ll ${e.c}">${e.t}</div>`).join("");
+  lb.scrollTop=lb.scrollHeight;
+}
+
+S=mkS();render();
+</script>
+</body>
+</html>
