@@ -39,19 +39,15 @@ from api import (
 
 class GridEngine:
     """
-    Motor de grid trading para un par de trading (ej. BTC/USDC).
+        Inicializa el motor del grid.
 
-    Gestiona una rejilla de órdenes limit con trailing dinámico (up y down)
-    y capacidad de extender el grid por debajo del nivel principal con
-    tamaños reducidos y pasos variables.
-
-    Atributos principales:
-        levels_below: Número de niveles por debajo del centro.
-        levels_above: Número de niveles por encima del centro.
-        step_percent: Porcentaje de separación entre niveles.
-        base_size: Tamaño base de cada orden (en el activo base, ej. BTC).
-        trailing_up_enabled: Habilita expansión hacia arriba.
-        trailing_down_mode: 'off', 'on' o 'extended' (expansión reducida).
+        Args:
+            steps_each_side: (deprecated) número de niveles a cada lado.
+            step_percent: Porcentaje de separación entre niveles (ej. 0.01 = 1%).
+            base_size: Tamaño base de cada orden (en el activo base).
+            initial_price: Precio inicial para centrar el grid (opcional).
+            levels_below: Niveles por debajo del centro.
+            levels_above: Niveles por encima del centro.
 
     El estado se persiste automáticamente en STATE_PATH para permitir
     recuperación tras reinicios.
@@ -66,17 +62,7 @@ class GridEngine:
         levels_below: Optional[int] = None,
         levels_above: Optional[int] = None,
     ) -> None:
-        """
-        Inicializa el motor del grid.
-
-        Args:
-            steps_each_side: (deprecated) número de niveles a cada lado.
-            step_percent: Porcentaje de separación entre niveles (ej. 0.01 = 1%).
-            base_size: Tamaño base de cada orden (en el activo base).
-            initial_price: Precio inicial para centrar el grid (opcional).
-            levels_below: Niveles por debajo del centro.
-            levels_above: Niveles por encima del centro.
-        """
+        
         # Parámetros de configuración
         legacy_steps = int(steps_each_side) if steps_each_side is not None else 0
         self.levels_below: int       = int(levels_below) if levels_below is not None else legacy_steps
@@ -111,6 +97,15 @@ class GridEngine:
         self.trailing_up_enabled: bool = True
         self.trailing_down_mode: str = 'on'  # 'off' | 'on' | 'extended'
         self.trailing_down_enabled: bool = True  # compatibilidad con estado antiguo
+
+        # Trailing up híbrido:
+        # - El grid normal mantiene base_size.
+        # - Cada nivel añadido por trailing up reduce el tamaño un 2.5%.
+        # - El tamaño nunca baja del 30% de base_size.
+        self.trailing_up_reduction_per_level: Decimal = Decimal("0.025")
+        self.trailing_up_min_factor: Decimal = Decimal("0.30")
+        self._trailing_up_steps: int = 0
+
         self._trailing_down_extended_drops: int = 0
 
     def _is_virtual_order(self, info: Optional["OrderInfo"]) -> bool:
@@ -154,6 +149,156 @@ class GridEngine:
     def _extended_order_size(self) -> Decimal:
         """Tamaño fijo de las órdenes extended: 50% del base_size."""
         return self.base_size * Decimal("0.5")
+
+    def _trailing_up_factor_for_steps(self, steps: Optional[int] = None) -> Decimal:
+        """Factor de tamaño para el trailing up híbrido según el contador actual."""
+        safe_steps = max(0, self._trailing_up_steps if steps is None else int(steps))
+        factor = Decimal("1") - (self.trailing_up_reduction_per_level * Decimal(safe_steps))
+        if factor < self.trailing_up_min_factor:
+            return self.trailing_up_min_factor
+        return factor
+
+    def _trailing_up_size_for_steps(self, steps: Optional[int] = None) -> Decimal:
+        """Tamaño base dinámico para nuevos niveles de trailing up."""
+        return self.base_size * self._trailing_up_factor_for_steps(steps)
+
+    def _current_trailing_up_size(self) -> Decimal:
+        """Tamaño que corresponde al contador actual de trailing up."""
+        return self._trailing_up_size_for_steps(self._trailing_up_steps)
+
+    def _trailing_up_anchor_high_locked(self) -> Optional[Decimal]:
+        """Techo original del grid principal, usado como ancla del trailing up."""
+        if self.center_price is None:
+            return None
+
+        try:
+            base_step = self._get_base_step_locked()
+        except Exception:
+            return None
+
+        return (
+            Decimal(str(self.center_price))
+            + (Decimal(self.levels_above) * base_step)
+        ).quantize(TICK_SIZE, rounding=ROUND_DOWN)
+
+    def _trailing_up_price_step_locked(self, price: Decimal) -> int:
+        """Numero de lineas que un precio esta por encima del techo principal."""
+        anchor_high = self._trailing_up_anchor_high_locked()
+        if anchor_high is None:
+            return 0
+
+        try:
+            base_step = self._get_base_step_locked()
+        except Exception:
+            return 0
+
+        if base_step <= 0 or price <= anchor_high:
+            return 0
+
+        raw_steps = (Decimal(str(price)) - anchor_high) / base_step
+        try:
+            return max(0, int(raw_steps.to_integral_value(rounding=ROUND_DOWN)))
+        except Exception:
+            return 0
+
+    def _trailing_up_step_from_size(self, size: Decimal) -> int:
+        """Infiere el step por size para estados antiguos sin metadata."""
+        if self.base_size <= 0 or self.trailing_up_reduction_per_level <= 0:
+            return 0
+
+        try:
+            factor = Decimal(str(size)) / self.base_size
+        except Exception:
+            return 0
+
+        if factor >= Decimal("1"):
+            return 0
+
+        if factor <= self.trailing_up_min_factor:
+            min_steps = (
+                (Decimal("1") - self.trailing_up_min_factor)
+                / self.trailing_up_reduction_per_level
+            )
+            return max(0, int(min_steps.to_integral_value(rounding=ROUND_DOWN)))
+
+        inferred = (Decimal("1") - factor) / self.trailing_up_reduction_per_level
+        try:
+            return max(0, int(inferred.to_integral_value(rounding=ROUND_DOWN)))
+        except Exception:
+            return 0
+
+    def _trailing_up_step_from_order_locked(
+        self,
+        price: Decimal,
+        side: str,
+        info: Optional[OrderInfo] = None,
+    ) -> int:
+        """Devuelve el step logico de trailing up asociado a una orden."""
+        if info is not None:
+            raw_step = info.get("trailing_up_step")
+            if raw_step is not None:
+                try:
+                    parsed = int(raw_step)
+                    if parsed > 0:
+                        return parsed
+                except Exception:
+                    pass
+
+            size_step = self._trailing_up_step_from_size(self._order_size(info))
+            if size_step > 0:
+                return size_step
+
+        price_step = self._trailing_up_price_step_locked(price)
+        if side == "buy" and price_step > 0:
+            return price_step + 1
+        return price_step
+
+    def _trailing_up_metadata_for_step(self, step: int) -> Optional[Dict[str, Any]]:
+        """Metadata comun para ordenes que pertenecen al trailing up hibrido."""
+        if step <= 0:
+            return None
+        return {"trailing_up_step": int(step)}
+
+    def _update_trailing_up_steps_after_buy_locked(
+        self,
+        filled_key: str,
+        price: Decimal,
+        info: OrderInfo,
+        logs: List[str],
+    ) -> None:
+        """Actualiza el contador al bajar una linea de trailing up."""
+        filled_step = self._trailing_up_step_from_order_locked(price, "buy", info)
+        next_steps = max(0, filled_step - 1)
+        previous_steps = self._trailing_up_steps
+        self._trailing_up_steps = next_steps
+
+        if previous_steps != next_steps:
+            logs.append(
+                f"[ENGINE] Trailing up: contador ajustado {previous_steps} -> "
+                f"{next_steps} tras BUY en {filled_key}; "
+                f"size actual {fmt_amount(self._current_trailing_up_size())}"
+            )
+
+    def _update_trailing_up_steps_after_sell_locked(
+        self,
+        filled_key: str,
+        price: Decimal,
+        info: OrderInfo,
+        logs: List[str],
+    ) -> int:
+        """Actualiza el contador al subir por niveles ya existentes de trailing up."""
+        filled_step = self._trailing_up_step_from_order_locked(price, "sell", info)
+        if filled_step <= 0:
+            return 0
+
+        previous_steps = self._trailing_up_steps
+        self._trailing_up_steps = filled_step
+        if previous_steps != filled_step:
+            logs.append(
+                f"[ENGINE] Trailing up: contador ajustado {previous_steps} -> "
+                f"{filled_step} tras SELL en {filled_key}"
+            )
+        return filled_step
 
     def _get_base_step_locked(self) -> Decimal:
         """Step principal. No se muta durante trailing_down_extended."""
@@ -231,6 +376,12 @@ class GridEngine:
         usdc_balance, _ = _parse_balances(balances_resp)
         available = usdc_balance - MIN_USDC_RESERVE
         return available if available > 0 else Decimal('0')
+
+    def _get_available_btc(self) -> Decimal:
+        """Calcula BTC disponible para nuevas ordenes SELL."""
+        balances_resp, _ = get_all_balances()
+        _, btc_balance = _parse_balances(balances_resp)
+        return btc_balance if btc_balance > 0 else Decimal('0')
 
     # ----------------------------------------------------------------------
     #  Métodos de manipulación de órdenes virtuales y selección
@@ -479,6 +630,132 @@ class GridEngine:
 
         return True
 
+    def _release_btc_for_trailing_down_sell(
+        self,
+        target_price: Decimal,
+        target_size: Decimal,
+        *,
+        max_cancellations: Optional[int] = None,
+        retry_delay: float = 1.0,
+    ) -> bool:
+        """
+        Libera BTC para un SELL creado por trailing_down_extended.
+
+        Con trailing up hibrido, las SELL altas pueden tener sizes distintos.
+        Por eso no sirve cancelar una orden cada dos drops: se cancelan tantas
+        SELL reales altas como haga falta, sumando su size real.
+        """
+        required = Decimal(str(target_size))
+        target_key = _price_key(target_price)
+        cancellations = 0
+
+        estimated_available = self._get_available_btc()
+        if estimated_available >= required:
+            return True
+
+        while estimated_available < required:
+            if max_cancellations is not None and cancellations >= max_cancellations:
+                log_event(
+                    f"[ENGINE] Trailing down extended: BTC insuficiente para SELL {target_key} "
+                    f"tras {cancellations} cancelaciones "
+                    f"({fmt_amount(estimated_available)} < {fmt_amount(required)})",
+                    "warning"
+                )
+                return False
+
+            candidate = self._find_highest_real_sell_order()
+            if candidate is None:
+                refreshed_available = self._get_available_btc()
+                if refreshed_available > estimated_available:
+                    estimated_available = refreshed_available
+                if estimated_available >= required:
+                    return True
+
+                log_event(
+                    f"[ENGINE] Trailing down extended: no hay SELL real alto cancelable "
+                    f"para liberar BTC ({fmt_amount(estimated_available)} < {fmt_amount(required)})",
+                    "warning"
+                )
+                return False
+
+            cancel_level_key, cancel_info = candidate
+            cancel_order_id = str(cancel_info["order_id"])
+            cancel_size = self._order_size(cancel_info)
+
+            with self._state_lock:
+                current = self.active_orders.get(cancel_level_key)
+                if current is None or current.get("order_id") != cancel_order_id:
+                    continue
+                current["order_id"] = "pending_cancel"
+
+            log_event(
+                f"[ENGINE] Trailing down extended: cancelando SELL alto {cancel_level_key} "
+                f"size {fmt_amount(cancel_size)} para liberar BTC antes de SELL {target_key} "
+                f"size {fmt_amount(required)}",
+                "info"
+            )
+            response, cancel_logs = self.cancel_order(cancel_order_id)
+
+            for entry in cancel_logs:
+                log_event(entry["msg"], entry["level"])
+
+            if response.get("status_code") == 204:
+                cancellations += 1
+                with self._state_lock:
+                    removed = self.active_orders.pop(cancel_level_key, None)
+                    if removed is not None:
+                        self.levels = [
+                            lvl for lvl in self.levels
+                            if _price_key(lvl) != cancel_level_key
+                        ]
+                        self.extended_levels.pop(cancel_level_key, None)
+
+                removed_virtual_key = self._remove_highest_virtual_sell_order()
+                if removed_virtual_key is not None:
+                    log_event(
+                        f"[ENGINE] Trailing down extended: virtual SELL de techo "
+                        f"{removed_virtual_key} eliminada tras cancelar SELL alto {cancel_level_key}",
+                        "info"
+                    )
+
+                estimated_available += cancel_size
+                if estimated_available >= required:
+                    log_event(
+                        f"[ENGINE] Trailing down extended: BTC estimado liberado con SELL "
+                        f"{cancel_level_key}; _place_order_safe esperara si el exchange "
+                        f"aun no actualizo el disponible",
+                        "info"
+                    )
+                    return True
+
+                if retry_delay > 0:
+                    time.sleep(retry_delay)
+                    refreshed_available = self._get_available_btc()
+                    if refreshed_available > estimated_available:
+                        estimated_available = refreshed_available
+                continue
+
+            with self._state_lock:
+                current = self.active_orders.get(cancel_level_key)
+                if current is not None and current.get("order_id") == "pending_cancel":
+                    current["order_id"] = cancel_order_id
+
+            err_body = response.get("body", {})
+            if isinstance(err_body, dict):
+                error_msg = err_body.get("message", "unknown")
+                error_id = err_body.get("error_id", "")
+            else:
+                error_msg = str(err_body)
+                error_id = ""
+            log_event(
+                f"[ENGINE] Trailing down extended: cancel fallido en {cancel_level_key}: "
+                f"{error_msg} ({error_id})",
+                "warning"
+            )
+            return False
+
+        return True
+
     def set_trailing(self, up: bool, down: object) -> None:
         mode = self._normalise_trailing_down_mode(down)
         with self._state_lock:
@@ -519,6 +796,9 @@ class GridEngine:
         if "paired_sell_price" in info:
             cloned["paired_sell_price"] = info["paired_sell_price"]
 
+        if "trailing_up_step" in info:
+            self._apply_order_metadata(cloned, {"trailing_up_step": info.get("trailing_up_step")})
+
         return cloned
 
     def _serialise_order_info(self, info: OrderInfo) -> Dict[str, Any]:
@@ -538,6 +818,9 @@ class GridEngine:
             if meta_key in info and info.get(meta_key) is not None:
                 payload[meta_key] = str(info.get(meta_key))
 
+        if "trailing_up_step" in info and info.get("trailing_up_step") is not None:
+            payload["trailing_up_step"] = int(info.get("trailing_up_step", 0))
+
         return payload
 
     def _build_state_snapshot_locked(self) -> Dict[str, Any]:
@@ -550,6 +833,10 @@ class GridEngine:
             "step_percent": str(self.step_percent),
             "base_size": str(self.base_size),
             "trailing_up_enabled": self.trailing_up_enabled,
+            "trailing_up_steps": self._trailing_up_steps,
+            "trailing_up_reduction_per_level": str(self.trailing_up_reduction_per_level),
+            "trailing_up_min_factor": str(self.trailing_up_min_factor),
+            "trailing_up_current_size": str(self._current_trailing_up_size()),
             "trailing_down_mode": self.trailing_down_mode,
             "trailing_down_enabled": self.trailing_down_enabled,
             "center_price": str(self.center_price) if self.center_price else None,
@@ -592,6 +879,10 @@ class GridEngine:
                 "last_fill_price": self.last_fill_price,
                 "base_size": self.base_size,
                 "trailing_up_enabled": self.trailing_up_enabled,
+                "trailing_up_steps": self._trailing_up_steps,
+                "trailing_up_reduction_per_level": self.trailing_up_reduction_per_level,
+                "trailing_up_min_factor": self.trailing_up_min_factor,
+                "trailing_up_current_size": self._current_trailing_up_size(),
                 "trailing_down_mode": self.trailing_down_mode,
                 "trailing_down_enabled": self.trailing_down_enabled,
                 "trailing_down_extended_drops": self._trailing_down_extended_drops,
@@ -777,6 +1068,18 @@ class GridEngine:
                         if parsed_meta is not None:
                             parsed_order[meta_key] = parsed_meta
 
+                    raw_trailing_up_step = info.get("trailing_up_step")
+                    if raw_trailing_up_step is not None:
+                        try:
+                            parsed_trailing_up_step = int(raw_trailing_up_step)
+                            if parsed_trailing_up_step > 0:
+                                self._apply_order_metadata(
+                                    parsed_order,
+                                    {"trailing_up_step": parsed_trailing_up_step},
+                                )
+                        except Exception:
+                            pass
+
                     active_orders[str(key)] = parsed_order
 
             if not extended_levels:
@@ -799,6 +1102,18 @@ class GridEngine:
                 if raw.get("last_fill_price") is not None else None
             )
             trailing_up_enabled = bool(raw.get("trailing_up_enabled", True))
+            trailing_up_steps = int(raw.get("trailing_up_steps", 0) or 0)
+            trailing_up_reduction_per_level = self._decimal_from_meta(
+                raw.get("trailing_up_reduction_per_level"),
+                self.trailing_up_reduction_per_level,
+            )
+            trailing_up_min_factor = self._decimal_from_meta(
+                raw.get("trailing_up_min_factor"),
+                self.trailing_up_min_factor,
+            )
+            if trailing_up_min_factor > Decimal("1"):
+                trailing_up_min_factor = Decimal("1")
+
             trailing_down_mode = self._normalise_trailing_down_mode(
                 raw.get("trailing_down_mode", raw.get("trailing_down_enabled", True))
             )
@@ -828,6 +1143,9 @@ class GridEngine:
                 self.last_fill_side = last_fill_side
                 self.last_fill_price = last_fill_price
                 self.trailing_up_enabled = trailing_up_enabled
+                self.trailing_up_reduction_per_level = trailing_up_reduction_per_level
+                self.trailing_up_min_factor = trailing_up_min_factor
+                self._trailing_up_steps = max(0, trailing_up_steps)
                 self.trailing_down_mode = trailing_down_mode
                 self.trailing_down_enabled = trailing_down_mode != 'off'
                 self._trailing_down_extended_drops = max(0, trailing_down_extended_drops)
@@ -838,7 +1156,8 @@ class GridEngine:
                 f"[STATE] Estado recuperado de {STATE_PATH} "
                 f"(guardado hace {age_min:.1f} min, "
                 f"{len(active_orders)} órdenes, "
-                f"{len(levels)} niveles)",
+                f"{len(levels)} niveles, "
+                f"trailing_up_steps={self._trailing_up_steps})",
                 "info"
             )
             return True
@@ -1373,6 +1692,7 @@ class GridEngine:
         orders_to_place: List[Tuple[Decimal, str, Decimal, Optional[Dict[str, Any]]]] = []
         virtual_orders_to_add: List[Tuple[str, OrderInfo]] = []
         trailing_up_buy_release_keys: set[str] = set()
+        trailing_down_sell_release_keys: set[str] = set()
         trailing_logs: List[str] = []
 
         with self._state_lock:
@@ -1398,6 +1718,13 @@ class GridEngine:
             is_virtual = order_id == "virtual"
             is_extended = self._is_extended_order(info) or filled_key in self.extended_levels
             handled = False
+
+            # El contador de trailing up se recalcula desde la orden/nivel ejecutado.
+            # Asi no depende de haber subido/bajado en la misma sesion ni de un contador neto.
+            if side == "buy" and not is_extended:
+                self._update_trailing_up_steps_after_buy_locked(filled_key, price, info, trailing_logs)
+            elif side == "sell" and not is_extended:
+                self._update_trailing_up_steps_after_sell_locked(filled_key, price, info, trailing_logs)
 
             # --------------------------------------------------
             # Ciclo extended ya existente: SELL extended ejecutado -> BUY en la línea inferior.
@@ -1480,20 +1807,7 @@ class GridEngine:
                                 }),
                             ))
 
-                        # Cada SELL principal de base_size libera saldo para dos sells extended de 0.5.
-                        # Por eso se cancela en las activaciones virtuales 1, 3, 5, ...
-                        if self._trailing_down_extended_drops % 2 == 1:
-                            highest_sell = self._find_highest_real_sell_order()
-                            if highest_sell is not None:
-                                cancel_level_key, cancel_info = highest_sell
-                                cancel_order_id = str(cancel_info["order_id"])
-                                remove_ceiling_virtual_after_cancel = True
-                                if cancel_level_key in self.active_orders:
-                                    self.active_orders[cancel_level_key]["order_id"] = "pending_cancel"
-                                trailing_logs.append(
-                                    f"[ENGINE] Trailing down extended: cancelando SELL alto "
-                                    f"{cancel_level_key} para liberar BTC"
-                                )
+                        trailing_down_sell_release_keys.add(_price_key(upper_sell_price))
 
                         trailing_logs.append(
                             f"[ENGINE] Trailing down extended: virtual BUY {filled_key} confirmado; "
@@ -1595,36 +1909,61 @@ class GridEngine:
                 handled = True
 
             elif not handled and side == "sell" and price == highest:
+                current_trailing_up_step = self._trailing_up_step_from_order_locked(price, "sell", info)
                 next_buy_price = (price - base_step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
-                orders_to_place.append((next_buy_price, "buy", order_size, None))
+                orders_to_place.append((
+                    next_buy_price,
+                    "buy",
+                    order_size,
+                    self._trailing_up_metadata_for_step(current_trailing_up_step),
+                ))
                 if is_virtual:
                     trailing_up_buy_release_keys.add(_price_key(next_buy_price))
 
                 if self.trailing_up_enabled:
                     trail_up_price = (price + base_step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
-                    self.levels.append(trail_up_price)
-
                     trail_up_key = _price_key(trail_up_price)
+
                     if trail_up_key not in self.active_orders:
+                        next_trailing_up_steps = current_trailing_up_step + 1
+                        trailing_up_size = self._trailing_up_size_for_steps(next_trailing_up_steps)
+                        self._trailing_up_steps = next_trailing_up_steps
+                        self.levels.append(trail_up_price)
+
+                        virtual_info = cast(OrderInfo, {
+                            "side": "sell",
+                            "order_id": "virtual",
+                            "price": trail_up_price,
+                            "size": trailing_up_size,
+                            "placed_at": time.time(),
+                        })
                         virtual_orders_to_add.append((
                             trail_up_key,
-                            cast(OrderInfo, {
-                                "side": "sell",
-                                "order_id": "virtual",
-                                "price": trail_up_price,
-                                "size": order_size,
-                                "placed_at": time.time(),
-                            }),
+                            self._apply_order_metadata(
+                                virtual_info,
+                                self._trailing_up_metadata_for_step(next_trailing_up_steps),
+                            ),
                         ))
 
-                    if is_virtual:
-                        trailing_logs.append(
-                            f"[ENGINE] Trailing up: virtual SELL {filled_key} activada; "
-                            f"BUY {_price_key(next_buy_price)} y nueva virtual SELL {trail_up_key}"
-                        )
+                        if is_virtual:
+                            trailing_logs.append(
+                                f"[ENGINE] Trailing up: virtual SELL {filled_key} activada; "
+                                f"BUY {_price_key(next_buy_price)} size {fmt_amount(order_size)} y nueva "
+                                f"virtual SELL {trail_up_key} size {fmt_amount(trailing_up_size)} "
+                                f"(step {next_trailing_up_steps}, factor "
+                                f"{self._trailing_up_factor_for_steps(next_trailing_up_steps):.3f})"
+                            )
+                        else:
+                            trailing_logs.append(
+                                f"[ENGINE] Rebalance trailing up: virtual SELL registrada en {trail_up_key} "
+                                f"size {fmt_amount(trailing_up_size)} "
+                                f"(step {next_trailing_up_steps}, factor "
+                                f"{self._trailing_up_factor_for_steps(next_trailing_up_steps):.3f})"
+                            )
                     else:
                         trailing_logs.append(
-                            f"[ENGINE] Rebalance trailing up: virtual SELL registrada en {trail_up_key}"
+                            f"[ENGINE] Trailing up: virtual SELL {trail_up_key} ya existía; "
+                            f"contador mantenido en {self._trailing_up_steps}"
                         )
                 else:
                     trailing_logs.append("[ENGINE] Trailing up desactivado: se mantiene el grid sin extenderse")
@@ -1633,12 +1972,24 @@ class GridEngine:
 
             elif not handled and side == "buy":
                 next_sell_price = (price + base_step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
-                orders_to_place.append((next_sell_price, "sell", order_size, None))
+                trailing_up_step = self._trailing_up_step_from_order_locked(price, "buy", info)
+                orders_to_place.append((
+                    next_sell_price,
+                    "sell",
+                    order_size,
+                    self._trailing_up_metadata_for_step(trailing_up_step),
+                ))
                 handled = True
 
             elif not handled and side == "sell":
                 next_buy_price = (price - base_step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
-                orders_to_place.append((next_buy_price, "buy", order_size, None))
+                trailing_up_step = self._trailing_up_step_from_order_locked(price, "sell", info)
+                orders_to_place.append((
+                    next_buy_price,
+                    "buy",
+                    order_size,
+                    self._trailing_up_metadata_for_step(trailing_up_step),
+                ))
                 handled = True
 
             self.levels = sorted(set(self.levels))
@@ -1691,6 +2042,13 @@ class GridEngine:
                 if not self._release_usdc_for_trailing_up_buy(price_to_place, size_to_place):
                     log_event(
                         f"[ENGINE] Trailing up: BUY {place_key} omitido por USDC insuficiente",
+                        "warning"
+                    )
+                    continue
+            if side_to_place == "sell" and place_key in trailing_down_sell_release_keys:
+                if not self._release_btc_for_trailing_down_sell(price_to_place, size_to_place):
+                    log_event(
+                        f"[ENGINE] Trailing down extended: SELL {place_key} omitido por BTC insuficiente",
                         "warning"
                     )
                     continue
