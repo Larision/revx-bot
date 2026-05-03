@@ -21,14 +21,17 @@ MULTIPLE_DECIMALS = Decimal("0.0001")
 
 
 def _price_key(price: Decimal) -> str:
+    """Formatea un precio con el tick size usado en los CSV de salida."""
     return format(price.quantize(TICK_SIZE, rounding=ROUND_DOWN), "f")
 
 
 def _multiple_key(value: Decimal) -> str:
+    """Formatea multiplos de step con precision estable para analisis."""
     return format(value.quantize(MULTIPLE_DECIMALS, rounding=ROUND_DOWN), "f")
 
 
 def load_fills(path: Path) -> List[Dict]:
+    """Carga fills.csv y normaliza side, price y quantity para el analisis."""
     fills = []
     with open(path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -43,6 +46,7 @@ def load_fills(path: Path) -> List[Dict]:
 
 
 def detect_step(fills: List[Dict]) -> Decimal:
+    """Detecta el menor salto positivo entre precios ejecutados."""
     prices = sorted(set(f["price"] for f in fills))
     if len(prices) < 2:
         return Decimal("0")
@@ -55,6 +59,7 @@ def detect_step(fills: List[Dict]) -> Decimal:
 
 
 def _find_best_buy_match(open_buys: List[Dict], sell_fill: Dict) -> Optional[int]:
+    """Busca el BUY abierto mas cercano para emparejar un SELL ejecutado."""
     sell_price = sell_fill["price"]
     sell_qty = sell_fill["quantity"]
 
@@ -79,6 +84,7 @@ def _find_best_buy_match(open_buys: List[Dict], sell_fill: Dict) -> Optional[int
 
 
 def _step_band(step_used: Decimal, step_base: Decimal) -> str:
+    """Clasifica un step realizado respecto al step base detectado."""
     if step_base <= 0:
         return "n/a"
     if step_used <= step_base:
@@ -91,6 +97,7 @@ def _step_band(step_used: Decimal, step_base: Decimal) -> str:
 
 
 def _step_flags(step_used: Decimal, step_base: Decimal) -> Dict[str, str]:
+    """Calcula columnas derivadas para marcar steps extendidos o anomalos."""
     if step_base <= 0:
         return {
             "step_multiple": "0.0000",
@@ -110,7 +117,8 @@ def _step_flags(step_used: Decimal, step_base: Decimal) -> Dict[str, str]:
     }
 
 
-def pair_fills(fills: List[Dict], step: Decimal) -> tuple:
+def pair_fills(fills: List[Dict], step: Decimal) -> Tuple[List[Dict], List[Dict]]:
+    """Empareja fills BUY/SELL y devuelve pares cerrados mas BUYs abiertos."""
     pairs: List[Dict] = []
     open_buys: List[Dict] = []
 
@@ -152,6 +160,7 @@ def pair_fills(fills: List[Dict], step: Decimal) -> tuple:
 
 
 def write_pairs(pairs: List[Dict], path: Path) -> None:
+    """Escribe el CSV de pares cerrados con metricas de step y beneficio."""
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
             f,
@@ -177,6 +186,7 @@ def write_pairs(pairs: List[Dict], path: Path) -> None:
 
 
 def write_open_buys(open_buys: List[Dict], path: Path) -> None:
+    """Escribe el CSV de BUYs que no pudieron emparejarse con un SELL."""
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=["ts", "price", "quantity"])
         writer.writeheader()
@@ -189,6 +199,7 @@ def write_open_buys(open_buys: List[Dict], path: Path) -> None:
 
 
 def print_summary(pairs: List[Dict], open_buys: List[Dict], step: Decimal) -> None:
+    """Muestra un resumen agregado del emparejamiento de fills."""
     print(f"\n{'=' * 52}")
     print("  RESUMEN DE FILLS EMPAREJADOS")
     print(f"{'=' * 52}")
@@ -239,6 +250,7 @@ def print_summary(pairs: List[Dict], open_buys: List[Dict], step: Decimal) -> No
 
 
 def main() -> None:
+    """Punto de entrada CLI para analizar fills.csv y generar reportes CSV."""
     fills_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("fills.csv")
 
     if not fills_path.exists():

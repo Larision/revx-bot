@@ -22,6 +22,7 @@ from config import (
     TICK_SIZE,
 )
 from logger import log_event, log_file
+from trailing import normalize_trailing_down_mode, trailing_down_mode_label
 from api import (
     _parse_balances,
     _price_key,
@@ -607,23 +608,16 @@ def _trailing_menu(engine: "GridEngine") -> None:
     """
     def _normalize_down_mode(value: object) -> str:
         """Normaliza el modo de trailing down a 'off', 'on' o 'extended'."""
-        if isinstance(value, bool):
-            return "on" if value else "off"
-        mode = str(value).strip().lower()
-        if mode in {"off", "on", "extended", "extendido"}:
-            return "extended" if mode == "extendido" else mode
-        return "off"
+        return normalize_trailing_down_mode(value)
 
     def _mode_label(mode: str) -> str:
         """Devuelve una etiqueta de visualización para el modo de trailing down."""
-        return {
-            "off": "OFF",
-            "on": "ON",
-            "extended": "EXTENDIDO",
-        }.get(mode, mode.upper())
+        return trailing_down_mode_label(mode)
 
     original_up = engine.trailing_up_enabled
-    original_down = _normalize_down_mode(getattr(engine, "trailing_down_mode", engine.trailing_down_enabled))
+    original_down = _normalize_down_mode(
+        getattr(engine, "trailing_down_mode", engine.trailing_down_enabled)
+    )
 
     new_up = original_up
     new_down = original_down

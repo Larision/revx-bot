@@ -49,6 +49,11 @@ from config import (
     STATE_PATH,
 )
 from logger import log_event
+from trailing import (
+    normalize_trailing_down_mode,
+    parse_trailing_down_mode,
+    trailing_down_mode_label,
+)
 
 if TYPE_CHECKING:
     from engine import GridEngine
@@ -134,14 +139,17 @@ _state = BotState()
 # =========================================================
 
 def _get_message(update: Update) -> Optional[Message]:
+    """Devuelve el mensaje del update cuando el evento lo incluye."""
     return update.message
 
 
 def _get_engine() -> Optional["GridEngine"]:
+    """Devuelve la instancia actual del engine gestionada por Telegram."""
     return _state.engine
 
 
 def _get_engine_thread() -> Optional[threading.Thread]:
+    """Devuelve el hilo donde corre el engine, si existe."""
     return _state.engine_thread
 
 
@@ -154,6 +162,7 @@ def _authorized(update: Update) -> bool:
 
 
 def _engine_running() -> bool:
+    """Indica si el engine existe y su hilo sigue activo."""
     engine = _get_engine()
     thread = _get_engine_thread()
     return engine is not None and thread is not None and thread.is_alive()
@@ -161,26 +170,16 @@ def _engine_running() -> bool:
 
 def _normalize_trailing_down_mode(value: object) -> str:
     """Normaliza el modo de trailing down usado por el engine."""
-    if isinstance(value, bool):
-        return "on" if value else "off"
-
-    mode = str(value).strip().lower()
-    if mode in {"off", "on", "extended"}:
-        return mode
-    if mode == "extendido":
-        return "extended"
-    return "off"
+    return normalize_trailing_down_mode(value)
 
 
 def _trailing_mode_label(mode: str) -> str:
-    return {
-        "off": "OFF",
-        "on": "ON",
-        "extended": "EXTENDIDO",
-    }.get(mode, mode.upper())
+    """Devuelve la etiqueta mostrada al usuario para trailing down."""
+    return trailing_down_mode_label(mode)
 
 
 def _get_trailing_down_mode(engine: "GridEngine") -> str:
+    """Lee el modo de trailing down, soportando estados antiguos booleanos."""
     raw_mode = getattr(engine, "trailing_down_mode", None)
     if raw_mode is None:
         raw_mode = getattr(engine, "trailing_down_enabled", False)
@@ -188,6 +187,7 @@ def _get_trailing_down_mode(engine: "GridEngine") -> str:
 
 
 def _format_trailing_status(engine: "GridEngine") -> str:
+    """Construye el bloque de estado de trailings para el comando /trailings."""
     up_enabled = bool(getattr(engine, "trailing_up_enabled", False))
     down_mode = _get_trailing_down_mode(engine)
 
@@ -202,6 +202,7 @@ def _format_trailing_status(engine: "GridEngine") -> str:
 
 
 def _parse_on_off(value: str) -> Optional[bool]:
+    """Parsea variantes comunes de on/off usadas en comandos de Telegram."""
     normalized = value.strip().lower()
     if normalized in {"on", "true", "1", "si", "sí", "s", "enable", "enabled"}:
         return True
@@ -211,12 +212,8 @@ def _parse_on_off(value: str) -> Optional[bool]:
 
 
 def _parse_trailing_down_mode(value: str) -> Optional[str]:
-    normalized = value.strip().lower()
-    if normalized in {"off", "on", "extended"}:
-        return normalized
-    if normalized == "extendido":
-        return "extended"
-    return None
+    """Parsea un modo de trailing down recibido por comando."""
+    return parse_trailing_down_mode(value)
 
 
 def _apply_trailing_config(

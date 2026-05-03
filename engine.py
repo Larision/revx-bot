@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple, cast
 from config import MIN_USDC_RESERVE, STATE_PATH, SYMBOL, TICK_SIZE, VERSION
 from types_ import LogEntry, OrderInfo
 from logger import log_event, log_fill
+from trailing import normalize_trailing_down_mode
 
 
 def _notify(msg: str) -> None:
@@ -127,15 +128,10 @@ class GridEngine:
 
     def _normalise_trailing_down_mode(self, down: object) -> str:
         """Normaliza el modo de trailing down a 'off', 'on' o 'extended'."""
-        if isinstance(down, bool):
-            return 'on' if down else 'off'
-
-        value = str(down).strip().lower()
-        if value in {'off', 'on', 'extended', 'extendido'}:
-            return 'extended' if value == 'extendido' else value
-        return 'off'
+        return normalize_trailing_down_mode(down)
 
     def _order_size(self, info: OrderInfo) -> Decimal:
+        """Lee el tamaño de una orden, con base_size como fallback seguro."""
         raw = info.get('size', self.base_size)
         try:
             return Decimal(str(raw))
@@ -757,6 +753,7 @@ class GridEngine:
         return True
 
     def set_trailing(self, up: bool, down: object) -> None:
+        """Actualiza la configuracion de trailing sin reiniciar el engine."""
         mode = self._normalise_trailing_down_mode(down)
         with self._state_lock:
             self.trailing_up_enabled = up

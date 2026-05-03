@@ -234,7 +234,13 @@ def get_market_trades_page(
     end_date: Optional[int] = None,
     cursor: Optional[str] = None,
     limit: int = MAX_TRADES_HISTORY_LIMIT,
-):
+) -> Tuple[Dict[str, Any], List[LogEntry]]:
+    """
+    Recupera una pagina de trades publicos de mercado para un simbolo.
+
+    El endpoint pagina con cursor y acepta fechas epoch en milisegundos. El
+    limite se acota al maximo admitido para evitar rechazos de API.
+    """
     params: Dict[str, Any] = {
         "limit": max(1, min(int(limit), MAX_TRADES_HISTORY_LIMIT))
     }
@@ -262,7 +268,16 @@ def get_candles(
     interval: int,
     since: Optional[int] = None,
     until: Optional[int] = None,
-):
+) -> Tuple[Dict[str, Any], List[LogEntry]]:
+    """
+    Recupera candles publicas para un simbolo e intervalo.
+
+    Args:
+        symbol: Par de mercado en formato de la API.
+        interval: Duracion de cada vela segun el endpoint.
+        since: Inicio opcional en epoch milliseconds.
+        until: Fin opcional en epoch milliseconds.
+    """
     params = {"interval": interval}
 
     if since:
