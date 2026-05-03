@@ -139,16 +139,16 @@ def menu_exportar_datos():
         opcion = input("Selecciona una opción: ").strip()
 
         if opcion == "1":
-            exportar_mercado_menu()
+            exportar_datos_mercado()
         elif opcion == "2":
-            exportar_candles_menu()
+            exportar_datos_candles()
         elif opcion == "3":
             break
         else:
             print("Opción inválida")
 
 
-def exportar_mercado_menu():
+def exportar_datos_mercado():
     """
     Submenú interactivo para descargar y exportar trades públicos de mercado (hasta 30 días por solicitud, con auto‑división).
     Los resultados se guardan como un archivo CSV.
@@ -248,7 +248,7 @@ def exportar_mercado_menu():
     print(f"Trades únicos exportados: {len(all_rows)}")
 
 
-def exportar_candles_menu():
+def exportar_datos_candles():
     """
     Submenú interactivo para descargar y exportar datos históricos de velas.
     Los resultados se guardan como un archivo CSV.
