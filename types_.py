@@ -21,3 +21,4 @@ class OrderInfo(TypedDict):
     extended: NotRequired[bool]
     paired_buy_price: NotRequired[Decimal]
     paired_sell_price: NotRequired[Decimal]
+    trailing_up_step: NotRequired[int]

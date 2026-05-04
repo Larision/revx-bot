@@ -22,7 +22,12 @@ from config import (
     TICK_SIZE,
 )
 from logger import log_event, log_file
-from trailing import normalize_trailing_down_mode, trailing_down_mode_label
+from trailing import (
+    normalize_trailing_down_mode,
+    normalize_trailing_up_mode,
+    trailing_down_mode_label,
+    trailing_up_mode_label,
+)
 from api import (
     _parse_balances,
     _price_key,
@@ -503,21 +508,19 @@ def show_grid_preview(
 # =========================================================
 
 def _show_grid_levels(engine: "GridEngine") -> None:
-    """
-    Imprime los niveles del grid con el estado de cada orden (filled, virtual, pendiente, etc.).
-    """
     snapshot = engine.get_runtime_snapshot()
     levels = sorted(snapshot["levels"], reverse=True)
     price = snapshot["current_price"]
     orders = snapshot["active_orders"]
+    base_size = snapshot["base_size"]
 
     closest = (
         min(levels, key=lambda level: abs(level - price))
         if price is not None and levels else None
     )
 
-    SEP = "  " + "-" * 62
-    print(f"\n  {'Precio':>12}  {'Side':<5}  {'Order ID':<38}  {'':6}")
+    SEP = "  " + "-" * 80
+    print(f"\n  {'Precio':>12}  {'Side':<5}  {'Size':>10}  {'Order ID':<32}")
     print(SEP)
 
     for lvl in levels:
@@ -527,25 +530,30 @@ def _show_grid_levels(engine: "GridEngine") -> None:
         if info:
             side = str(info["side"]).upper()
             oid = str(info["order_id"])
+
+            size = info.get("size", base_size)
+            size_str = fmt_amount(size)
+
             if oid == "virtual":
                 tag = " [V]"
                 oid_str = "virtual"
             elif oid == "pending_post_only":
                 tag = " [P]"
-                oid_str = "latente (post_only)"
+                oid_str = "latente"
             elif oid == "pending_manual":
                 tag = " [M]"
-                oid_str = "reservada (manual)"
+                oid_str = "manual"
             else:
-                tag = "    "
-                oid_str = oid[:36]
+                tag = ""
+                oid_str = oid[:32]
         else:
             side = "---"
+            size_str = "-"
             oid_str = "vacío"
-            tag = "    "
+            tag = ""
 
-        marker = " ◄" if closest is not None and lvl == closest else "  "
-        print(f"  {key:>12}  {side:<5}  {oid_str:<38}{tag}{marker}")
+        marker = " ◄" if closest is not None and lvl == closest else ""
+        print(f"  {key:>12}  {side:<5}  {size_str:>10}  {oid_str:<32}{tag}{marker}")
 
     print(SEP)
     price_str = _price_key(price) if price else "N/A"
@@ -606,15 +614,25 @@ def _trailing_menu(engine: "GridEngine") -> None:
     Menú interactivo para la configuración en vivo de trailing up/down.
     Los cambios se pueden aplicar inmediatamente o descartar.
     """
+    def _normalize_up_mode(value: object) -> str:
+        """Normaliza el modo de trailing up a 'off', 'on' o 'extended'."""
+        return normalize_trailing_up_mode(value)
+
     def _normalize_down_mode(value: object) -> str:
         """Normaliza el modo de trailing down a 'off', 'on' o 'extended'."""
         return normalize_trailing_down_mode(value)
 
-    def _mode_label(mode: str) -> str:
+    def _up_mode_label(mode: str) -> str:
+        """Devuelve una etiqueta de visualización para el modo de trailing up."""
+        return trailing_up_mode_label(mode)
+
+    def _down_mode_label(mode: str) -> str:
         """Devuelve una etiqueta de visualización para el modo de trailing down."""
         return trailing_down_mode_label(mode)
 
-    original_up = engine.trailing_up_enabled
+    original_up = _normalize_up_mode(
+        getattr(engine, "trailing_up_mode", engine.trailing_up_enabled)
+    )
     original_down = _normalize_down_mode(
         getattr(engine, "trailing_down_mode", engine.trailing_down_enabled)
     )
@@ -625,14 +643,15 @@ def _trailing_menu(engine: "GridEngine") -> None:
 
     while True:
         print("\n=== CONFIGURAR TRAILINGS ===")
-        print(f"1. Trailing up   > {'ON' if new_up else 'OFF'}")
-        print(f"2. Trailing down > {_mode_label(new_down)}")
+        print(f"1. Trailing up   > {_up_mode_label(new_up)}")
+        print(f"2. Trailing down > {_down_mode_label(new_down)}")
         print("3. Atrás")
 
         opcion = input("Opción: ").strip()
 
         if opcion == "1":
-            new_up = not new_up
+            idx = cycle.index(new_up) if new_up in cycle else 0
+            new_up = cycle[(idx + 1) % len(cycle)]
         elif opcion == "2":
             idx = cycle.index(new_down) if new_down in cycle else 0
             new_down = cycle[(idx + 1) % len(cycle)]
@@ -879,6 +898,7 @@ def show_menu(engine_running: bool = False) -> str:
     print("6. Iniciar Grid Engine" if not engine_running else "8. Engine ya en marcha")
     print("7. Monitor del engine")
     print("8. Detener engine")
+    print("9. Backtesting")
     print("c. Configuración manual")
     print("0. Salir")
     print("=" * 40)
@@ -973,7 +993,7 @@ def run_cli() -> None:
         elif opcion == "4":
             if engine_running:
                 print("\n[!] El engine está en marcha.")
-                print("    Usa el monitor del engine (opción 9) para añadir órdenes manuales.")
+                print("    Usa el monitor del engine (opción 7) para añadir órdenes manuales.")
                 continue
 
             print("\n=== Orden manual ===")
@@ -1121,6 +1141,14 @@ def run_cli() -> None:
 
             engine = None
             engine_thread = None
+
+        # --------------------------------------------------
+        # 9. Backtesting
+        # --------------------------------------------------
+        elif opcion == "9":
+            from backtesting import prompt_backtest
+
+            prompt_backtest()
 
         # --------------------------------------------------
         # c.Configuración manual

@@ -51,8 +51,10 @@ from config import (
 from logger import log_event
 from trailing import (
     normalize_trailing_down_mode,
+    normalize_trailing_up_mode,
     parse_trailing_down_mode,
-    trailing_down_mode_label,
+    parse_trailing_up_mode,
+    trailing_mode_label,
 )
 
 if TYPE_CHECKING:
@@ -168,14 +170,22 @@ def _engine_running() -> bool:
     return engine is not None and thread is not None and thread.is_alive()
 
 
+def _normalize_trailing_up_mode(value: object) -> str:
+    """Normaliza el modo de trailing up usado por el engine."""
+    return normalize_trailing_up_mode(value)
+
+
 def _normalize_trailing_down_mode(value: object) -> str:
     """Normaliza el modo de trailing down usado por el engine."""
     return normalize_trailing_down_mode(value)
 
 
-def _trailing_mode_label(mode: str) -> str:
-    """Devuelve la etiqueta mostrada al usuario para trailing down."""
-    return trailing_down_mode_label(mode)
+def _get_trailing_up_mode(engine: "GridEngine") -> str:
+    """Lee el modo de trailing up, soportando estados antiguos booleanos."""
+    raw_mode = getattr(engine, "trailing_up_mode", None)
+    if raw_mode is None:
+        raw_mode = getattr(engine, "trailing_up_enabled", False)
+    return _normalize_trailing_up_mode(raw_mode)
 
 
 def _get_trailing_down_mode(engine: "GridEngine") -> str:
@@ -188,15 +198,15 @@ def _get_trailing_down_mode(engine: "GridEngine") -> str:
 
 def _format_trailing_status(engine: "GridEngine") -> str:
     """Construye el bloque de estado de trailings para el comando /trailings."""
-    up_enabled = bool(getattr(engine, "trailing_up_enabled", False))
+    up_mode = _get_trailing_up_mode(engine)
     down_mode = _get_trailing_down_mode(engine)
 
     return (
         "⚙️ *TRAILINGS*\n"
-        f"Trailing up   : `{'ON' if up_enabled else 'OFF'}`\n"
-        f"Trailing down : `{_trailing_mode_label(down_mode)}`\n\n"
+        f"Trailing up   : `{trailing_mode_label(up_mode)}`\n"
+        f"Trailing down : `{trailing_mode_label(down_mode)}`\n\n"
         "Cambiar configuración:\n"
-        "`/trailings up on` o `/trailings up off`\n"
+        "`/trailings up off`, `/trailings up on` o `/trailings up extended`\n"
         "`/trailings down off`, `/trailings down on` o `/trailings down extended`"
     )
 
@@ -211,6 +221,11 @@ def _parse_on_off(value: str) -> Optional[bool]:
     return None
 
 
+def _parse_trailing_up_mode(value: str) -> Optional[str]:
+    """Parsea un modo de trailing up recibido por comando."""
+    return parse_trailing_up_mode(value)
+
+
 def _parse_trailing_down_mode(value: str) -> Optional[str]:
     """Parsea un modo de trailing down recibido por comando."""
     return parse_trailing_down_mode(value)
@@ -219,19 +234,21 @@ def _parse_trailing_down_mode(value: str) -> Optional[str]:
 def _apply_trailing_config(
     engine: "GridEngine",
     *,
-    trailing_up: Optional[bool] = None,
+    trailing_up: Optional[str] = None,
     trailing_down: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Aplica cambios de trailing en caliente usando GridEngine.set_trailing()."""
     if not hasattr(engine, "set_trailing"):
         return False, "El engine no expone set_trailing()."
 
-    current_up = bool(getattr(engine, "trailing_up_enabled", False))
+    current_up = _get_trailing_up_mode(engine)
     current_down = _get_trailing_down_mode(engine)
 
-    new_up = current_up if trailing_up is None else trailing_up
+    new_up = current_up if trailing_up is None else _normalize_trailing_up_mode(trailing_up)
     new_down = current_down if trailing_down is None else _normalize_trailing_down_mode(trailing_down)
 
+    if new_up not in {"off", "on", "extended"}:
+        return False, "Modo de trailing up inválido."
     if new_down not in {"off", "on", "extended"}:
         return False, "Modo de trailing down inválido."
 
@@ -318,8 +335,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Órdenes activas: `{len(snapshot['active_orders'])}`",
         f"Fills sesión  : `{len(snapshot['fill_history'])}`",
         f"Último fill   : `{snapshot['last_fill_side'] or 'ninguno'}`",
-        f"Trailing up   : `{'ON' if bool(getattr(eng, 'trailing_up_enabled', False)) else 'OFF'}`",
-        f"Trailing down : `{_trailing_mode_label(_get_trailing_down_mode(eng))}`",
+        f"Trailing up   : `{trailing_mode_label(_get_trailing_up_mode(eng))}`",
+        f"Trailing down : `{trailing_mode_label(_get_trailing_down_mode(eng))}`",
     ]
     await message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -421,7 +438,7 @@ async def cmd_trailings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await message.reply_text(
             "Uso:\n"
             "`/trailings`\n"
-            "`/trailings up on|off`\n"
+            "`/trailings up off|on|extended`\n"
             "`/trailings down off|on|extended`",
             parse_mode="Markdown",
         )
@@ -430,11 +447,11 @@ async def cmd_trailings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     target, value = args
 
     if target == "up":
-        parsed = _parse_on_off(value)
-        if parsed is None:
-            await message.reply_text("Valor inválido. Usa `on` u `off`.", parse_mode="Markdown")
+        mode = _parse_trailing_up_mode(value)
+        if mode is None:
+            await message.reply_text("Valor inválido. Usa `off`, `on` o `extended`.", parse_mode="Markdown")
             return
-        ok, response = _apply_trailing_config(eng, trailing_up=parsed)
+        ok, response = _apply_trailing_config(eng, trailing_up=mode)
 
     else:
         mode = _parse_trailing_down_mode(value)

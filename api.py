@@ -225,7 +225,7 @@ def get_historical_orders(limit: int = 50) -> Tuple[Dict[str, Any], List[LogEntr
     return response, logs
 
 
-MAX_TRADES_HISTORY_LIMIT = 1900
+MAX_TRADES_HISTORY_LIMIT = 1000
 
 
 def get_market_trades_page(

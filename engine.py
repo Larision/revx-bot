@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple, cast
 from config import MIN_USDC_RESERVE, STATE_PATH, SYMBOL, TICK_SIZE, VERSION
 from types_ import LogEntry, OrderInfo
 from logger import log_event, log_fill
-from trailing import normalize_trailing_down_mode
+from trailing import normalize_trailing_down_mode, normalize_trailing_up_mode
 
 
 def _notify(msg: str) -> None:
@@ -95,16 +95,17 @@ class GridEngine:
         self._state_lock = threading.RLock()
 
         # Flags de trailing
-        self.trailing_up_enabled: bool = True
+        self.trailing_up_mode: str = 'extended'  # 'off' | 'on' | 'extended'
+        self.trailing_up_enabled: bool = True  # compatibilidad con estado antiguo
         self.trailing_down_mode: str = 'on'  # 'off' | 'on' | 'extended'
         self.trailing_down_enabled: bool = True  # compatibilidad con estado antiguo
 
-        # Trailing up híbrido:
+        # Trailing up extendido / híbrido:
         # - El grid normal mantiene base_size.
         # - Cada nivel añadido por trailing up reduce el tamaño un 2.5%.
         # - El tamaño nunca baja del 30% de base_size.
         self.trailing_up_reduction_per_level: Decimal = Decimal("0.025")
-        self.trailing_up_min_factor: Decimal = Decimal("0.30")
+        self.trailing_up_min_factor: Decimal = Decimal("0.50")
         self._trailing_up_steps: int = 0
 
         self._trailing_down_extended_drops: int = 0
@@ -129,6 +130,10 @@ class GridEngine:
     def _normalise_trailing_down_mode(self, down: object) -> str:
         """Normaliza el modo de trailing down a 'off', 'on' o 'extended'."""
         return normalize_trailing_down_mode(down)
+
+    def _normalise_trailing_up_mode(self, up: object) -> str:
+        """Normaliza el modo de trailing up a 'off', 'on' o 'extended'."""
+        return normalize_trailing_up_mode(up)
 
     def _order_size(self, info: OrderInfo) -> Decimal:
         """Lee el tamaño de una orden, con base_size como fallback seguro."""
@@ -255,6 +260,32 @@ class GridEngine:
             return None
         return {"trailing_up_step": int(step)}
 
+    def _trailing_up_size_for_step(self, step: int) -> Decimal:
+        """Tamaño que corresponde a un trailing_up_step concreto."""
+        if step <= 0:
+            return self.base_size
+        return self._trailing_up_size_for_steps(step)
+
+    def _trailing_up_size_from_metadata(
+        self,
+        metadata: Optional[Dict[str, Any]],
+        default_size: Decimal,
+    ) -> Decimal:
+        """Calcula el tamaño efectivo a partir de metadata de trailing up."""
+        if not metadata:
+            return default_size
+
+        raw_step = metadata.get("trailing_up_step")
+        if raw_step is None:
+            return default_size
+
+        try:
+            step = int(raw_step)
+        except Exception:
+            return default_size
+
+        return self._trailing_up_size_for_step(step)
+
     def _update_trailing_up_steps_after_buy_locked(
         self,
         filled_key: str,
@@ -292,7 +323,8 @@ class GridEngine:
         if previous_steps != filled_step:
             logs.append(
                 f"[ENGINE] Trailing up: contador ajustado {previous_steps} -> "
-                f"{filled_step} tras SELL en {filled_key}"
+                f"{filled_step} tras SELL en {filled_key}; "
+                f"size actual {fmt_amount(self._current_trailing_up_size())}"
             )
         return filled_step
 
@@ -752,18 +784,22 @@ class GridEngine:
 
         return True
 
-    def set_trailing(self, up: bool, down: object) -> None:
+    def set_trailing(self, up: object, down: object) -> None:
         """Actualiza la configuracion de trailing sin reiniciar el engine."""
-        mode = self._normalise_trailing_down_mode(down)
+        up_mode = self._normalise_trailing_up_mode(up)
+        down_mode = self._normalise_trailing_down_mode(down)
         with self._state_lock:
-            self.trailing_up_enabled = up
-            self.trailing_down_mode = mode
-            self.trailing_down_enabled = mode != 'off'
-            if mode != 'extended':
+            self.trailing_up_mode = up_mode
+            self.trailing_up_enabled = up_mode != 'off'
+            self.trailing_down_mode = down_mode
+            self.trailing_down_enabled = down_mode != 'off'
+            if up_mode != 'extended':
+                self._trailing_up_steps = 0
+            if down_mode != 'extended':
                 self._trailing_down_extended_drops = 0
 
         log_event(
-            f"[ENGINE] Trailing actualizado → up: {'ON' if up else 'OFF'} | down: {mode.upper()}",
+            f"[ENGINE] Trailing actualizado → up: {up_mode.upper()} | down: {down_mode.upper()}",
             'info'
         )
 
@@ -829,6 +865,7 @@ class GridEngine:
             "levels_above": self.levels_above,
             "step_percent": str(self.step_percent),
             "base_size": str(self.base_size),
+            "trailing_up_mode": self.trailing_up_mode,
             "trailing_up_enabled": self.trailing_up_enabled,
             "trailing_up_steps": self._trailing_up_steps,
             "trailing_up_reduction_per_level": str(self.trailing_up_reduction_per_level),
@@ -875,6 +912,7 @@ class GridEngine:
                 "last_fill_side": self.last_fill_side,
                 "last_fill_price": self.last_fill_price,
                 "base_size": self.base_size,
+                "trailing_up_mode": self.trailing_up_mode,
                 "trailing_up_enabled": self.trailing_up_enabled,
                 "trailing_up_steps": self._trailing_up_steps,
                 "trailing_up_reduction_per_level": self.trailing_up_reduction_per_level,
@@ -1098,7 +1136,10 @@ class GridEngine:
                 Decimal(raw["last_fill_price"])
                 if raw.get("last_fill_price") is not None else None
             )
-            trailing_up_enabled = bool(raw.get("trailing_up_enabled", True))
+            trailing_up_mode = self._normalise_trailing_up_mode(
+                raw.get("trailing_up_mode", raw.get("trailing_up_enabled", True))
+            )
+            trailing_up_enabled = trailing_up_mode != "off"
             trailing_up_steps = int(raw.get("trailing_up_steps", 0) or 0)
             trailing_up_reduction_per_level = self._decimal_from_meta(
                 raw.get("trailing_up_reduction_per_level"),
@@ -1139,6 +1180,7 @@ class GridEngine:
                 self.active_orders = active_orders
                 self.last_fill_side = last_fill_side
                 self.last_fill_price = last_fill_price
+                self.trailing_up_mode = trailing_up_mode
                 self.trailing_up_enabled = trailing_up_enabled
                 self.trailing_up_reduction_per_level = trailing_up_reduction_per_level
                 self.trailing_up_min_factor = trailing_up_min_factor
@@ -1564,7 +1606,7 @@ class GridEngine:
                             current = self.active_orders.get(key)
                             if current is not None and current["order_id"] == "pending_post_only":
                                 retry_metadata = {}
-                                for meta_key in ("extended", "grid_step", "paired_buy_price", "paired_sell_price"):
+                                for meta_key in ("extended", "grid_step", "paired_buy_price", "paired_sell_price", "trailing_up_step"):
                                     if meta_key in current:
                                         retry_metadata[meta_key] = current.get(meta_key)
                                 del self.active_orders[key]
@@ -1718,10 +1760,11 @@ class GridEngine:
 
             # El contador de trailing up se recalcula desde la orden/nivel ejecutado.
             # Asi no depende de haber subido/bajado en la misma sesion ni de un contador neto.
-            if side == "buy" and not is_extended:
-                self._update_trailing_up_steps_after_buy_locked(filled_key, price, info, trailing_logs)
-            elif side == "sell" and not is_extended:
-                self._update_trailing_up_steps_after_sell_locked(filled_key, price, info, trailing_logs)
+            if self._normalise_trailing_up_mode(getattr(self, "trailing_up_mode", self.trailing_up_enabled)) == "extended":
+                if side == "buy" and not is_extended:
+                    self._update_trailing_up_steps_after_buy_locked(filled_key, price, info, trailing_logs)
+                elif side == "sell" and not is_extended:
+                    self._update_trailing_up_steps_after_sell_locked(filled_key, price, info, trailing_logs)
 
             # --------------------------------------------------
             # Ciclo extended ya existente: SELL extended ejecutado -> BUY en la línea inferior.
@@ -1811,6 +1854,44 @@ class GridEngine:
                             f"SELL {_price_key(upper_sell_price)} size {fmt_amount(extended_size)}; "
                             f"nueva virtual BUY {next_buy_key} con step {_price_key(new_step)}"
                         )
+                    elif self.trailing_down_mode == "on":
+                        next_buy_price = (price - grid_step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
+                        self._mark_extended_level_locked(next_buy_price, grid_step)
+
+                        orders_to_place.append((
+                            upper_sell_price,
+                            "sell",
+                            order_size,
+                            {
+                                "extended": True,
+                                "grid_step": grid_step,
+                                "paired_buy_price": price,
+                            },
+                        ))
+
+                        next_buy_key = _price_key(next_buy_price)
+                        if next_buy_key not in self.active_orders:
+                            virtual_info = cast(OrderInfo, {
+                                "side": "buy",
+                                "order_id": "virtual",
+                                "price": next_buy_price,
+                                "size": order_size,
+                                "placed_at": time.time(),
+                            })
+                            virtual_orders_to_add.append((
+                                next_buy_key,
+                                self._apply_order_metadata(virtual_info, {
+                                    "extended": True,
+                                    "grid_step": grid_step,
+                                    "paired_sell_price": price,
+                                }),
+                            ))
+
+                        trailing_logs.append(
+                            f"[ENGINE] Trailing down normal: virtual BUY {filled_key} confirmado; "
+                            f"SELL {_price_key(upper_sell_price)} size {fmt_amount(order_size)}; "
+                            f"nueva virtual BUY {next_buy_key}"
+                        )
                     else:
                         trailing_logs.append(
                             f"[ENGINE] Virtual extended BUY {filled_key} activada, pero "
@@ -1836,7 +1917,6 @@ class GridEngine:
 
             # --------------------------------------------------
             # Primer toque del suelo principal en modo extended.
-            # Ejemplo: BUY 20000 -> SELL 21000 size 1 y virtual BUY 19000 size 0.5.
             # --------------------------------------------------
             if not handled and side == "buy" and price == lowest_principal:
                 next_sell_price = (price + base_step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
@@ -1906,25 +1986,48 @@ class GridEngine:
                 handled = True
 
             elif not handled and side == "sell" and price == highest:
-                current_trailing_up_step = self._trailing_up_step_from_order_locked(price, "sell", info)
+                trailing_up_mode = self._normalise_trailing_up_mode(
+                    getattr(self, "trailing_up_mode", self.trailing_up_enabled)
+                )
+                extended_trailing_up = trailing_up_mode == "extended"
+                current_trailing_up_step = (
+                    self._trailing_up_step_from_order_locked(price, "sell", info)
+                    if extended_trailing_up else 0
+                )
                 next_buy_price = (price - base_step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
+                buy_metadata = (
+                    self._trailing_up_metadata_for_step(current_trailing_up_step)
+                    if extended_trailing_up else None
+                )
+                buy_size = self._trailing_up_size_from_metadata(buy_metadata, order_size)
                 orders_to_place.append((
                     next_buy_price,
                     "buy",
-                    order_size,
-                    self._trailing_up_metadata_for_step(current_trailing_up_step),
+                    buy_size,
+                    buy_metadata,
                 ))
                 if is_virtual:
                     trailing_up_buy_release_keys.add(_price_key(next_buy_price))
 
-                if self.trailing_up_enabled:
+                if trailing_up_mode != "off":
                     trail_up_price = (price + base_step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
                     trail_up_key = _price_key(trail_up_price)
 
                     if trail_up_key not in self.active_orders:
-                        next_trailing_up_steps = current_trailing_up_step + 1
-                        trailing_up_size = self._trailing_up_size_for_steps(next_trailing_up_steps)
-                        self._trailing_up_steps = next_trailing_up_steps
+                        if extended_trailing_up:
+                            next_trailing_up_steps = current_trailing_up_step + 1
+                            virtual_metadata = self._trailing_up_metadata_for_step(next_trailing_up_steps)
+                            trailing_up_size = self._trailing_up_size_from_metadata(
+                                virtual_metadata,
+                                order_size,
+                            )
+                            self._trailing_up_steps = next_trailing_up_steps
+                        else:
+                            next_trailing_up_steps = 0
+                            trailing_up_size = order_size
+                            virtual_metadata = None
+                            self._trailing_up_steps = 0
+
                         self.levels.append(trail_up_price)
 
                         virtual_info = cast(OrderInfo, {
@@ -1936,31 +2039,41 @@ class GridEngine:
                         })
                         virtual_orders_to_add.append((
                             trail_up_key,
-                            self._apply_order_metadata(
-                                virtual_info,
-                                self._trailing_up_metadata_for_step(next_trailing_up_steps),
-                            ),
+                            self._apply_order_metadata(virtual_info, virtual_metadata),
                         ))
 
-                        if is_virtual:
-                            trailing_logs.append(
-                                f"[ENGINE] Trailing up: virtual SELL {filled_key} activada; "
-                                f"BUY {_price_key(next_buy_price)} size {fmt_amount(order_size)} y nueva "
-                                f"virtual SELL {trail_up_key} size {fmt_amount(trailing_up_size)} "
-                                f"(step {next_trailing_up_steps}, factor "
-                                f"{self._trailing_up_factor_for_steps(next_trailing_up_steps):.3f})"
-                            )
+                        if extended_trailing_up:
+                            if is_virtual:
+                                trailing_logs.append(
+                                    f"[ENGINE] Trailing up extended: virtual SELL {filled_key} activada; "
+                                    f"BUY {_price_key(next_buy_price)} size {fmt_amount(order_size)} y nueva "
+                                    f"virtual SELL {trail_up_key} size {fmt_amount(trailing_up_size)} "
+                                    f"(step {next_trailing_up_steps}, factor "
+                                    f"{self._trailing_up_factor_for_steps(next_trailing_up_steps):.3f})"
+                                )
+                            else:
+                                trailing_logs.append(
+                                    f"[ENGINE] Rebalance trailing up extended: virtual SELL registrada en {trail_up_key} "
+                                    f"size {fmt_amount(trailing_up_size)} "
+                                    f"(step {next_trailing_up_steps}, factor "
+                                    f"{self._trailing_up_factor_for_steps(next_trailing_up_steps):.3f})"
+                                )
                         else:
-                            trailing_logs.append(
-                                f"[ENGINE] Rebalance trailing up: virtual SELL registrada en {trail_up_key} "
-                                f"size {fmt_amount(trailing_up_size)} "
-                                f"(step {next_trailing_up_steps}, factor "
-                                f"{self._trailing_up_factor_for_steps(next_trailing_up_steps):.3f})"
-                            )
+                            if is_virtual:
+                                trailing_logs.append(
+                                    f"[ENGINE] Trailing up normal: virtual SELL {filled_key} activada; "
+                                    f"BUY {_price_key(next_buy_price)} size {fmt_amount(order_size)} y nueva "
+                                    f"virtual SELL {trail_up_key} size {fmt_amount(trailing_up_size)}"
+                                )
+                            else:
+                                trailing_logs.append(
+                                    f"[ENGINE] Rebalance trailing up normal: virtual SELL registrada en {trail_up_key} "
+                                    f"size {fmt_amount(trailing_up_size)}"
+                                )
                     else:
                         trailing_logs.append(
                             f"[ENGINE] Trailing up: virtual SELL {trail_up_key} ya existía; "
-                            f"contador mantenido en {self._trailing_up_steps}"
+                            f"modo {trailing_up_mode.upper()}"
                         )
                 else:
                     trailing_logs.append("[ENGINE] Trailing up desactivado: se mantiene el grid sin extenderse")
@@ -1970,22 +2083,26 @@ class GridEngine:
             elif not handled and side == "buy":
                 next_sell_price = (price + base_step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
                 trailing_up_step = self._trailing_up_step_from_order_locked(price, "buy", info)
+                trailing_up_metadata = self._trailing_up_metadata_for_step(trailing_up_step)
+                trailing_up_size = self._trailing_up_size_from_metadata(trailing_up_metadata, order_size)
                 orders_to_place.append((
                     next_sell_price,
                     "sell",
-                    order_size,
-                    self._trailing_up_metadata_for_step(trailing_up_step),
+                    trailing_up_size,
+                    trailing_up_metadata,
                 ))
                 handled = True
 
             elif not handled and side == "sell":
                 next_buy_price = (price - base_step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
                 trailing_up_step = self._trailing_up_step_from_order_locked(price, "sell", info)
+                trailing_up_metadata = self._trailing_up_metadata_for_step(trailing_up_step)
+                trailing_up_size = self._trailing_up_size_from_metadata(trailing_up_metadata, order_size)
                 orders_to_place.append((
                     next_buy_price,
                     "buy",
-                    order_size,
-                    self._trailing_up_metadata_for_step(trailing_up_step),
+                    trailing_up_size,
+                    trailing_up_metadata,
                 ))
                 handled = True
 
