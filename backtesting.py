@@ -56,6 +56,13 @@ class PaperGridEngine(GridEngine):
         self.realized_profit: Decimal = Decimal("0")
         self._paper_order_index: dict[str, str] = {}
         self._paper_last_fill: Optional[OrderInfo] = None
+        # Habilita trailing up y down extendidos durante el backtest
+        self.trailing_up_mode   = 'extended'
+        self.trailing_up_enabled = True
+        self.trailing_down_mode = 'extended'
+        self.trailing_down_enabled = True
+        self._trailing_up_steps = 0
+        self._trailing_down_extended_drops = 0
 
     def initialize(self, recover_state: Optional[bool] = None) -> None:
         del recover_state
@@ -391,7 +398,7 @@ def _load_market_trades(symbol: str, since: int, until: int) -> list[dict[str, A
                 trades.append(row)
 
         metadata = response.get("metadata", {})
-        cursor = metadata.get("next_cursor") if isinstance(metadata, dict) else None
+        cursor = metadata.get("next_cursor")# if isinstance(metadata, dict) else None
         if not cursor:
             break
 
@@ -407,6 +414,8 @@ def run_grid_backtest(
     start_date: str,
     end_date: str,
     symbol: str = SYMBOL,
+    trailing_up_mode: str,
+    trailing_down_mode: str,
 ) -> BacktestResult:
     if saldo <= 0:
         raise ValueError("El saldo debe ser mayor que cero.")
@@ -440,6 +449,7 @@ def run_grid_backtest(
         initial_price=center,
     )
     engine.initialize(recover_state=False)
+    engine.set_trailing(trailing_up_mode, trailing_down_mode)
 
     fills: list[dict[str, str]] = []
     last_price = center
@@ -499,6 +509,8 @@ def prompt_backtest() -> None:
     default_size = "0.0005"
     default_step = "200"
     default_price = "75000"
+    default_trailing_up = "extended"
+    default_trailing_down = "on"
 
     today = datetime.utcnow().date()
     start_default = (today - timedelta(days=29)).strftime("%Y%m%d")
@@ -517,6 +529,16 @@ def prompt_backtest() -> None:
     def ask_date(label: str, default: str) -> str:
         raw = input(f"{label} [{default}]: ").strip()
         return raw or default
+    
+    def ask_trailing_mode(label: str, default: str) -> str:
+        """Pregunta por el modo de trailing y valida la respuesta."""
+        while True:
+            raw = input(f"{label} (off/on/extended) [{default}]: ").strip().lower()
+            if not raw:
+                return default
+            if raw in ("off", "on", "extended"):
+                return raw
+            print("Opción inválida. Debe ser off, on o extended.")
 
     saldo = ask_decimal("Saldo USDC", default_saldo)
     size = ask_decimal("Size BTC por orden", default_size)
@@ -524,6 +546,8 @@ def prompt_backtest() -> None:
     initial_price = ask_decimal("Precio inicial", default_price)
     start_date = ask_date("Fecha inicio (YYYYMMDD)", start_default)
     end_date = ask_date("Fecha final (YYYYMMDD)", end_default)
+    trailing_up = ask_trailing_mode("Trailing up", default_trailing_up)
+    trailing_down = ask_trailing_mode("Trailing down", default_trailing_down)
 
     try:
         result = run_grid_backtest(
@@ -533,6 +557,8 @@ def prompt_backtest() -> None:
             initial_price=initial_price,
             start_date=start_date,
             end_date=end_date,
+            trailing_up_mode=trailing_up,
+            trailing_down_mode=trailing_down
         )
     except Exception as exc:
         print(f"\n[!] Backtest cancelado: {exc}")
@@ -542,6 +568,9 @@ def prompt_backtest() -> None:
     pnl_pct = (pnl / result.start_equity * Decimal("100")) if result.start_equity else Decimal("0")
 
     print("\n=== RESULTADO BACKTEST ===")
+    print(f"Precio inicial     : {_price_key(initial_price)} USDC")
+    print(f"Step               : {_price_key(step)} USDC")
+    print(f"Trailings up/down  : {trailing_up} / {trailing_down}")
     print(f"Lineas calculadas  : {result.lines} por lado")
     print(f"Trades mercado     : {result.market_trades}")
     print(f"Fills simulados    : {result.fills} ({result.buys} BUY / {result.sells} SELL)")
