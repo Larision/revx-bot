@@ -225,7 +225,7 @@ def get_historical_orders(limit: int = 50) -> Tuple[Dict[str, Any], List[LogEntr
     return response, logs
 
 
-MAX_TRADES_HISTORY_LIMIT = 1000
+MAX_TRADES_HISTORY_LIMIT = 1900
 
 
 def get_market_trades_page(
@@ -233,7 +233,7 @@ def get_market_trades_page(
     start_date: Optional[int] = None,
     end_date: Optional[int] = None,
     cursor: Optional[str] = None,
-    limit: int = MAX_TRADES_HISTORY_LIMIT,
+    limit: Optional[int] = None,
 ) -> Tuple[Dict[str, Any], List[LogEntry]]:
     """
     Recupera una pagina de trades publicos de mercado para un simbolo.
@@ -241,16 +241,17 @@ def get_market_trades_page(
     El endpoint pagina con cursor y acepta fechas epoch en milisegundos. El
     limite se acota al maximo admitido para evitar rechazos de API.
     """
-    params: Dict[str, Any] = {
-        "limit": max(1, min(int(limit), MAX_TRADES_HISTORY_LIMIT))
-    }
+    params = []
 
     if start_date is not None:
-        params["start_date"] = int(start_date)
+        params.append(("start_date", int(start_date)))
     if end_date is not None:
-        params["end_date"] = int(end_date)
+        params.append(("end_date", int(end_date)))
     if cursor:
-        params["cursor"] = cursor
+        params.append(("cursor", cursor))
+
+    if limit is not None:
+        params.append(("limit", max(1, min(int(limit), MAX_TRADES_HISTORY_LIMIT))))
 
     query = urlencode(params)
 

@@ -76,38 +76,53 @@ def send_request(
         return {"error": True, "status_code": None, "body": "missing api key"}, logs
 
     url       = f"{BASE_URL}{path}" + (f"?{query}" if query else "")
-    timestamp = _synced_timestamp()
     body_str  = json.dumps(body, separators=(",", ":")) if body else ""
 
-    try:
+    def _perform_request():
+        timestamp = _synced_timestamp()
         signature = sign_request(timestamp, method, path, query, body_str)
-    except Exception as exc:
-        log_event(f"Firma fallida: {exc}", "error", logs)
-        return {"error": True, "status_code": None, "body": str(exc)}, logs
 
-    headers = {
-        "X-Revx-Timestamp": timestamp,
-        "X-Revx-Signature": signature,
-        "X-Revx-API-Key":   API_KEY,
-        "Accept":           "application/json"
-    }
-    if method.upper() == "POST":
-        headers["Content-Type"] = "application/json"
+        headers = {
+            "Accept": "application/json",
+            "X-Revx-Timestamp": timestamp,
+            "X-Revx-Signature": signature,
+            "X-Revx-API-Key": API_KEY
+        }
+        if method.upper() == "POST":
+            headers["Content-Type"] = "application/json"
+
+        if method.upper() == "GET":
+            return SESSION.get(url, headers=headers, timeout=10)
+        if method.upper() == "DELETE":
+            return SESSION.delete(url, headers=headers, timeout=10)
+        if method.upper() == "POST":
+            return SESSION.post(url, headers=headers, timeout=10, data=body_str)
+
+        raise ValueError(f"Método HTTP no soportado: {method}")
 
     try:
-        if method.upper() == "GET":
-            r = SESSION.get(url, headers=headers, timeout=10)
-        elif method.upper() == "DELETE":
-            r = SESSION.delete(url, headers=headers, timeout=10)
-        elif method.upper() == "POST":
-            r = SESSION.post(url, headers=headers, timeout=10, data=body_str)
-        else:
-            log_event(f"Método HTTP no soportado: {method}", "error", logs)
-            return {"error": True, "status_code": None, "body": "unsupported method"}, logs
-
+        r = _perform_request()
     except requests.RequestException as exc:
         log_event(f"Request exception: {exc}", "error", logs)
         return {"error": True, "status_code": None, "body": str(exc)}, logs
+    except Exception as exc:
+        log_event(f"Error preparando request: {exc}", "error", logs)
+        return {"error": True, "status_code": None, "body": str(exc)}, logs
+
+    if r.status_code == 409:
+        try:
+            err = r.json()
+        except ValueError:
+            err = r.text
+
+        _update_server_offset(err)
+        log_event(f"API error {r.status_code} -> {err}", "error", logs)
+
+        try:
+            r = _perform_request()
+        except requests.RequestException as exc:
+            log_event(f"Retry request exception: {exc}", "error", logs)
+            return {"error": True, "status_code": None, "body": str(exc)}, logs
 
     if not r.ok:
         try:
@@ -126,6 +141,5 @@ def send_request(
         if r.status_code == 204:
             log_event(f"Respuesta vacía (status {r.status_code}), operación exitosa.", "info", logs)
             return {"status_code": r.status_code, "text": ""}, logs
-        else:
-            log_event(f"Respuesta vacía. Comprobar manualmente.(status {r.status_code})", "warning", logs)
-            return {"status_code": r.status_code, "text": r.text}, logs
+        log_event(f"Respuesta vacía. Comprobar manualmente.(status {r.status_code})", "warning", logs)
+        return {"status_code": r.status_code, "text": r.text}, logs

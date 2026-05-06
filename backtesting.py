@@ -367,40 +367,51 @@ def _select_trade_fill_keys(
     return []
 
 
+MAX_WINDOW_MS = 30 * 24 * 60 * 60 * 1000
+
+
 def _load_market_trades(symbol: str, since: int, until: int) -> list[dict[str, Any]]:
     trades: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
-    cursor: Optional[str] = None
 
-    while True:
-        response, logs = get_market_trades_page(
-            symbol=symbol,
-            start_date=since,
-            end_date=until,
-            cursor=cursor,
-        )
-        for entry in logs:
-            log_event(f"[BACKTEST] {entry['msg']}", entry.get("level", "info"))
+    window_start = since
 
-        if not isinstance(response, dict) or response.get("error"):
-            raise RuntimeError("No se pudieron obtener trades de mercado para el backtest.")
+    while window_start <= until:
+        window_end = min(window_start + MAX_WINDOW_MS - 1, until)
+        cursor: Optional[str] = None
 
-        data = response.get("data", [])
-        if isinstance(data, list):
-            for row in data:
-                if not isinstance(row, dict):
-                    continue
-                trade_id = str(row.get("tid") or row.get("id") or "")
-                if trade_id:
-                    if trade_id in seen_ids:
+        while True:
+            response, logs = get_market_trades_page(
+                symbol=symbol,
+                start_date=window_start,
+                end_date=window_end,
+                cursor=cursor,
+            )
+
+            for entry in logs:
+                log_event(f"[BACKTEST] {entry['msg']}", entry.get("level", "info"))
+
+            if not isinstance(response, dict) or response.get("error"):
+                raise RuntimeError("No se pudieron obtener trades de mercado para el backtest.")
+
+            data = response.get("data", [])
+            if isinstance(data, list):
+                for row in data:
+                    if not isinstance(row, dict):
                         continue
-                    seen_ids.add(trade_id)
-                trades.append(row)
+                    trade_id = str(row.get("tid") or row.get("id") or "")
+                    if trade_id and trade_id in seen_ids:
+                        continue
+                    if trade_id:
+                        seen_ids.add(trade_id)
+                    trades.append(row)
 
-        metadata = response.get("metadata", {})
-        cursor = metadata.get("next_cursor")# if isinstance(metadata, dict) else None
-        if not cursor:
-            break
+            metadata = response.get("metadata", {})
+            cursor = metadata.get("next_cursor") if isinstance(metadata, dict) else None
+            if not cursor:
+                break
+
+        window_start = window_end + 1
 
     return sorted(trades, key=_item_time_ms)
 

@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 if TYPE_CHECKING:
     from engine import GridEngine
@@ -190,8 +190,8 @@ def exportar_datos_mercado():
     from api import get_market_trades_page
 
     WINDOW_MS = 30 * 24 * 60 * 60 * 1000
-    all_rows = []
-    seen_ids = set()
+    all_rows: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
     window_start = since
 
     # Descargar por ventanas de 30 días
@@ -214,7 +214,7 @@ def exportar_datos_mercado():
 
             if not isinstance(response, dict) or response.get("error"):
                 print("Error obteniendo datos de mercado")
-                return
+                raise RuntimeError("No se pudieron obtener trades de mercado para el backtest.")
 
             data = response.get("data", [])
             if isinstance(data, list):
@@ -228,7 +228,7 @@ def exportar_datos_mercado():
                     all_rows.append(row)
 
             metadata = response.get("metadata", {})
-            cursor = metadata.get("next_cursor")
+            cursor = metadata.get("next_cursor") if isinstance(metadata, dict) else None
             if not cursor:
                 break
 
@@ -241,13 +241,18 @@ def exportar_datos_mercado():
     end_label = end_str if end_str else "now"
     filename = Path(f"market-{symbol}-{start_str}_to_{end_label}.csv")
 
+    # Orden cronológico ascendente
+    all_rows.sort(key=lambda r: int(r.get("tdt") or 0))
+
     fieldnames = sorted({k for row in all_rows for k in row.keys()})
+
     with filename.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
+
         for row in all_rows:
             writer.writerow(row)
-
+            
     print("\n=== EXPORT COMPLETADO ===")
     print(f"CSV generado: {filename}")
     print(f"Trades únicos exportados: {len(all_rows)}")
