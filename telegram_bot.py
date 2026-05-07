@@ -732,10 +732,10 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     try:
-        from analyze_fills import detect_step, load_fills, pair_fills
+        from analyze_fills import detect_step, load_fills, load_state_step, pair_fills
 
         fills = load_fills(fills_path)
-        step = detect_step(fills)
+        step = load_state_step(Path("grid_state.json")) or detect_step(fills)
         if step == 0:
             await message.reply_text("⚠️ No se pudo detectar el step del grid.")
             return

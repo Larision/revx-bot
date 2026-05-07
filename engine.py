@@ -125,7 +125,7 @@ class GridEngine:
             "order_id": info["order_id"],
             "ts": time.time(),
         })
-        log_fill(info["side"], price_key, fmt_amount(self.base_size))
+        log_fill(info["side"], price_key, fmt_amount(self._order_size(info)))
 
     def _normalise_trailing_down_mode(self, down: object) -> str:
         """Normaliza el modo de trailing down a 'off', 'on' o 'extended'."""

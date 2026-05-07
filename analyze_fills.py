@@ -10,14 +10,18 @@ Añade métricas para detectar pares con step extendido/anómalo respecto al ste
 """
 
 import csv
+import json
 import sys
+from collections import Counter
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from statistics import median
+from typing import Dict, Iterable, List, Optional, Tuple
 
 
 TICK_SIZE = Decimal("0.01")
 MULTIPLE_DECIMALS = Decimal("0.0001")
+QTY_EPSILON = Decimal("0.00000000000001")
 
 
 def _price_key(price: Decimal) -> str:
@@ -28,6 +32,23 @@ def _price_key(price: Decimal) -> str:
 def _multiple_key(value: Decimal) -> str:
     """Formatea multiplos de step con precision estable para analisis."""
     return format(value.quantize(MULTIPLE_DECIMALS, rounding=ROUND_DOWN), "f")
+
+
+def _decimal_or_none(value: object) -> Optional[Decimal]:
+    """Convierte valores externos a Decimal sin romper el analisis."""
+    if value is None:
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except Exception:
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _quantity_key(quantity: Decimal) -> str:
+    """Normaliza cantidades residuales para los CSV de salida."""
+    normalized = quantity.normalize()
+    return format(normalized, "f")
 
 
 def load_fills(path: Path) -> List[Dict]:
@@ -45,23 +66,65 @@ def load_fills(path: Path) -> List[Dict]:
     return fills
 
 
+def load_state_step(path: Path = Path("grid_state.json")) -> Optional[Decimal]:
+    """Lee base_step/step del estado persistido si esta disponible."""
+    if not path.exists():
+        return None
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:
+        return None
+
+    return _decimal_or_none(raw.get("base_step")) or _decimal_or_none(raw.get("step"))
+
+
+def _common_positive_diffs(prices: Iterable[Decimal]) -> List[Decimal]:
+    """Devuelve saltos positivos entre precios unicos, redondeados a tick."""
+    unique_prices = sorted(set(prices))
+    if len(unique_prices) < 2:
+        return []
+
+    diffs: List[Decimal] = []
+    for i in range(len(unique_prices) - 1):
+        diff = (unique_prices[i + 1] - unique_prices[i]).quantize(TICK_SIZE, rounding=ROUND_DOWN)
+        if diff > 0:
+            diffs.append(diff)
+    return diffs
+
+
 def detect_step(fills: List[Dict]) -> Decimal:
-    """Detecta el menor salto positivo entre precios ejecutados."""
-    prices = sorted(set(f["price"] for f in fills))
-    if len(prices) < 2:
+    """
+    Detecta un step base robusto desde fills historicos.
+
+    Antes se usaba el menor salto positivo entre cualquier precio. Con trailing,
+    cambios de size o resets del grid, ese minimo suele ser ruido y distorsiona
+    todos los multiplos. Aqui usamos el salto mas frecuente; si no hay una moda
+    clara, usamos una mediana recortada.
+    """
+    diffs = _common_positive_diffs(f["price"] for f in fills)
+    if not diffs:
         return Decimal("0")
 
-    diffs = [prices[i + 1] - prices[i] for i in range(len(prices) - 1)]
-    positive_diffs = [d for d in diffs if d > 0]
-    if not positive_diffs:
-        return Decimal("0")
-    return min(positive_diffs)
+    counts = Counter(diffs)
+    most_common_diff, most_common_count = counts.most_common(1)[0]
+    if most_common_count > 1:
+        return most_common_diff
+
+    if len(diffs) <= 4:
+        return median(diffs)
+
+    ordered = sorted(diffs)
+    trim = max(1, len(ordered) // 10)
+    trimmed = ordered[trim:-trim] or ordered
+    return Decimal(str(median(trimmed))).quantize(TICK_SIZE, rounding=ROUND_DOWN)
 
 
 def _find_best_buy_match(open_buys: List[Dict], sell_fill: Dict) -> Optional[int]:
     """Busca el BUY abierto mas cercano para emparejar un SELL ejecutado."""
     sell_price = sell_fill["price"]
-    sell_qty = sell_fill["quantity"]
+    remaining_sell_qty = sell_fill.get("remaining_quantity", sell_fill["quantity"])
 
     exact_qty_candidates: List[Tuple[int, Dict]] = []
     fallback_candidates: List[Tuple[int, Dict]] = []
@@ -70,7 +133,11 @@ def _find_best_buy_match(open_buys: List[Dict], sell_fill: Dict) -> Optional[int
         if buy["price"] >= sell_price:
             continue
 
-        if buy["quantity"] == sell_qty:
+        buy_qty = buy.get("remaining_quantity", buy["quantity"])
+        if buy_qty <= 0:
+            continue
+
+        if buy_qty == remaining_sell_qty:
             exact_qty_candidates.append((idx, buy))
         else:
             fallback_candidates.append((idx, buy))
@@ -123,6 +190,7 @@ def pair_fills(fills: List[Dict], step: Decimal) -> Tuple[List[Dict], List[Dict]
     open_buys: List[Dict] = []
 
     for fill in fills:
+        fill = {**fill, "remaining_quantity": fill["quantity"]}
         side = fill["side"]
 
         if side == "buy":
@@ -132,29 +200,36 @@ def pair_fills(fills: List[Dict], step: Decimal) -> Tuple[List[Dict], List[Dict]
         if side != "sell":
             continue
 
-        matched_idx = _find_best_buy_match(open_buys, fill)
-        if matched_idx is None:
-            continue
+        while fill["remaining_quantity"] > QTY_EPSILON:
+            matched_idx = _find_best_buy_match(open_buys, fill)
+            if matched_idx is None:
+                break
 
-        buy = open_buys.pop(matched_idx)
-        quantity = buy["quantity"]
-        sell_price = fill["price"]
-        buy_price = buy["price"]
-        buy_value = buy_price * quantity
-        sell_value = sell_price * quantity
-        profit = sell_value - buy_value
-        step_used = sell_price - buy_price
+            buy = open_buys[matched_idx]
+            buy_qty = buy["remaining_quantity"]
+            quantity = min(buy_qty, fill["remaining_quantity"])
+            sell_price = fill["price"]
+            buy_price = buy["price"]
+            buy_value = buy_price * quantity
+            sell_value = sell_price * quantity
+            profit = sell_value - buy_value
+            step_used = sell_price - buy_price
 
-        pairs.append({
-            "buy_ts": buy["ts"],
-            "buy_price": _price_key(buy_price),
-            "sell_ts": fill["ts"],
-            "sell_price": _price_key(sell_price),
-            "quantity": str(quantity),
-            "step_usdc": _price_key(step_used),
-            "profit_usdc": f"{profit:.4f}",
-            **_step_flags(step_used, step),
-        })
+            pairs.append({
+                "buy_ts": buy["ts"],
+                "buy_price": _price_key(buy_price),
+                "sell_ts": fill["ts"],
+                "sell_price": _price_key(sell_price),
+                "quantity": _quantity_key(quantity),
+                "step_usdc": _price_key(step_used),
+                "profit_usdc": f"{profit:.4f}",
+                **_step_flags(step_used, step),
+            })
+
+            buy["remaining_quantity"] -= quantity
+            fill["remaining_quantity"] -= quantity
+            if buy["remaining_quantity"] <= QTY_EPSILON:
+                open_buys.pop(matched_idx)
 
     return pairs, open_buys
 
@@ -191,10 +266,11 @@ def write_open_buys(open_buys: List[Dict], path: Path) -> None:
         writer = csv.DictWriter(f, fieldnames=["ts", "price", "quantity"])
         writer.writeheader()
         for b in open_buys:
+            quantity = b.get("remaining_quantity", b["quantity"])
             writer.writerow({
                 "ts": b["ts"],
                 "price": _price_key(b["price"]),
-                "quantity": str(b["quantity"]),
+                "quantity": _quantity_key(quantity),
             })
 
 
@@ -216,7 +292,7 @@ def print_summary(pairs: List[Dict], open_buys: List[Dict], step: Decimal) -> No
     realized_steps = [Decimal(p["step_usdc"]) for p in pairs]
     min_step = min(realized_steps)
     max_step = max(realized_steps)
-    avg_step = sum(realized_steps) / len(realized_steps)
+    median_step = Decimal(str(median(realized_steps)))
 
     gt_1x_count = sum(1 for p in pairs if p["gt_1x"] == "yes")
     gt_2x_count = sum(1 for p in pairs if p["gt_2x"] == "yes")
@@ -228,7 +304,7 @@ def print_summary(pairs: List[Dict], open_buys: List[Dict], step: Decimal) -> No
     print(f"  Beneficio medio    : {avg_profit:.4f} USDC / par")
     print(f"  Step realizado min : {min_step} USDC")
     print(f"  Step realizado max : {max_step} USDC")
-    print(f"  Step realizado med : {avg_step:.4f} USDC")
+    print(f"  Step realizado med : {median_step:.4f} USDC")
     print(f"  Pares > 1x step    : {gt_1x_count}")
     print(f"  Pares > 2x step    : {gt_2x_count}")
     print(f"  Pares > 3x step    : {gt_3x_count}")
@@ -251,14 +327,33 @@ def print_summary(pairs: List[Dict], open_buys: List[Dict], step: Decimal) -> No
 
 def main() -> None:
     """Punto de entrada CLI para analizar fills.csv y generar reportes CSV."""
-    fills_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("fills.csv")
+    args = sys.argv[1:]
+    manual_step: Optional[Decimal] = None
+    fills_arg: Optional[str] = None
+    idx = 0
+    while idx < len(args):
+        arg = args[idx]
+        if arg == "--step" and idx + 1 < len(args):
+            manual_step = _decimal_or_none(args[idx + 1])
+            idx += 2
+            continue
+        if arg.startswith("--step="):
+            manual_step = _decimal_or_none(arg.split("=", 1)[1])
+            idx += 1
+            continue
+        if fills_arg is None:
+            fills_arg = arg
+        idx += 1
+
+    fills_path = Path(fills_arg) if fills_arg else Path("fills.csv")
 
     if not fills_path.exists():
         print(f"[!] No se encontró {fills_path}")
         sys.exit(1)
 
     fills = load_fills(fills_path)
-    step = detect_step(fills)
+    state_step = load_state_step(fills_path.parent / "grid_state.json")
+    step = manual_step or state_step or detect_step(fills)
 
     if step == 0 and len(fills) < 2:
         print("[!] No hay suficientes fills para analizar.")
