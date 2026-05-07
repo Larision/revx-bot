@@ -19,6 +19,8 @@ from types_ import LogEntry, OrderInfo
 @dataclass
 class BacktestResult:
     lines: int
+    lines_above: int
+    lines_below: int
     market_trades: int
     fills: int
     buys: int
@@ -38,15 +40,16 @@ class PaperGridEngine(GridEngine):
         self,
         *,
         saldo: Decimal,
-        levels_each_side: int,
+        levels_above: int,
+        levels_below: int,
         step_usdc: Decimal,
         base_size: Decimal,
         initial_price: Decimal,
     ) -> None:
         step_percent = Decimal(str(step_usdc)) / Decimal(str(initial_price))
         super().__init__(
-            levels_below=levels_each_side,
-            levels_above=levels_each_side,
+            levels_below=levels_below,
+            levels_above=levels_above,
             step_percent=step_percent,
             base_size=base_size,
             initial_price=initial_price,
@@ -152,11 +155,20 @@ class PaperGridEngine(GridEngine):
             "placed_at": time.time(),
         })
 
-        if side == "sell" and metadata is None:
-            if self._paper_last_fill is not None and self._paper_last_fill["side"] == "buy":
-                order_info["paired_buy_price"] = Decimal(str(self._paper_last_fill["price"]))
-            elif self.center_price is not None:
-                order_info["paired_buy_price"] = Decimal(str(self.center_price))
+        # FIX Bug 1: paired_buy_price se asigna siempre para SELLs, salvo que
+        # el metadata ya lo traiga (órdenes extended que lo calculan explícitamente).
+        # La condición original "metadata is None" excluía las SELLs de trailing-up
+        # (metadata = {"trailing_up_step": N}), haciendo que se usase center_price
+        # como coste base en lugar del BUY real, sobreestimando realized_profit.
+        if side == "sell":
+            metadata_has_paired = (
+                isinstance(metadata, dict) and "paired_buy_price" in metadata
+            )
+            if not metadata_has_paired:
+                if self._paper_last_fill is not None and self._paper_last_fill["side"] == "buy":
+                    order_info["paired_buy_price"] = Decimal(str(self._paper_last_fill["price"]))
+                elif self.center_price is not None:
+                    order_info["paired_buy_price"] = Decimal(str(self.center_price))
 
         order_info = self._apply_order_metadata(order_info, metadata)
 
@@ -311,12 +323,25 @@ def _quantize_price(price: Decimal) -> Decimal:
     return Decimal(str(price)).quantize(TICK_SIZE, rounding=ROUND_DOWN)
 
 
-def _calculate_lines_from_balance(*, saldo: Decimal, size: Decimal, step: Decimal, center: Decimal) -> int:
+def _required_balance_for_grid(
+    *,
+    levels_above: int,
+    levels_below: int,
+    size: Decimal,
+    step: Decimal,
+    center: Decimal,
+) -> Decimal:
+    above = Decimal(levels_above)
+    below = Decimal(levels_below)
+    btc_for_sells = above * size * center
+    usdc_for_buys = size * ((below * center) - (step * below * (below + Decimal("1")) / Decimal("2")))
+    return btc_for_sells + usdc_for_buys
+
+
+def _calculate_max_buy_only_lines(*, saldo: Decimal, size: Decimal, step: Decimal, center: Decimal) -> int:
     def required_for_lines(lines: int) -> Decimal:
         n = Decimal(lines)
-        btc_for_sells = n * size * center
-        usdc_for_buys = size * ((n * center) - (step * n * (n + Decimal("1")) / Decimal("2")))
-        return btc_for_sells + usdc_for_buys
+        return size * ((n * center) - (step * n * (n + Decimal("1")) / Decimal("2")))
 
     max_by_price = int(((center - TICK_SIZE) / step).to_integral_value(rounding=ROUND_DOWN))
     if max_by_price <= 0:
@@ -344,21 +369,25 @@ def _select_trade_fill_keys(
     snapshot = engine.get_runtime_snapshot()["active_orders"]
 
     if trade_price > previous_price:
+        # FIX Bug 4: el rango es exclusivo en el extremo inferior (previous_price)
+        # para evitar doble-fill en niveles de frontera. Un SELL en previous_price
+        # ya habría sido procesado en el ciclo anterior si existía.
         return sorted(
             [
                 key
                 for key, info in snapshot.items()
-                if info["side"] == "sell" and low <= Decimal(key) <= high
+                if info["side"] == "sell" and low < Decimal(key) <= high
             ],
             key=Decimal,
         )
 
     if trade_price < previous_price:
+        # Exclusivo en el extremo superior (previous_price) por la misma razón.
         return sorted(
             [
                 key
                 for key, info in snapshot.items()
-                if info["side"] == "buy" and low <= Decimal(key) <= high
+                if info["side"] == "buy" and low <= Decimal(key) < high
             ],
             key=Decimal,
             reverse=True,
@@ -422,6 +451,8 @@ def run_grid_backtest(
     size: Decimal,
     step: Decimal,
     initial_price: Decimal,
+    levels_above: int,
+    levels_below: int,
     start_date: str,
     end_date: str,
     symbol: str = SYMBOL,
@@ -446,15 +477,32 @@ def run_grid_backtest(
     if not market_trades:
         raise RuntimeError("No hay trades de mercado en el rango seleccionado.")
 
+    if levels_above < 0 or levels_below < 0:
+        raise ValueError("Las lineas arriba y abajo no pueden ser negativas.")
+    if levels_above + levels_below <= 0:
+        raise ValueError("Debes colocar al menos una linea entre arriba y abajo.")
+
     center = _quantize_price(initial_price)
     grid_step = _quantize_price(step)
-    lines = _calculate_lines_from_balance(saldo=saldo, size=size, step=grid_step, center=center)
-    if lines <= 0:
-        raise ValueError("El saldo no permite abrir ninguna linea con ese size, step y precio inicial.")
+    required_balance = _required_balance_for_grid(
+        levels_above=levels_above,
+        levels_below=levels_below,
+        size=size,
+        step=grid_step,
+        center=center,
+    )
+    if required_balance > saldo:
+        raise ValueError(
+            "La distribución de lineas no cabe en el saldo disponible. "
+            f"Necesitas {_price_key(required_balance)} USDC y tienes {_price_key(saldo)} USDC."
+        )
+
+    lines = levels_above + levels_below
 
     engine = PaperGridEngine(
         saldo=saldo,
-        levels_each_side=lines,
+        levels_above=levels_above,
+        levels_below=levels_below,
         step_usdc=grid_step,
         base_size=size,
         initial_price=center,
@@ -465,7 +513,12 @@ def run_grid_backtest(
     fills: list[dict[str, str]] = []
     last_price = center
 
-    previous_price = center
+    # FIX Bug 3: inicializar previous_price con el precio del primer trade real,
+    # no con center. Si se usa center y el mercado abre lejos (ej. center=75000,
+    # primer trade=71000), todos los BUYs entre ambos se ejecutan de golpe en el
+    # primer ciclo, produciendo un estado irreal. Usando el primer trade como punto
+    # de partida, el grid solo reacciona a movimientos a partir de ese instante.
+    previous_price = _trade_price(market_trades[0]) if market_trades else center
     for trade in market_trades:
         trade_price = _trade_price(trade)
         last_price = trade_price
@@ -496,12 +549,17 @@ def run_grid_backtest(
         writer.writeheader()
         writer.writerows(fills)
 
+    # FIX Bug 2: excluir activaciones de órdenes virtuales del conteo de fills.
+    # Las virtuales son sentinels de trailing, no transacciones reales.
+    real_fills = [f for f in fills if f["virtual"] == "no"]
     return BacktestResult(
         lines=lines,
+        lines_above=levels_above,
+        lines_below=levels_below,
         market_trades=len(market_trades),
-        fills=len(fills),
-        buys=sum(1 for fill in fills if fill["side"] == "buy"),
-        sells=sum(1 for fill in fills if fill["side"] == "sell"),
+        fills=len(real_fills),
+        buys=sum(1 for f in real_fills if f["side"] == "buy"),
+        sells=sum(1 for f in real_fills if f["side"] == "sell"),
         realized_profit=engine.realized_profit,
         start_equity=saldo,
         end_equity=engine.equity(last_price),
@@ -540,7 +598,7 @@ def prompt_backtest() -> None:
     def ask_date(label: str, default: str) -> str:
         raw = input(f"{label} [{default}]: ").strip()
         return raw or default
-    
+
     def ask_trailing_mode(label: str, default: str) -> str:
         """Pregunta por el modo de trailing y valida la respuesta."""
         while True:
@@ -551,10 +609,64 @@ def prompt_backtest() -> None:
                 return raw
             print("Opción inválida. Debe ser off, on o extended.")
 
+    def ask_non_negative_int(label: str, default: int) -> int:
+        while True:
+            raw = input(f"{label} [{default}]: ").strip()
+            if not raw:
+                return default
+            try:
+                value = int(raw)
+            except Exception:
+                print("Valor invalido. Introduce un entero.")
+                continue
+            if value < 0:
+                print("Valor invalido. Debe ser cero o mayor.")
+                continue
+            return value
+
     saldo = ask_decimal("Saldo USDC", default_saldo)
     size = ask_decimal("Size BTC por orden", default_size)
     step = ask_decimal("Step USDC entre lineas", default_step)
     initial_price = ask_decimal("Precio inicial", default_price)
+
+    center = _quantize_price(initial_price)
+    grid_step = _quantize_price(step)
+    max_total_lines = _calculate_max_buy_only_lines(
+        saldo=saldo,
+        size=size,
+        step=grid_step,
+        center=center,
+    )
+    print(f"\nLineas maximas estimadas con este saldo: {max_total_lines} en total (si todas fuesen abajo).")
+    print("La distribucion arriba/abajo cambia el saldo necesario.")
+
+    if max_total_lines <= 0:
+        print("[!] El saldo no permite abrir ninguna linea con ese size, step y precio inicial.")
+        return
+
+    while True:
+        levels_above = ask_non_negative_int("Cuantas lineas quieres poner arriba", 0)
+        levels_below = ask_non_negative_int("Cuantas lineas quieres poner abajo", max_total_lines)
+
+        if levels_above + levels_below <= 0:
+            print("[!] Debes colocar al menos una linea.")
+            continue
+
+        required_balance = _required_balance_for_grid(
+            levels_above=levels_above,
+            levels_below=levels_below,
+            size=size,
+            step=grid_step,
+            center=center,
+        )
+        if required_balance > saldo:
+            print(
+                f"[!] Esa distribucion requiere {_price_key(required_balance)} USDC, "
+                f"pero solo tienes {_price_key(saldo)} USDC."
+            )
+            continue
+        break
+
     start_date = ask_date("Fecha inicio (YYYYMMDD)", start_default)
     end_date = ask_date("Fecha final (YYYYMMDD)", end_default)
     trailing_up = ask_trailing_mode("Trailing up", default_trailing_up)
@@ -566,10 +678,12 @@ def prompt_backtest() -> None:
             size=size,
             step=step,
             initial_price=initial_price,
+            levels_above=levels_above,
+            levels_below=levels_below,
             start_date=start_date,
             end_date=end_date,
             trailing_up_mode=trailing_up,
-            trailing_down_mode=trailing_down
+            trailing_down_mode=trailing_down,
         )
     except Exception as exc:
         print(f"\n[!] Backtest cancelado: {exc}")
@@ -582,7 +696,7 @@ def prompt_backtest() -> None:
     print(f"Precio inicial     : {_price_key(initial_price)} USDC")
     print(f"Step               : {_price_key(step)} USDC")
     print(f"Trailings up/down  : {trailing_up} / {trailing_down}")
-    print(f"Lineas calculadas  : {result.lines} por lado")
+    print(f"Lineas totales     : {result.lines} ({result.lines_above} arriba / {result.lines_below} abajo)")
     print(f"Trades mercado     : {result.market_trades}")
     print(f"Fills simulados    : {result.fills} ({result.buys} BUY / {result.sells} SELL)")
     print(f"Profit realizado   : {_price_key(result.realized_profit)} USDC")
