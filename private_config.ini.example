@@ -8,3 +8,11 @@ private_pem_path = private.pem
 enabled = true
 token   = TU_TOKEN_AQUI
 chat_id = TU_CHAT_ID_AQUI
+
+[grid]
+levels_below = 3
+levels_above = 3
+base_size = 10
+step_percent = 0.5
+trailing_up = off
+trailing_down = off

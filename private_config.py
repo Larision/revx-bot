@@ -90,3 +90,70 @@ def get_telegram_chat_id() -> Optional[int]:
         except ValueError:
             pass
     return None
+
+
+def get_grid_levels_below(default: int) -> int:
+    """Lee levels_below de [grid] en private_config.ini."""
+    cfg = _load()
+    val = cfg.get("grid", "levels_below", fallback=None)
+    if val:
+        try:
+            return int(val.strip())
+        except ValueError:
+            pass
+    return default
+
+
+def get_grid_levels_above(default: int) -> int:
+    """Lee levels_above de [grid] en private_config.ini."""
+    cfg = _load()
+    val = cfg.get("grid", "levels_above", fallback=None)
+    if val:
+        try:
+            return int(val.strip())
+        except ValueError:
+            pass
+    return default
+
+
+def get_base_size_default(default: str) -> str:
+    """Lee base_size de [grid] en private_config.ini."""
+    cfg = _load()
+    val = cfg.get("grid", "base_size", fallback=None)
+    return val.strip() if val else default
+
+
+def get_step_percent_default(default: str) -> str:
+    """Lee step_percent de [grid] en private_config.ini."""
+    cfg = _load()
+    val = cfg.get("grid", "step_percent", fallback=None)
+    return val.strip() if val else default
+
+
+def get_trailing_up_default(default: str) -> str:
+    """Lee trailing_up de [grid] en private_config.ini."""
+    cfg = _load()
+    val = cfg.get("grid", "trailing_up", fallback=None)
+    return val.strip() if val else default
+
+
+def get_trailing_down_default(default: str) -> str:
+    """Lee trailing_down de [grid] en private_config.ini."""
+    cfg = _load()
+    val = cfg.get("grid", "trailing_down", fallback=None)
+    return val.strip() if val else default
+
+
+def save_grid_config(levels_below: int, levels_above: int, base_size: str, step_percent: str, trailing_up: str, trailing_down: str) -> None:
+    """Guarda la configuración de grid en private_config.ini."""
+    cfg = _load()
+    if not cfg.has_section("grid"):
+        cfg.add_section("grid")
+    cfg.set("grid", "levels_below", str(levels_below))
+    cfg.set("grid", "levels_above", str(levels_above))
+    cfg.set("grid", "base_size", base_size)
+    cfg.set("grid", "step_percent", step_percent)
+    cfg.set("grid", "trailing_up", trailing_up)
+    cfg.set("grid", "trailing_down", trailing_down)
+    with open(PRIVATE_CONFIG_PATH, "w", encoding="utf-8") as f:
+        cfg.write(f)

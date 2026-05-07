@@ -920,7 +920,16 @@ def run_cli() -> None:
     Gestiona el bucle principal del menú, el ciclo de vida del motor y la integración con el bot de Telegram.
     """
     from engine import GridEngine
-    from private_config import get_telegram_enabled
+    from private_config import (
+        get_base_size_default,
+        get_grid_levels_above,
+        get_grid_levels_below,
+        get_step_percent_default,
+        get_telegram_enabled,
+        get_trailing_down_default,
+        get_trailing_up_default,
+        save_grid_config,
+    )
 
     telegram_enabled = get_telegram_enabled(default=True)
     start_telegram_bot = None
@@ -931,10 +940,12 @@ def run_cli() -> None:
         start_telegram_bot = _start_telegram_bot
         tg_state = _tg_state
 
-    grid_levels_below:    int     = DEFAULT_GRID_LEVELS_BELOW
-    grid_levels_above:    int     = DEFAULT_GRID_LEVELS_ABOVE
-    base_size_default:    Decimal = DEFAULT_BASE_SIZE
-    step_percent_default: Decimal = DEFAULT_STEP_PERCENT
+    grid_levels_below:    int     = get_grid_levels_below(DEFAULT_GRID_LEVELS_BELOW)
+    grid_levels_above:    int     = get_grid_levels_above(DEFAULT_GRID_LEVELS_ABOVE)
+    base_size_default:    Decimal = Decimal(get_base_size_default(str(DEFAULT_BASE_SIZE)))
+    step_percent_default: Decimal = Decimal(get_step_percent_default(str(DEFAULT_STEP_PERCENT)))
+    trailing_up_default:  str     = get_trailing_up_default("off")
+    trailing_down_default: str    = get_trailing_down_default("off")
 
     print("GRID ENGINE v1.1 — CLI INTERACTIVO")
 
@@ -1188,6 +1199,29 @@ def run_cli() -> None:
                     step_percent_default = Decimal(new_step_percent)
                 except Exception:
                     log_event("[ERROR] Valor de step percent inválido, conservando el anterior.", "error")
+
+            new_trailing_up = input(f"Trailing up (off/on/extended) [{trailing_up_default}]: ").strip().lower()
+            if new_trailing_up and new_trailing_up in ("off", "on", "extended"):
+                trailing_up_default = new_trailing_up
+            elif new_trailing_up:
+                log_event("[ERROR] Valor de trailing up inválido (debe ser off, on o extended), conservando el anterior.", "error")
+
+            new_trailing_down = input(f"Trailing down (off/on/extended) [{trailing_down_default}]: ").strip().lower()
+            if new_trailing_down and new_trailing_down in ("off", "on", "extended"):
+                trailing_down_default = new_trailing_down
+            elif new_trailing_down:
+                log_event("[ERROR] Valor de trailing down inválido (debe ser off, on o extended), conservando el anterior.", "error")
+
+            # Guardar la configuración
+            save_grid_config(
+                grid_levels_below,
+                grid_levels_above,
+                str(base_size_default),
+                str(step_percent_default),
+                trailing_up_default,
+                trailing_down_default,
+            )
+            print("✓ Configuración guardada como predeterminada.")
 
         # --------------------------------------------------
         # 0.Salir
