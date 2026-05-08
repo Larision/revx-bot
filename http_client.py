@@ -82,14 +82,17 @@ def send_request(
         timestamp = _synced_timestamp()
         signature = sign_request(timestamp, method, path, query, body_str)
 
-        headers = {
-            "Accept": "application/json",
+        headers = {}
+        if method.upper() == "POST":
+            headers["Content-Type"] = "application/json"
+        if method.upper() == "GET":
+            headers["Accept"] = "application/json"
+
+        headers.update({
             "X-Revx-Timestamp": timestamp,
             "X-Revx-Signature": signature,
             "X-Revx-API-Key": API_KEY
-        }
-        if method.upper() == "POST":
-            headers["Content-Type"] = "application/json"
+        })
 
         if method.upper() == "GET":
             return SESSION.get(url, headers=headers, timeout=10)
