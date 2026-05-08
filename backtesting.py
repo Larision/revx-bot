@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import time
+import msvcrt
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
@@ -14,6 +15,35 @@ from config import SYMBOL, TICK_SIZE
 from engine import GridEngine
 from logger import log_event
 from types_ import LogEntry, OrderInfo
+
+
+def input_with_esc(prompt: str) -> str:
+    """
+    Función de input personalizada que permite cancelar con ESC.
+    """
+    print(prompt, end='', flush=True)
+    buffer = ''
+    while True:
+        if msvcrt.kbhit():
+            ch = msvcrt.getch()
+            if ch == b'\x1b':  # ESC key
+                print()  # newline
+                raise KeyboardInterrupt("Backtest cancelado con ESC")
+            elif ch == b'\r':  # Enter
+                print()
+                return buffer
+            elif ch == b'\x08':  # Backspace
+                if buffer:
+                    buffer = buffer[:-1]
+                    print('\b \b', end='', flush=True)
+            else:
+                try:
+                    char = ch.decode('utf-8')
+                    buffer += char
+                    print(char, end='', flush=True)
+                except UnicodeDecodeError:
+                    pass  # ignore invalid chars
+        time.sleep(0.01)
 
 
 @dataclass
@@ -581,6 +611,7 @@ def run_grid_backtest(
 def prompt_backtest() -> None:
     print("\n=== Backtesting Grid ===")
     print("Usa la logica de GridEngine con exchange simulado. Fechas en formato YYYYMMDD.")
+    print("Presiona ESC en cualquier momento para cancelar.")
 
     # Defaults
     default_saldo = "1000"
@@ -596,7 +627,7 @@ def prompt_backtest() -> None:
 
     def ask_decimal(label: str, default: str) -> Decimal:
         while True:
-            raw = input(f"{label} [{default}]: ").strip()
+            raw = input_with_esc(f"{label} [{default}]: ").strip()
             if not raw:
                 raw = default
             try:
@@ -606,7 +637,7 @@ def prompt_backtest() -> None:
 
     def ask_decimal_list(label: str, default: str) -> list[Decimal]:
         while True:
-            raw = input(f"{label} [{default}]: ").strip()
+            raw = input_with_esc(f"{label} [{default}]: ").strip()
             if not raw:
                 raw = default
 
@@ -633,13 +664,13 @@ def prompt_backtest() -> None:
             print("Valor invalido. Introduce uno o varios numeros separados por comas.")
 
     def ask_date(label: str, default: str) -> str:
-        raw = input(f"{label} [{default}]: ").strip()
+        raw = input_with_esc(f"{label} [{default}]: ").strip()
         return raw or default
 
     def ask_trailing_mode(label: str, default: str) -> str:
         """Pregunta por el modo de trailing y valida la respuesta."""
         while True:
-            raw = input(f"{label} (off/on/extended) [{default}]: ").strip().lower()
+            raw = input_with_esc(f"{label} (off/on/extended) [{default}]: ").strip().lower()
             if not raw:
                 return default
             if raw in ("off", "on", "extended"):
@@ -650,7 +681,7 @@ def prompt_backtest() -> None:
         """Pregunta por uno o varios modos de trailing separados por comas."""
         valid_modes = {"off", "on", "extended"}
         while True:
-            raw = input(f"{label} (off/on/extended, separados por comas) [{default}]: ").strip().lower()
+            raw = input_with_esc(f"{label} (off/on/extended, separados por comas) [{default}]: ").strip().lower()
             if not raw:
                 raw = default
 
@@ -662,7 +693,7 @@ def prompt_backtest() -> None:
 
     def ask_non_negative_int(label: str, default: int) -> int:
         while True:
-            raw = input(f"{label} [{default}]: ").strip()
+            raw = input_with_esc(f"{label} [{default}]: ").strip()
             if not raw:
                 return default
             try:
@@ -676,8 +707,10 @@ def prompt_backtest() -> None:
             return value
 
     saldo = ask_decimal("Saldo USDC", default_saldo)
-    sizes = ask_decimal_list("Size BTC por orden", default_size)
-    steps = ask_decimal_list("Step USDC entre lineas", default_step)
+    # Permite ingresar listas de sizes y steps para ejecutar múltiples combinaciones de backtest.
+    sizes = ask_decimal_list("Size BTC por orden. Admite varios sizes separados por comas.", default_size)
+    steps = ask_decimal_list("Step USDC entre lineas. Admite varios steps separados por comas.", default_step)
+
     initial_price = ask_decimal("Precio inicial", default_price)
 
     center = _quantize_price(initial_price)
@@ -779,8 +812,11 @@ def prompt_backtest() -> None:
                 output_label=output_label,
             )
             results.append((size, step, trailing_up, trailing_down, result))
-    except Exception as exc:
-        print(f"\n[!] Backtest cancelado: {exc}")
+    except (Exception, KeyboardInterrupt) as exc:
+        if isinstance(exc, KeyboardInterrupt):
+            print("\n[!] Backtest cancelado con ESC.")
+        else:
+            print(f"\n[!] Backtest cancelado: {exc}")
         return
 
     if not results:
