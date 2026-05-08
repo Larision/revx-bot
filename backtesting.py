@@ -481,6 +481,62 @@ def _load_market_trades(symbol: str, since: int, until: int) -> list[dict[str, A
     return sorted(trades, key=_item_time_ms)
 
 
+def _write_backtest_summary(
+    *,
+    saldo: Decimal,
+    initial_price: Decimal,
+    levels_above: int,
+    levels_below: int,
+    start_date: str,
+    end_date: str,
+    results: list[tuple[Decimal, Decimal, str, str, BacktestResult]],
+) -> None:
+    summary_file = Path("resumen_resultados.txt")
+    lines: list[str] = []
+    lines.append("=== BACKTEST RESUMEN ===")
+    lines.append(f"Fecha UTC      : {datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()}")
+    lines.append(f"Símbolo        : {SYMBOL}")
+    lines.append(f"Rango          : {start_date} -> {end_date}")
+    lines.append(f"Saldo USDC     : {_price_key(saldo)}")
+    lines.append(f"Precio inicial : {_price_key(initial_price)}")
+    lines.append(f"Lineas         : {levels_above} arriba / {levels_below} abajo")
+    lines.append(f"Combinaciones  : {len(results)}")
+    lines.append("-")
+    lines.append(f"  {'Size':>12} {'Step':>10} {'T.Up':>8} {'T.Down':>8} {'Fills':>8} {'Profit':>12} {'PnL MTM':>12} {'CSV'}")
+
+    best: Optional[tuple[Decimal, Decimal, str, str, BacktestResult, Decimal]] = None
+    for size, step, trailing_up, trailing_down, result in results:
+        pnl = result.end_equity - result.start_equity
+        if best is None or pnl > best[5]:
+            best = (size, step, trailing_up, trailing_down, result, pnl)
+        lines.append(
+            f"  {fmt_amount(size):>12} {_price_key(step):>10} "
+            f"{trailing_up:>8} {trailing_down:>8} "
+            f"{result.fills:>8} {_price_key(result.realized_profit):>12} "
+            f"{_price_key(pnl):>12} {result.output_path}"
+        )
+
+    if best is not None:
+        best_size, best_step, best_trailing_up, best_trailing_down, best_result, best_pnl = best
+        best_pct = (
+            best_pnl / best_result.start_equity * Decimal("100")
+            if best_result.start_equity
+            else Decimal("0")
+        )
+        lines.append("-")
+        lines.append(
+            f"Mejor PnL MTM: size {fmt_amount(best_size)}, step {_price_key(best_step)}, "
+            f"trailing {best_trailing_up}/{best_trailing_down}, "
+            f"{_price_key(best_pnl)} USDC ({fmt_amount(best_pct)}%)"
+        )
+
+    lines.append("")
+
+    summary_file.parent.mkdir(parents=True, exist_ok=True)
+    with summary_file.open("a", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
 def run_grid_backtest(
     *,
     saldo: Decimal,
@@ -854,3 +910,13 @@ def prompt_backtest() -> None:
             f"trailing {best_trailing_up}/{best_trailing_down} "
             f"=> {_price_key(best_pnl)} USDC ({fmt_amount(best_pct)}%)"
         )
+
+    _write_backtest_summary(
+        saldo=saldo,
+        initial_price=initial_price,
+        levels_above=levels_above,
+        levels_below=levels_below,
+        start_date=start_date,
+        end_date=end_date,
+        results=results,
+    )
