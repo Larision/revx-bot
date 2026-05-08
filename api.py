@@ -232,8 +232,8 @@ def get_market_trades_page(
     symbol: str,
     start_date: Optional[int] = None,
     end_date: Optional[int] = None,
-    cursor: Optional[str] = None,
     limit: Optional[int] = None,
+    cursor: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], List[LogEntry]]:
     """
     Recupera una pagina de trades publicos de mercado para un simbolo.
@@ -247,12 +247,10 @@ def get_market_trades_page(
         params.append(("start_date", int(start_date)))
     if end_date is not None:
         params.append(("end_date", int(end_date)))
-    if cursor:
-        params.append(("cursor", cursor))
-
     if limit is not None:
         params.append(("limit", max(1, min(int(limit), MAX_TRADES_HISTORY_LIMIT))))
-
+    if cursor:
+        params.append(("cursor", str(cursor)))
     query = urlencode(params)
 
     response, logs = send_request(

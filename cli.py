@@ -189,7 +189,7 @@ def exportar_datos_mercado():
 
     from api import get_market_trades_page
 
-    WINDOW_MS = 30 * 24 * 60 * 60 * 1000
+    WINDOW_MS = 29 * 24 * 60 * 60 * 1000
     all_rows: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
     window_start = since
