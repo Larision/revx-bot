@@ -17,6 +17,8 @@ from config import (
     DEFAULT_GRID_LEVELS_ABOVE,
     DEFAULT_GRID_LEVELS_BELOW,
     DEFAULT_STEP_PERCENT,
+    DEFAULT_TRAILING_DOWN,
+    DEFAULT_TRAILING_UP,
     STATE_PATH,
     SYMBOL,
     TICK_SIZE,
@@ -409,6 +411,8 @@ def show_grid_preview(
     levels_above: int,
     base_size: Decimal,
     step_percent: Decimal,
+    trailing_up: str,
+    trailing_down: str,
 ) -> Tuple[bool, Optional[Decimal]]:
     """
     Muestra un resumen de la configuración del grid, los fondos requeridos y los saldos actuales.
@@ -439,6 +443,8 @@ def show_grid_preview(
     _lp(f"  Total órdenes    : {levels_below + levels_above}")
     _lp(f"  Tamaño base      : {fmt_amount(base_size)} BTC por orden")
     _lp(f"  Step percent     : {fmt_amount(step_percent * 100)}%  entre niveles")
+    _lp(f"  Trailing up      : {trailing_up.upper()}")
+    _lp(f"  Trailing down    : {trailing_down.upper()}")
 
     initial_price = choose_initial_grid_price()
     if initial_price is None:
@@ -1079,6 +1085,8 @@ def run_cli() -> None:
                     grid_levels_above,
                     base_size_default,
                     step_percent_default,
+                    trailing_up_default,
+                    trailing_down_default,
                 )
                 if not confirmar:
                     print("\nGrid no iniciado.")
@@ -1091,6 +1099,9 @@ def run_cli() -> None:
                 base_size=base_size_default,
                 initial_price=initial_price,
             )
+
+            if not recover_state:
+                engine.set_trailing(trailing_up_default, trailing_down_default)
 
             try:
                 engine.initialize(recover_state=recover_state)

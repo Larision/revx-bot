@@ -17,6 +17,8 @@ DEFAULT_GRID_LEVELS_ABOVE: int = 3
 DEFAULT_GRID_STEPS: int = DEFAULT_GRID_LEVELS_ABOVE  # alias legacy (grid simétrico)
 DEFAULT_BASE_SIZE: Decimal = Decimal("0.00008")
 DEFAULT_STEP_PERCENT: Decimal = Decimal("0.002")
+DEFAULT_TRAILING_UP: str = "extended"
+DEFAULT_TRAILING_DOWN: str = "on"
 TICK_SIZE: Decimal = Decimal("0.01")
 MIN_USDC_RESERVE: Decimal = Decimal("20")  # USDC mínimo reservado — no usar en trailing down extendido
 

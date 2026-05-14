@@ -1591,8 +1591,8 @@ class GridEngine:
                 if current_price is not None:
                     lvl_price = info["price"]
                     can_place = (
-                        (oside == "sell" and current_price < lvl_price) or
-                        (oside == "buy" and current_price > lvl_price)
+                        (oside == "sell" and current_price > lvl_price) or
+                        (oside == "buy" and current_price < lvl_price)
                     )
                     if can_place:
                         log_event(
