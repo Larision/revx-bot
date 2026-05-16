@@ -2311,14 +2311,16 @@ class GridEngine:
     # MAIN LOOP
     # ----------------------------------------------------------
 
-    def run(self, poll_interval: int = 2, recovery_interval: int = 600) -> None:
+    def run(self, poll_interval: int = 2, current_price_interval: int = 600, recovery_interval: int = 1800) -> None:
         """
         poll_interval:     segundos entre cada ciclo de detección de fills (flujo normal).
+        current_price_interval: segundos entre cada actualización de precio actual.
         recovery_interval: segundos entre cada ejecución de fill_empty_levels (recuperación).
         """
         log_event("[ENGINE] Iniciando loop principal", "info")
 
         last_recovery = time.time()
+        last_current_price_update = time.time()
 
         self._stop_event.clear()
 
@@ -2385,9 +2387,12 @@ class GridEngine:
 
                 now = time.time()
                 if now - last_recovery >= recovery_interval:
-                    log_event(f"[ENGINE] Precio actual: {current_price}", "info")
                     self.fill_empty_levels(current_price)
-                    last_recovery = now
+                if now - last_current_price_update >= current_price_interval:
+                    log_event(f"[ENGINE] Precio actual: {current_price}", "info")
+                    
+                last_recovery = now
+                last_current_price_update = now
 
         except KeyboardInterrupt:
             self._stop_event.set()
