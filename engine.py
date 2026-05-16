@@ -2388,11 +2388,11 @@ class GridEngine:
                 now = time.time()
                 if now - last_recovery >= recovery_interval:
                     self.fill_empty_levels(current_price)
+                    last_recovery = now
+
                 if now - last_current_price_update >= current_price_interval:
                     log_event(f"[ENGINE] Precio actual: {current_price}", "info")
-                    
-                last_recovery = now
-                last_current_price_update = now
+                    last_current_price_update = now
 
         except KeyboardInterrupt:
             self._stop_event.set()
