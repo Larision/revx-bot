@@ -383,7 +383,7 @@ class GridEngine:
 
     def _protected_empty_level_keys(self, snapshot_orders: Dict[str, OrderInfo]) -> set[str]:
         """
-        Niveles que deben permanecer vacíos porque son la otra pata de una orden extended activa.
+        Niveles que deben permanecer vacíos porque son la otra pareja de una orden extended activa.
         Evita que la recuperación recree BUY/SELL duplicados dentro del grid extendido.
         """
         protected: set[str] = set()
@@ -1591,8 +1591,8 @@ class GridEngine:
                 if current_price is not None:
                     lvl_price = info["price"]
                     can_place = (
-                        (oside == "sell" and current_price > lvl_price) or
-                        (oside == "buy" and current_price < lvl_price)
+                        (oside == "sell" and current_price < lvl_price) or
+                        (oside == "buy" and current_price > lvl_price)
                     )
                     if can_place:
                         log_event(
@@ -1716,8 +1716,7 @@ class GridEngine:
           - Cada nivel por debajo del suelo principal se marca como extended.
           - Los niveles extended usan 50% de base_size.
           - El step extended crece un 10% en cada nueva línea virtual.
-          - Cada dos sells extended de 0.5 BTC se cancela un SELL principal alto de 1 BTC
-            para liberar inventario: activaciones virtuales 1, 3, 5, ...
+          - Cancela niveles segun necesite saldo.
         """
 
         side: str = str(info["side"])
@@ -2252,14 +2251,14 @@ class GridEngine:
             if key in protected_empty_keys:
                 log_event(
                     f"[ENGINE] Nivel {key} dejado vacío intencionalmente "
-                    f"(pata pendiente de orden extended activa)"
+                    f"(pareja pendiente de orden extended activa)"
                 )
                 continue
 
             if skip_level is not None and level == skip_level:
                 log_event(
                     f"[ENGINE] Nivel {key} dejado vacío intencionalmente "
-                    f"({skip_reason}, último fill: {last_fill_side or 'desconocido'})"
+                    f"({skip_reason}: {last_fill_side or 'desconocido'})"
                 )
                 continue
 
