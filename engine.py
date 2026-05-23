@@ -1715,7 +1715,7 @@ class GridEngine:
           - El suelo principal sigue usando base_size y el step original.
           - Cada nivel por debajo del suelo principal se marca como extended.
           - Los niveles extended usan 50% de base_size.
-          - El step extended crece un 10% en cada nueva línea virtual.
+          - El step extended se mantiene fijo en cada nueva línea virtual.
           - Cancela niveles segun necesite saldo.
         """
 
@@ -1809,13 +1809,10 @@ class GridEngine:
                 if is_virtual:
                     if self.trailing_down_mode == "extended":
                         extended_size = self._extended_order_size()
-                        new_step = (grid_step * Decimal("1.1")).quantize(TICK_SIZE, rounding=ROUND_DOWN)
-                        if new_step <= 0:
-                            new_step = grid_step
-                        next_buy_price = (price - new_step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
+                        next_buy_price = (price - grid_step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
 
                         self._trailing_down_extended_drops += 1
-                        self._mark_extended_level_locked(next_buy_price, new_step)
+                        self._mark_extended_level_locked(next_buy_price, grid_step)
 
                         orders_to_place.append((
                             upper_sell_price,
@@ -1841,7 +1838,7 @@ class GridEngine:
                                 next_buy_key,
                                 self._apply_order_metadata(virtual_info, {
                                     "extended": True,
-                                    "grid_step": new_step,
+                                    "grid_step": grid_step,
                                     "paired_sell_price": price,
                                 }),
                             ))
@@ -1851,7 +1848,7 @@ class GridEngine:
                         trailing_logs.append(
                             f"[ENGINE] Trailing down extended: virtual BUY {filled_key} confirmado; "
                             f"SELL {_price_key(upper_sell_price)} size {fmt_amount(extended_size)}; "
-                            f"nueva virtual BUY {next_buy_key} con step {_price_key(new_step)}"
+                            f"nueva virtual BUY {next_buy_key} con step {_price_key(grid_step)}"
                         )
                     elif self.trailing_down_mode == "on":
                         next_buy_price = (price - grid_step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
