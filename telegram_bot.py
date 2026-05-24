@@ -369,6 +369,7 @@ async def cmd_grid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         info = active_orders.get(key)
         if info is not None:
             side = str(info["side"]).upper()
+            size = info.get("size")
             oid = str(info["order_id"])
             if oid == "virtual":
                 tag = "[V]"
@@ -378,7 +379,8 @@ async def cmd_grid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 tag = "[M]"
             else:
                 tag = ""
-            lines.append(f"{key:>12}  {side:<4} {tag}")
+            size_text = fmt_amount(size) if size is not None else "?"
+            lines.append(f"{key:>12}  {side:<4} {size_text:<8} {tag}")
         else:
             lines.append(f"{key:>12}  ---  vacío")
     lines.append("```")
