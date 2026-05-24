@@ -719,6 +719,9 @@ def format_balances_live(engine: Optional["GridEngine"] = None) -> str:
                 elif info["side"] == "buy":
                     usdc_en_grid += info["price"] * order_size
 
+            current_price = snapshot.get("current_price")
+            btc_total = btc + btc_en_grid
+            usdc_total = usdc + usdc_en_grid
             lines.extend([
                 "",
                 "EN LA REJILLA",
@@ -728,8 +731,9 @@ def format_balances_live(engine: Optional["GridEngine"] = None) -> str:
                 "",
                 "TOTAL",
                 "──────────────────────────────────────",
-                f"BTC  total      : {fmt_amount(btc + btc_en_grid)}",
-                f"USDC total      : {_price_key(usdc + usdc_en_grid)}",
+                f"BTC  total      : {fmt_amount(btc_total)}",
+                f"USDC total      : {_price_key(usdc_total)}",
+                f"USD aprox ($)   : {_price_key(btc_total * current_price + usdc_total)}" if current_price is not None else "USD aprox ($)   : N/A",
             ])
 
     lines.append("──────────────────────────────────────")
