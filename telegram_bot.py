@@ -25,6 +25,7 @@ Seguridad:
 import asyncio
 import logging
 import threading
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, cast
@@ -762,6 +763,14 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             day = str(pair["sell_ts"])[:10]
             days.setdefault(day, []).append(Decimal(pair["profit_usdc"]))
 
+        current_month = datetime.now().strftime("%Y-%m")
+        months: dict[str, list[Decimal]] = {}
+        month_day_profits: dict[str, dict[str, list[Decimal]]] = {}
+        for day, profits in days.items():
+            month = day[:7]
+            months.setdefault(month, []).extend(profits)
+            month_day_profits.setdefault(month, {})[day] = profits
+
         lines = [
             "📊 *ANALYZE FILLS*",
             f"Step detectado  : `{step} USDC`",
@@ -770,14 +779,20 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"Beneficio total : `{total_profit:.4f} USDC`",
             f"Media por par   : `{avg_profit:.4f} USDC`",
             "",
-            "*Desglose por día:*",
+            "*Desglose por mes/día:*",
             "```",
         ]
-        for day in sorted(days):
-            profits = days[day]
-            day_total = sum(profits)
-            day_avg = day_total / len(profits)
-            lines.append(f"{day}  {len(profits):>4} pares  {day_total:>8.4f}$  {day_avg:.4f}$/par")
+        for month in sorted(months):
+            if month == current_month:
+                for day in sorted(month_day_profits[month]):
+                    profits = month_day_profits[month][day]
+                    day_total = sum(profits)
+                    day_avg = day_total / len(profits)
+                    lines.append(f"{day}  {len(profits):>4} pares  {day_total:>8.4f}$  {day_avg:.4f}$/par")
+            else:
+                month_total = sum(months[month])
+                month_avg = month_total / len(months[month])
+                lines.append(f"{month}  {len(months[month]):>4} pares  {month_total:>8.4f}$  {month_avg:.4f}$/par")
         lines.append("```")
 
         await message.reply_text("\n".join(lines), parse_mode="Markdown")

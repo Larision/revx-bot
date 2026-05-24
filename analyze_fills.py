@@ -13,6 +13,7 @@ import csv
 import json
 import sys
 from collections import Counter
+from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from statistics import median
@@ -314,13 +315,27 @@ def print_summary(pairs: List[Dict], open_buys: List[Dict], step: Decimal) -> No
         day = p["sell_ts"][:10]
         days.setdefault(day, []).append(Decimal(p["profit_usdc"]))
 
-    print(f"\n  {'Día':<12} {'Pares':>6} {'Beneficio':>12} {'Media':>10}")
+    current_month = datetime.now().strftime("%Y-%m")
+    months: Dict[str, List[Decimal]] = {}
+    month_day_profits: Dict[str, Dict[str, List[Decimal]]] = {}
+    for day, profits in days.items():
+        month = day[:7]
+        months.setdefault(month, []).extend(profits)
+        month_day_profits.setdefault(month, {})[day] = profits
+
+    print(f"\n  {'Mes/Día':<12} {'Pares':>6} {'Beneficio':>12} {'Media':>10}")
     print(f"  {'-' * 42}")
-    for day in sorted(days):
-        profits = days[day]
-        day_total = sum(profits)
-        day_avg = day_total / len(profits)
-        print(f"  {day:<12} {len(profits):>6} {day_total:>11.4f}$ {day_avg:>9.4f}$")
+    for month in sorted(months):
+        if month == current_month:
+            for day in sorted(month_day_profits[month]):
+                profits = month_day_profits[month][day]
+                day_total = sum(profits)
+                day_avg = day_total / len(profits)
+                print(f"  {day:<12} {len(profits):>6} {day_total:>11.4f}$ {day_avg:>9.4f}$")
+        else:
+            month_total = sum(months[month])
+            month_avg = month_total / len(months[month])
+            print(f"  {month:<12} {len(months[month]):>6} {month_total:>11.4f}$ {month_avg:>9.4f}$")
 
     print(f"{'=' * 52}\n")
 
