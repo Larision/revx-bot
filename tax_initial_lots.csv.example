@@ -1,0 +1,4 @@
+buy_ts,buy_price,quantity,note
+# Ejemplo de lotes de compras anteriores
+2025-01-10 12:00:00,43000,0.001,compra previa revolut
+2025-03-02 09:30:00,61000,0.0008,compra previa

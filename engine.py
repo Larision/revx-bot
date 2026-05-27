@@ -10,6 +10,7 @@ from config import MIN_USDC_RESERVE, STATE_PATH, SYMBOL, TICK_SIZE, VERSION
 from types_ import LogEntry, OrderInfo
 from logger import log_event, log_fill
 from trailing import normalize_trailing_down_mode, normalize_trailing_up_mode
+from tax_fifo import record_tax_fill
 
 
 def _notify(msg: str) -> None:
@@ -116,16 +117,31 @@ class GridEngine:
 
     def _record_real_fill(self, price_key: str, info: "OrderInfo") -> None:
         """
-        Registra solo fills reales del exchange en memoria y en fills.csv.
+        Registra solo fills reales del exchange en memoria, fills.csv y FIFO fiscal.
         Las activaciones virtuales sirven para rebalancear, pero no cuentan como fill.
         """
+        order_size = self._order_size(info)
+        order_id = str(info["order_id"])
+        side = str(info["side"])
+
+        log_event(f"[ENGINE] Orden ejecutada: {order_id}")
         self.fill_history.append({
-            "side": info["side"],
+            "side": side,
             "price": price_key,
-            "order_id": info["order_id"],
+            "order_id": order_id,
             "ts": time.time(),
         })
-        log_fill(info["side"], price_key, fmt_amount(self._order_size(info)))
+        log_fill(side, price_key, fmt_amount(order_size))
+
+        try:
+            record_tax_fill(
+                side=side,
+                price=Decimal(price_key),
+                quantity=order_size,
+                order_id=order_id,
+            )
+        except Exception as exc:
+            log_event(f"[TAX] Error registrando FIFO fiscal: {exc}", "warning")
 
     def _normalise_trailing_down_mode(self, down: object) -> str:
         """Normaliza el modo de trailing down a 'off', 'on' o 'extended'."""
@@ -2344,7 +2360,7 @@ class GridEngine:
 
                 if filled:
                     fill_snapshots: Dict[str, OrderInfo] = {}
-                    fill_log_entries: List[Tuple[str, str]] = []
+                    real_fill_keys: List[str] = []
 
                     with self._state_lock:
                         for key in filled:
@@ -2354,21 +2370,13 @@ class GridEngine:
 
                             fill_snapshots[key] = self._clone_order_info(info)
                             if not self._is_virtual_order(info):
-                                self.fill_history.append({
-                                    "side": info["side"],
-                                    "price": key,
-                                    "order_id": info["order_id"],
-                                    "ts": time.time(),
-                                })
-                                fill_log_entries.append((str(info["side"]), key))
+                                real_fill_keys.append(key)
                             else:
                                 log_event(f"[ENGINE] Orden virtual activada: {key}", "info")
                             del self.active_orders[key]
 
-                    for side, key in fill_log_entries:
-                        order_size = fill_snapshots[key].get('size', self.base_size)
-                        log_event(f"[ENGINE] Orden ejecutada: {fill_snapshots[key]['order_id']}")
-                        log_fill(side, key, fmt_amount(Decimal(str(order_size))))
+                    for key in real_fill_keys:
+                        self._record_real_fill(key, fill_snapshots[key])
 
                     sells = sorted(
                         [(key, snapshot) for key, snapshot in fill_snapshots.items() if snapshot["side"] == "sell"],

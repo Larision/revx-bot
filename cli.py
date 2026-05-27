@@ -343,6 +343,183 @@ def exportar_datos_candles():
     print(f"Candles exportados: {len(data)}")
 
 
+
+# =========================================================
+# ===================== TAX FIFO MENU =====================
+# =========================================================
+
+def _normalize_tax_timestamp(raw: str) -> str:
+    """Normaliza fechas para lotes manuales del ledger FIFO."""
+    text = raw.strip()
+    if not text:
+        raise ValueError("fecha vacía")
+
+    if len(text) == 8 and text.isdigit():
+        return datetime.strptime(text, "%Y%m%d").strftime("%Y-%m-%d 00:00:00")
+
+    if len(text) == 10 and text[4] == "-" and text[7] == "-":
+        return f"{text} 00:00:00"
+
+    parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    return parsed.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _ask_tax_limit(default: int = 20) -> int:
+    """Pide un límite de filas para listados fiscales."""
+    raw = input(f"  Límite de filas [{default}]: ").strip()
+    if not raw:
+        return default
+    try:
+        return max(1, min(500, int(raw)))
+    except Exception:
+        print("  Valor inválido. Usando límite predeterminado.")
+        return default
+
+
+def _show_tax_files() -> None:
+    """Muestra los archivos fiscales conocidos y su estado."""
+    from tax_fifo import TAX_LOTS_PATH, TAX_SALES_PATH, TAX_UNMATCHED_SALES_PATH
+
+    print("\n=== ARCHIVOS FISCALES FIFO ===")
+    for path in (TAX_LOTS_PATH, TAX_SALES_PATH, TAX_UNMATCHED_SALES_PATH):
+        if path.exists():
+            print(f"  ✓ {path}  ({path.stat().st_size} bytes)")
+        else:
+            print(f"  - {path}  (no existe todavía)")
+
+
+def _simulate_tax_fifo_sale(engine: Optional["GridEngine"] = None) -> None:
+    """Simula una venta FIFO sin modificar el ledger fiscal."""
+    from tax_fifo import simulate_fifo_sell
+
+    try:
+        price = Decimal(input("  Precio de venta: ").strip())
+    except Exception:
+        print("  Precio inválido.")
+        return
+
+    default_qty: Optional[Decimal] = None
+    if engine is not None:
+        try:
+            default_qty = Decimal(str(engine.get_runtime_snapshot()["base_size"]))
+        except Exception:
+            default_qty = None
+
+    if default_qty is not None:
+        qty_raw = input(f"  Cantidad BTC [{fmt_amount(default_qty)}]: ").strip()
+        try:
+            quantity = Decimal(qty_raw) if qty_raw else default_qty
+        except Exception:
+            print("  Cantidad inválida.")
+            return
+    else:
+        try:
+            quantity = Decimal(input("  Cantidad BTC: ").strip())
+        except Exception:
+            print("  Cantidad inválida.")
+            return
+
+    try:
+        text = simulate_fifo_sell(price=price, quantity=quantity)
+    except Exception as exc:
+        print(f"  [!] Error simulando FIFO: {exc}")
+        return
+
+    print("\n=== SIMULACIÓN FIFO ===")
+    print(text)
+
+
+def _import_tax_manual_lot() -> None:
+    """Importa un lote FIFO inicial/manual desde CLI."""
+    from tax_fifo import import_manual_lot
+
+    print("\n=== IMPORTAR LOTE FIFO MANUAL ===")
+    print("Fecha admitida: YYYYMMDD, YYYY-MM-DD o YYYY-MM-DDTHH:MM:SS")
+
+    try:
+        buy_ts = _normalize_tax_timestamp(input("  Fecha compra: "))
+        buy_price = Decimal(input("  Precio compra: ").strip())
+        quantity = Decimal(input("  Cantidad BTC: ").strip())
+        note = input("  Nota [cli]: ").strip() or "cli"
+        if buy_price <= 0 or quantity <= 0:
+            raise ValueError("precio y cantidad deben ser mayores que cero")
+    except Exception as exc:
+        print(f"  [!] Datos inválidos: {exc}")
+        return
+
+    try:
+        lot = import_manual_lot(
+            buy_ts=buy_ts,
+            buy_price=buy_price,
+            quantity=quantity,
+            note=note,
+        )
+    except Exception as exc:
+        print(f"  [!] No se pudo importar el lote: {exc}")
+        return
+
+    print("\n  ✓ Lote importado")
+    print(f"    Fecha : {lot.buy_ts}")
+    print(f"    Qty   : {lot.qty_total} BTC")
+    print(f"    Precio: {lot.buy_price} USDC")
+    print(f"    ID    : {lot.source_order_id}")
+
+
+def menu_tax_fifo(engine: Optional["GridEngine"] = None) -> None:
+    """Submenú de consulta y mantenimiento del ledger fiscal FIFO."""
+    while True:
+        print("\n=== FISCAL FIFO ===")
+        print("1. Ver resumen FIFO")
+        print("2. Ver lotes abiertos")
+        print("3. Ver incidencias de ventas no cubiertas")
+        print("4. Simular venta FIFO")
+        print("5. Importar lote inicial/manual")
+        print("6. Ver archivos fiscales")
+        print("v. Volver")
+
+        opcion = input("Opción: ").strip().lower()
+
+        if opcion == "1":
+            try:
+                from tax_fifo import build_tax_status
+                print("\n=== RESUMEN FIFO ===")
+                print(build_tax_status())
+            except Exception as exc:
+                print(f"  [!] Error leyendo resumen FIFO: {exc}")
+
+        elif opcion == "2":
+            try:
+                from tax_fifo import build_tax_lots_text
+                limit = _ask_tax_limit()
+                print("\n=== LOTES FIFO ABIERTOS ===")
+                print(build_tax_lots_text(limit=limit))
+            except Exception as exc:
+                print(f"  [!] Error leyendo lotes FIFO: {exc}")
+
+        elif opcion == "3":
+            try:
+                from tax_fifo import build_tax_unmatched_text
+                limit = _ask_tax_limit()
+                print("\n=== INCIDENCIAS FIFO ===")
+                print(build_tax_unmatched_text(limit=limit))
+            except Exception as exc:
+                print(f"  [!] Error leyendo incidencias FIFO: {exc}")
+
+        elif opcion == "4":
+            _simulate_tax_fifo_sale(engine)
+
+        elif opcion == "5":
+            _import_tax_manual_lot()
+
+        elif opcion == "6":
+            _show_tax_files()
+
+        elif opcion == "v":
+            break
+
+        else:
+            print("Opción inválida")
+
 # =========================================================
 # =================== GRID PREVIEW ========================
 # =========================================================
@@ -914,6 +1091,7 @@ def show_menu(engine_running: bool = False) -> str:
     print("7. Monitor del engine")
     print("8. Detener engine")
     print("9. Backtesting")
+    print("10. Fiscal FIFO")
     print("c. Configuración manual")
     print("0. Salir")
     print("=" * 40)
@@ -1180,6 +1358,12 @@ def run_cli() -> None:
             from backtesting import prompt_backtest
 
             prompt_backtest()
+
+        # --------------------------------------------------
+        # 10. Fiscal FIFO
+        # --------------------------------------------------
+        elif opcion == "10":
+            menu_tax_fifo(engine if engine_running else None)
 
         # --------------------------------------------------
         # c.Configuración manual

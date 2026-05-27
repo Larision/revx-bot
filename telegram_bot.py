@@ -6,6 +6,11 @@ Comandos disponibles:
   /grid      — niveles del grid con órdenes
   /balance   — balances disponibles y fondos comprometidos en el grid
   /trailings — muestra o configura trailing up/down
+  /taxstatus — resumen FIFO fiscal
+  /taxlots   — lotes FIFO abiertos
+  /taxsim    — simulación FIFO de una venta
+  /taxaddlot — importa lote fiscal inicial/manual
+  /taxreport — exporta CSV/JSON fiscales
   /start_engine  — arranca el engine (recupera estado si existe)
   /stop      — detiene el engine (requiere confirmación)
   /add_order — añade una orden manual (guiado por pasos)
@@ -56,6 +61,16 @@ from trailing import (
     parse_trailing_down_mode,
     parse_trailing_up_mode,
     trailing_mode_label,
+)
+from tax_fifo import (
+    TAX_LOTS_PATH,
+    TAX_SALES_PATH,
+    TAX_UNMATCHED_SALES_PATH,
+    build_tax_lots_text,
+    build_tax_status,
+    build_tax_unmatched_text,
+    import_manual_lot,
+    simulate_fifo_sell,
 )
 
 if TYPE_CHECKING:
@@ -801,6 +816,211 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await message.reply_text(f"❌ Error en analyze: {exc}")
 
 
+def _default_taxsim_quantity() -> Optional[Decimal]:
+    """Cantidad por defecto para /taxsim: base_size del engine si esta activo."""
+    eng = _get_engine() if _engine_running() else None
+    if eng is None:
+        return None
+    try:
+        return Decimal(str(eng.get_runtime_snapshot()["base_size"]))
+    except Exception:
+        return None
+
+
+def _normalize_tax_timestamp(raw: str) -> str:
+    """Normaliza fechas de /taxaddlot a texto estable para el ledger FIFO."""
+    text = raw.strip()
+    if not text:
+        raise ValueError("Fecha vacia.")
+
+    if len(text) == 8 and text.isdigit():
+        return datetime.strptime(text, "%Y%m%d").strftime("%Y-%m-%d 00:00:00")
+
+    if len(text) == 10 and text[4] == "-" and text[7] == "-":
+        return f"{text} 00:00:00"
+
+    # Valida ISO o formato con espacio, pero conserva segundos legibles.
+    parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    return parsed.strftime("%Y-%m-%d %H:%M:%S")
+
+
+async def cmd_taxstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    del context
+    if not _authorized(update):
+        return
+
+    message = _get_message(update)
+    if message is None:
+        return
+
+    try:
+        text = build_tax_status()
+    except Exception as exc:
+        await message.reply_text(f"❌ Error fiscal FIFO: {exc}")
+        return
+
+    await message.reply_text(f"📒 *FIFO FISCAL*\n```\n{text}\n```", parse_mode="Markdown")
+
+
+async def cmd_taxlots(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        return
+
+    message = _get_message(update)
+    if message is None:
+        return
+
+    args = context.args or []
+    limit = 20
+    if args:
+        try:
+            limit = max(1, min(100, int(args[0])))
+        except Exception:
+            await message.reply_text("Uso: `/taxlots [limite]`", parse_mode="Markdown")
+            return
+
+    try:
+        text = build_tax_lots_text(limit=limit)
+    except Exception as exc:
+        await message.reply_text(f"❌ Error leyendo lotes FIFO: {exc}")
+        return
+
+    await message.reply_text(f"📦 *LOTES FIFO*\n```\n{text}\n```", parse_mode="Markdown")
+
+
+async def cmd_taxunmatched(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        return
+
+    message = _get_message(update)
+    if message is None:
+        return
+
+    args = context.args or []
+    limit = 20
+    if args:
+        try:
+            limit = max(1, min(100, int(args[0])))
+        except Exception:
+            await message.reply_text("Uso: `/taxunmatched [limite]`", parse_mode="Markdown")
+            return
+
+    try:
+        text = build_tax_unmatched_text(limit=limit)
+    except Exception as exc:
+        await message.reply_text(f"❌ Error leyendo incidencias FIFO: {exc}")
+        return
+
+    await message.reply_text(f"⚠️ *INCIDENCIAS FIFO*\n```\n{text}\n```", parse_mode="Markdown")
+
+
+async def cmd_taxsim(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        return
+
+    message = _get_message(update)
+    if message is None:
+        return
+
+    args = context.args or []
+    if not args:
+        await message.reply_text(
+            "Uso: `/taxsim precio [cantidad_btc]`\n"
+            "Ejemplo: `/taxsim 75000 0.0005`\n"
+            "Si omites cantidad y el engine esta activo, se usa el base_size.",
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        price = Decimal(args[0])
+        if len(args) >= 2:
+            quantity = Decimal(args[1])
+        else:
+            quantity = _default_taxsim_quantity()
+            if quantity is None:
+                await message.reply_text(
+                    "Indica cantidad BTC o arranca el engine para usar base_size.\n"
+                    "Uso: `/taxsim precio cantidad_btc`",
+                    parse_mode="Markdown",
+                )
+                return
+        text = simulate_fifo_sell(price=price, quantity=quantity)
+    except Exception as exc:
+        await message.reply_text(f"❌ Error simulando FIFO: {exc}")
+        return
+
+    await message.reply_text(f"🧮 *SIMULACIÓN FIFO*\n```\n{text}\n```", parse_mode="Markdown")
+
+
+async def cmd_taxaddlot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        return
+
+    message = _get_message(update)
+    if message is None:
+        return
+
+    args = context.args or []
+    if len(args) < 3:
+        await message.reply_text(
+            "Uso: `/taxaddlot fecha precio cantidad_btc [nota]`\n"
+            "Fecha: `YYYYMMDD`, `YYYY-MM-DD` o `YYYY-MM-DDTHH:MM:SS`\n"
+            "Ejemplo: `/taxaddlot 20250110 43000 0.001 compra_previa`",
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        buy_ts = _normalize_tax_timestamp(args[0])
+        buy_price = Decimal(args[1])
+        quantity = Decimal(args[2])
+        note = " ".join(args[3:]).strip() or "telegram"
+        if buy_price <= 0 or quantity <= 0:
+            raise ValueError("precio y cantidad deben ser mayores que cero")
+        lot = import_manual_lot(
+            buy_ts=buy_ts,
+            buy_price=buy_price,
+            quantity=quantity,
+            note=note,
+        )
+    except Exception as exc:
+        await message.reply_text(f"❌ No se pudo importar el lote: {exc}")
+        return
+
+    await message.reply_text(
+        "✅ Lote FIFO importado\n"
+        f"`{lot.buy_ts}`\n"
+        f"`{lot.qty_total} BTC @ {lot.buy_price} USDC`\n"
+        f"ID: `{lot.source_order_id}`",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_taxreport(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    del context
+    if not _authorized(update):
+        return
+
+    message = _get_message(update)
+    if message is None:
+        return
+
+    paths = [TAX_LOTS_PATH, TAX_SALES_PATH, TAX_UNMATCHED_SALES_PATH]
+    existing = [path for path in paths if path.exists()]
+    if not existing:
+        await message.reply_text("No hay archivos fiscales todavía.")
+        return
+
+    for path in existing:
+        try:
+            with path.open("rb") as fh:
+                await message.reply_document(document=fh, filename=path.name)
+        except Exception as exc:
+            await message.reply_text(f"❌ No se pudo enviar {path.name}: {exc}")
+
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Gestiona los flujos de conversación multi-paso (add_order, cancel)."""
     del context
@@ -937,6 +1157,12 @@ def start_telegram_bot() -> None:
         app.add_handler(CommandHandler("confirm", cmd_confirm))
         app.add_handler(CommandHandler("abort", cmd_abort))
         app.add_handler(CommandHandler("analyze", cmd_analyze))
+        app.add_handler(CommandHandler("taxstatus", cmd_taxstatus))
+        app.add_handler(CommandHandler("taxlots", cmd_taxlots))
+        app.add_handler(CommandHandler("taxunmatched", cmd_taxunmatched))
+        app.add_handler(CommandHandler("taxsim", cmd_taxsim))
+        app.add_handler(CommandHandler("taxaddlot", cmd_taxaddlot))
+        app.add_handler(CommandHandler("taxreport", cmd_taxreport))
         app.add_error_handler(telegram_error_handler)
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
