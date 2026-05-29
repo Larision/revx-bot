@@ -17,6 +17,9 @@ from logger import log_event
 from types_ import LogEntry, OrderInfo
 
 
+BACKTEST_OUTPUT_DIR = Path("backtesting")
+
+
 def input_with_esc(prompt: str) -> str:
     """
     Función de input personalizada que permite cancelar con ESC.
@@ -491,7 +494,7 @@ def _write_backtest_summary(
     end_date: str,
     results: list[tuple[Decimal, Decimal, str, str, BacktestResult]],
 ) -> None:
-    summary_file = Path("resumen_resultados.txt")
+    summary_file = BACKTEST_OUTPUT_DIR / "resumen_resultados.txt"
     lines: list[str] = []
     lines.append("=== BACKTEST RESUMEN ===")
     lines.append(f"Fecha UTC      : {datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()}")
@@ -635,7 +638,8 @@ def run_grid_backtest(
             fills.append(fill)
 
     suffix = f"-{output_label}" if output_label else ""
-    output_path = Path(f"backtest-{symbol}-{start_date}_to_{end_date}{suffix}.csv")
+    output_path = BACKTEST_OUTPUT_DIR / f"backtest-{symbol}-{start_date}_to_{end_date}{suffix}.csv"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(
             fh,
