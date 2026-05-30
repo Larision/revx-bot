@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
-from typing import TYPE_CHECKING, Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional, Tuple, cast
 
 if TYPE_CHECKING:
     from engine import GridEngine
@@ -37,7 +37,7 @@ from api import (
     fmt_amount,
     get_all_balances,
     get_current_price,
-    get_ticker_price,
+    get_ticker,
     place_order,
 )
 
@@ -535,7 +535,7 @@ def choose_initial_grid_price() -> Optional[Decimal]:
     print("\n  Consultando bid/ask/mid...")
 
     try:
-        ticker_resp, _ = get_ticker_price()
+        ticker_resp, _ = get_ticker()
     except Exception as exc:
         log_event(f"[ERROR] No se pudo consultar get_ticker_price(): {exc}", "error")
         ticker_resp = None
@@ -583,6 +583,325 @@ def choose_initial_grid_price() -> Optional[Decimal]:
             print("  Precio inválido. Introduce un número o pulsa Enter para usar el predeterminado.")
 
 
+def _fmt_usdc_value(value: Decimal) -> str:
+    """Formatea importes USDC usando la misma precisión visual que los precios."""
+    return _price_key(Decimal(str(value)))
+
+
+def _read_available_balances() -> Tuple[Decimal, Decimal, bool]:
+    """Lee balances disponibles de USDC y BTC; indica si la consulta fue válida."""
+    try:
+        balances_resp, _ = get_all_balances()
+    except Exception as exc:
+        log_event(f"[BALANCE] No se pudieron consultar balances: {exc}", "warning")
+        return Decimal("0"), Decimal("0"), False
+
+    if isinstance(balances_resp, dict) and balances_resp.get("error"):
+        log_event(f"[BALANCE] Respuesta de error consultando balances: {balances_resp}", "warning")
+        return Decimal("0"), Decimal("0"), False
+
+    usdc_balance, btc_balance = _parse_balances(balances_resp)
+    return usdc_balance, btc_balance, True
+
+
+def _esc_pressed() -> bool:
+    """
+    Detecta ESC sin bloquear.
+
+    - En Windows usa msvcrt.
+    - En Debian/Linux/macOS usa termios + tty + select.
+    - Evita avisos de Pylance en Windows.
+    """
+    import importlib
+    import platform
+    import select
+    import sys
+
+    if platform.system().lower() == "windows":
+        try:
+            msvcrt = cast(Any, importlib.import_module("msvcrt"))
+        except ImportError:
+            return False
+
+        while msvcrt.kbhit():
+            ch = msvcrt.getch()
+            if ch == b"\x1b":
+                return True
+
+        return False
+
+    if not sys.stdin.isatty():
+        return False
+
+    try:
+        termios = cast(Any, importlib.import_module("termios"))
+        tty = cast(Any, importlib.import_module("tty"))
+    except ImportError:
+        return False
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+
+    try:
+        tty.setcbreak(fd)
+        readable, _, _ = select.select([sys.stdin], [], [], 0)
+
+        if not readable:
+            return False
+
+        return sys.stdin.read(1) == "\x1b"
+
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def _decimal_from_order_data(
+    data: dict[str, Any],
+    field_names: tuple[str, ...],
+    default: Decimal = Decimal("0"),
+) -> Decimal:
+    """Extrae un Decimal de una respuesta de orden usando varios nombres posibles."""
+    for name in field_names:
+        raw = data.get(name)
+        if raw is None or raw == "":
+            continue
+        try:
+            value = Decimal(str(raw))
+            return value
+        except Exception:
+            continue
+    return default
+
+
+def _record_initial_btc_buy_fifo(
+    *,
+    order_id: str,
+    order_data: dict[str, Any],
+    fallback_qty: Decimal,
+    fallback_price: Decimal,
+) -> bool:
+    """Registra en tax_fifo el BTC comprado por la orden inicial."""
+    from tax_fifo import record_tax_fill
+
+    filled_qty = _decimal_from_order_data(
+        order_data,
+        ("filled_quantity", "filled_size", "executed_quantity", "filled_qty"),
+        Decimal("0"),
+    )
+
+    status = str(order_data.get("status") or order_data.get("state") or "").lower()
+
+    # Si la orden está filled pero el exchange no devuelve filled_quantity,
+    # usamos la cantidad pedida como fallback.
+    if filled_qty <= 0 and status == "filled":
+        filled_qty = fallback_qty
+
+    if filled_qty <= 0:
+        return False
+
+    fill_price = _decimal_from_order_data(
+        order_data,
+        ("average_fill_price", "avg_price", "avg_fill_price", "price"),
+        fallback_price,
+    )
+
+    if fill_price <= 0:
+        fill_price = fallback_price
+
+    record_tax_fill(
+        side="buy",
+        price=fill_price,
+        quantity=filled_qty,
+        order_id=order_id,
+    )
+
+    print(
+        f"  ✓ Lote FIFO registrado: {fmt_amount(filled_qty)} BTC "
+        f"@ {_price_key(fill_price)} USDC"
+    )
+    log_event(
+        f"[BTC_INIT] Lote FIFO registrado: BUY {fmt_amount(filled_qty)} BTC "
+        f"@ {_price_key(fill_price)} USDC ({order_id})",
+        "info",
+    )
+    return True
+
+
+def _place_initial_btc_buy_order(quantity: Decimal, limit_price: Decimal) -> bool:
+    """
+    Crea una orden limit BUY para comprar el BTC inicial faltante.
+
+    Devuelve True solo si:
+      - la orden se crea,
+      - se ejecuta completamente,
+      - y queda registrada en tax_fifo.
+
+    Si se pulsa ESC:
+      - cancela la orden,
+      - registra en tax_fifo cualquier fill parcial si lo hubo,
+      - y devuelve False.
+    """
+    import uuid
+    import time
+
+    from api import cancel_order, get_order_by_id
+    from http_client import send_request
+
+    qty = Decimal(str(quantity))
+    price = Decimal(str(limit_price)).quantize(TICK_SIZE, rounding=ROUND_DOWN)
+
+    if qty <= 0:
+        return False
+
+    print(
+        f"\n  Creando orden LIMIT BUY de {fmt_amount(qty)} BTC "
+        f"a {_price_key(price)} USDC..."
+    )
+
+    body = {
+        "client_order_id": str(uuid.uuid4()),
+        "symbol": SYMBOL,
+        "side": "buy",
+        "order_configuration": {
+            "limit": {
+                "base_size": fmt_amount(qty),
+                "price": _price_key(price),
+                "execution_instructions": ["post_only"],
+            }
+        },
+    }
+
+    resp, logs = send_request("POST", "/api/1.0/orders", body=body)
+    for entry in logs:
+        log_event(f"[BTC_INIT] {entry['msg']}", entry.get("level", "info"))
+
+    if not isinstance(resp, dict) or resp.get("error"):
+        print(f"  [!] No se pudo crear la orden de compra de BTC. Respuesta: {resp}")
+        return False
+
+    data = resp.get("data")
+    if not isinstance(data, dict):
+        print(f"  [!] Respuesta inesperada al crear compra BTC: {resp}")
+        return False
+
+    state = str(data.get("state") or data.get("status") or "").lower()
+    order_id = data.get("venue_order_id")
+
+    if state == "rejected":
+        print("  [!] La orden de compra BTC fue rechazada por post_only o por el exchange.")
+        print("      Prueba con otro precio límite o compra manualmente antes de arrancar el grid.")
+        return False
+
+    if not isinstance(order_id, str) or not order_id:
+        print(f"  [!] No se obtuvo venue_order_id en la compra BTC. Respuesta: {resp}")
+        return False
+
+    print(f"  ✓ Orden de compra BTC creada: {order_id}")
+    print("  Esperando a la ejecución de la compra... Pulsa ESC para cancelar la compra.")
+
+    final_states = {"filled", "cancelled", "canceled", "rejected", "expired", "failed"}
+    last_status_log = 0.0
+    poll_interval = 2.0
+
+    while True:
+        if _esc_pressed():
+            print("\n  [!] ESC detectado. Cancelando compra BTC...")
+
+            cancel_resp, cancel_logs = cancel_order(order_id)
+            for entry in cancel_logs:
+                log_event(f"[BTC_INIT] {entry['msg']}", entry.get("level", "info"))
+
+            if isinstance(cancel_resp, dict) and cancel_resp.get("error"):
+                print(f"  [!] No se pudo cancelar la orden. Respuesta: {cancel_resp}")
+            else:
+                print("  ✓ Orden de compra BTC cancelada o solicitud de cancelación enviada.")
+
+            # Tras cancelar, consultamos la orden por si hubo fill parcial antes de la cancelación.
+            order_resp, order_logs = get_order_by_id(order_id)
+            for entry in order_logs:
+                log_event(f"[BTC_INIT] {entry['msg']}", entry.get("level", "info"))
+
+            order_data = order_resp.get("data") if isinstance(order_resp, dict) else None
+            if isinstance(order_data, dict):
+                try:
+                    if _record_initial_btc_buy_fifo(
+                        order_id=order_id,
+                        order_data=order_data,
+                        fallback_qty=qty,
+                        fallback_price=price,
+                    ):
+                        print("  [!] Hubo fill parcial antes de cancelar. El grid no se inicia automáticamente.")
+                except Exception as exc:
+                    print(f"  [!] Error registrando fill parcial en FIFO: {exc}")
+                    log_event(f"[BTC_INIT] Error registrando fill parcial en FIFO: {exc}", "warning")
+
+            return False
+
+        order_resp, order_logs = get_order_by_id(order_id)
+        for entry in order_logs:
+            log_event(f"[BTC_INIT] {entry['msg']}", entry.get("level", "info"))
+
+        if not isinstance(order_resp, dict) or order_resp.get("error"):
+            now = time.time()
+            if now - last_status_log >= 15:
+                print("  ... esperando confirmación de la orden BTC")
+                last_status_log = now
+            time.sleep(poll_interval)
+            continue
+
+        order_data = order_resp.get("data")
+        if not isinstance(order_data, dict):
+            print(f"  [!] Respuesta inesperada consultando compra BTC: {order_resp}")
+            time.sleep(poll_interval)
+            continue
+
+        status = str(order_data.get("status") or order_data.get("state") or "").lower()
+
+        if status == "filled":
+            try:
+                fifo_ok = _record_initial_btc_buy_fifo(
+                    order_id=order_id,
+                    order_data=order_data,
+                    fallback_qty=qty,
+                    fallback_price=price,
+                )
+            except Exception as exc:
+                print(f"  [!] La compra se ejecutó, pero no se pudo registrar en FIFO: {exc}")
+                log_event(f"[BTC_INIT] Error registrando FIFO: {exc}", "warning")
+                return False
+
+            if not fifo_ok:
+                print("  [!] La compra figura como ejecutada, pero no se pudo leer cantidad ejecutada.")
+                print("      Revisa la orden manualmente antes de arrancar el grid.")
+                return False
+
+            print("  ✓ Compra BTC ejecutada y registrada en FIFO.")
+            print("  ✓ Ya puedes continuar con el arranque del grid.")
+            return True
+
+        if status in final_states:
+            print(f"  [!] La orden BTC terminó con estado '{status}'. El grid no se inicia.")
+            return False
+
+        now = time.time()
+        if now - last_status_log >= 15:
+            filled_qty = _decimal_from_order_data(
+                order_data,
+                ("filled_quantity", "filled_size", "executed_quantity", "filled_qty"),
+                Decimal("0"),
+            )
+            if filled_qty > 0:
+                print(
+                    f"  ... esperando ejecución completa "
+                    f"({fmt_amount(filled_qty)} / {fmt_amount(qty)} BTC ejecutados). ESC para cancelar."
+                )
+            else:
+                print("  ... esperando a la ejecución de la compra. ESC para cancelar.")
+            last_status_log = now
+
+        time.sleep(poll_interval)
+
+
 def show_grid_preview(
     levels_below: int,
     levels_above: int,
@@ -590,19 +909,14 @@ def show_grid_preview(
     step_percent: Decimal,
     trailing_up: str,
     trailing_down: str,
+    bot_usdc_budget: Decimal,
 ) -> Tuple[bool, Optional[Decimal]]:
     """
-    Muestra un resumen de la configuración del grid, los fondos requeridos y los saldos actuales.
-    Solicita al usuario confirmar el inicio del motor.
+    Muestra un resumen de configuración, fondos requeridos y presupuesto asignado.
 
-    Args:
-        levels_below: Número de niveles de compra por debajo del precio inicial.
-        levels_above: Número de niveles de venta por encima del precio inicial.
-        base_size: Tamaño de orden por nivel.
-        step_percent: Porcentaje de paso entre niveles (como Decimal, ej. 0.01 para 1%).
-
-    Retorna:
-        Tupla (confirmado: bool, initial_price: Optional[Decimal]).
+    El presupuesto `bot_usdc_budget` es el capital máximo asignado al bot en
+    equivalente USDC. Si es <= 0, se conserva el comportamiento anterior y se
+    considera disponible todo el balance actual estimado.
     """
     def _lp(msg: str = "", level: str = "info") -> None:
         """Imprime y registra un mensaje."""
@@ -633,7 +947,6 @@ def show_grid_preview(
     _lp(f"\n  Precio inicial   : {_price_key(initial_price)} USDC")
     _lp(f"  Step calculado   : {_price_key(step_val)} USDC entre niveles  ({fmt_amount(step_percent * 100)}%)")
 
-    # Build all grid levels
     levels = []
     for i in range(-levels_below, levels_above + 1):
         lvl = (initial_price + (Decimal(i) * step_val)).quantize(TICK_SIZE, rounding=ROUND_DOWN)
@@ -645,6 +958,8 @@ def show_grid_preview(
 
     required_usdc = sum((base_size * p for p in buy_prices), Decimal("0"))
     required_btc = base_size * Decimal(len(sell_prices))
+    required_btc_value = required_btc * initial_price
+    total_required_value = required_usdc + required_btc_value
 
     _lp(f"\n  {'Nivel':<8}  {'Precio':>12}  {'Lado'}")
     _lp(f"  {'-' * 8}  {'-' * 12}  {'-' * 14}")
@@ -659,28 +974,85 @@ def show_grid_preview(
         marker = " ◄ PRECIO INICIAL" if lvl == initial_price else ""
         _lp(f"  {'':8}  {key:>12}  {lado}{marker}")
 
-    _lp(f"\n  Fondos necesarios:")
-    _lp(f"    USDC requerido : {_price_key(required_usdc)} USDC  ({len(buy_prices)} órdenes BUY)")
-    _lp(f"    BTC requerido  : {fmt_amount(required_btc)} BTC   ({len(sell_prices)} órdenes SELL)")
+    _lp("\n  Fondos necesarios para arrancar:")
+    _lp(f"    USDC para BUYs       : {_fmt_usdc_value(required_usdc)} USDC  ({len(buy_prices)} órdenes BUY)")
+    _lp(f"    BTC para SELLs       : {fmt_amount(required_btc)} BTC   ({len(sell_prices)} órdenes SELL)")
+    _lp(f"    Valor BTC estimado   : {_fmt_usdc_value(required_btc_value)} USDC @ {_price_key(initial_price)}")
+    _lp(f"    Capital total estim. : {_fmt_usdc_value(total_required_value)} USDC")
 
     _lp("\n  Consultando balances...")
-    balances_resp, _ = get_all_balances()
-    usdc_balance, btc_balance = _parse_balances(balances_resp)
+    usdc_balance, btc_balance, balances_ok = _read_available_balances()
+    if not balances_ok:
+        _lp("    [!] No se pudieron leer balances fiables.", "warning")
 
-    usdc_ok = usdc_balance >= required_usdc
+    current_total_value = usdc_balance + (btc_balance * initial_price)
+    assigned_budget = Decimal(str(bot_usdc_budget))
+    if assigned_budget <= 0:
+        effective_budget = current_total_value
+        budget_text = f"{_fmt_usdc_value(effective_budget)} USDC (sin límite configurado; usando balance actual estimado)"
+    else:
+        effective_budget = assigned_budget
+        budget_text = f"{_fmt_usdc_value(effective_budget)} USDC"
+
+    missing_btc = required_btc - btc_balance
+    if missing_btc < 0:
+        missing_btc = Decimal("0")
+    missing_btc_cost = missing_btc * initial_price
+    usdc_needed_now = required_usdc + missing_btc_cost
+
+    budget_ok = effective_budget >= total_required_value
+    cash_ok = usdc_balance >= usdc_needed_now
     btc_ok = btc_balance >= required_btc
 
-    _lp(f"    USDC disponible: {_price_key(usdc_balance)} USDC  {'✓' if usdc_ok else '✗ INSUFICIENTE'}")
-    _lp(f"    BTC disponible : {fmt_amount(btc_balance)} BTC   {'✓' if btc_ok else '✗ INSUFICIENTE'}")
+    _lp(f"    Saldo asignado bot   : {budget_text}")
+    _lp(f"    USDC disponible      : {_fmt_usdc_value(usdc_balance)} USDC")
+    _lp(f"    BTC disponible       : {fmt_amount(btc_balance)} BTC")
+    _lp(f"    Valor cuenta estim.  : {_fmt_usdc_value(current_total_value)} USDC")
+
+    if missing_btc > 0:
+        _lp("\n  BTC inicial faltante:")
+        _lp(f"    BTC a comprar        : {fmt_amount(missing_btc)} BTC")
+        _lp(f"    Coste estimado       : {_fmt_usdc_value(missing_btc_cost)} USDC")
+        _lp(f"    USDC necesario ahora : {_fmt_usdc_value(usdc_needed_now)} USDC  (BUYs + compra BTC)")
+    else:
+        _lp("\n  BTC inicial faltante   : 0 BTC")
+        _lp(f"  USDC necesario ahora   : {_fmt_usdc_value(required_usdc)} USDC")
+
     _lp("\n" + "=" * 50)
 
-    if not usdc_ok or not btc_ok:
-        _lp("  [!] Fondos insuficientes para iniciar el grid.", "warning")
-        _lp("      Deposita los fondos necesarios o ajusta la configuración.", "warning")
+    if not budget_ok:
+        _lp("  [!] Presupuesto asignado insuficiente para esta configuración.", "warning")
+        _lp(f"      Asignado : {_fmt_usdc_value(effective_budget)} USDC", "warning")
+        _lp(f"      Necesario: {_fmt_usdc_value(total_required_value)} USDC", "warning")
+        _lp("      Ajusta saldo asignado, líneas, size o step.", "warning")
         _lp("=" * 50)
         return False, initial_price
 
-    _lp("  [✓] Fondos suficientes para iniciar el grid.")
+    if not cash_ok:
+        _lp("  [!] USDC disponible insuficiente para arrancar con esta configuración.", "warning")
+        _lp(f"      Disponible ahora : {_fmt_usdc_value(usdc_balance)} USDC", "warning")
+        _lp(f"      Necesario ahora  : {_fmt_usdc_value(usdc_needed_now)} USDC", "warning")
+        _lp("      Reduce configuración, libera USDC o deposita fondos.", "warning")
+        _lp("=" * 50)
+        return False, initial_price
+
+    if not btc_ok:
+        _lp("  [!] Hay presupuesto suficiente, pero falta BTC inicial para las órdenes SELL.", "warning")
+        try:
+            respuesta_btc = input(
+                f"\n  ¿Crear orden LIMIT BUY para comprar {fmt_amount(missing_btc)} BTC "
+                f"a {_price_key(initial_price)} USDC? (s/n): "
+            ).strip().lower()
+        except EOFError:
+            respuesta_btc = "n"
+
+        if respuesta_btc.startswith("s"):
+            _place_initial_btc_buy_order(missing_btc, initial_price)
+        else:
+            print("\n  Compra BTC cancelada. Grid no iniciado.")
+        return False, initial_price
+
+    _lp("  [✓] Fondos suficientes dentro del saldo asignado para iniciar el grid.")
     _lp("=" * 50)
 
     try:
@@ -689,7 +1061,6 @@ def show_grid_preview(
         respuesta = "n"
 
     return respuesta.startswith("s"), initial_price
-
 
 # =========================================================
 # ================= ENGINE MONITOR SUBMENU ================
@@ -1110,6 +1481,7 @@ def run_cli() -> None:
     from engine import GridEngine
     from private_config import (
         get_base_size_default,
+        get_bot_usdc_budget_default,
         get_grid_levels_above,
         get_grid_levels_below,
         get_step_percent_default,
@@ -1134,6 +1506,7 @@ def run_cli() -> None:
     step_percent_default: Decimal = Decimal(get_step_percent_default(str(DEFAULT_STEP_PERCENT)))
     trailing_up_default:  str     = get_trailing_up_default("off")
     trailing_down_default: str    = get_trailing_down_default("off")
+    bot_usdc_budget_default: Decimal = Decimal(get_bot_usdc_budget_default("0"))
 
     print("GRID ENGINE v1.1 — CLI INTERACTIVO")
 
@@ -1156,17 +1529,31 @@ def run_cli() -> None:
         if opcion == "1":
             print(f"\n=== Precio actual {SYMBOL} ===")
             try:
-                ticker_resp, logs = get_ticker_price()
+                ticker_resp, logs = get_ticker()
                 for l in logs:
                     log_event(f"[LOG] {l['msg']}")
 
-                bid = ticker_resp.get("bid") if isinstance(ticker_resp, dict) else None
-                ask = ticker_resp.get("ask") if isinstance(ticker_resp, dict) else None
-                mid = ticker_resp.get("mid") if isinstance(ticker_resp, dict) else None
+                bid: Optional[Decimal] = None
+                ask: Optional[Decimal] = None
+                mid: Optional[Decimal] = None
+
+                if isinstance(ticker_resp, dict):
+                    data = ticker_resp.get("data", [])
+                    if isinstance(data, list) and data:
+                        item = data[0]
+                        try:
+                            bid = Decimal(str(item.get("bid"))) if item.get("bid") is not None else None
+                            ask = Decimal(str(item.get("ask"))) if item.get("ask") is not None else None
+                            mid = Decimal(str(item.get("mid"))) if item.get("mid") is not None else None
+                        except Exception:
+                            bid = ask = mid = None
 
                 if bid is not None and ask is not None and mid is not None:
+                    indent = " " * 31
                     log_event(
-                        f"Bid: {_price_key(Decimal(str(bid)))} | Ask: {_price_key(Decimal(str(ask)))} | Mid: {_price_key(Decimal(str(mid)))}"
+                        f"Bid: {_price_key(Decimal(str(bid)))}\n"
+                        f"{indent}Ask: {_price_key(Decimal(str(ask)))}\n"
+                        f"{indent}Mid: {_price_key(Decimal(str(mid)))}"
                     )
                 else:
                     price, _ = get_current_price()
@@ -1269,6 +1656,7 @@ def run_cli() -> None:
                     step_percent_default,
                     trailing_up_default,
                     trailing_down_default,
+                    bot_usdc_budget_default,
                 )
                 if not confirmar:
                     print("\nGrid no iniciado.")
@@ -1411,6 +1799,41 @@ def run_cli() -> None:
             elif new_trailing_down:
                 log_event("[ERROR] Valor de trailing down inválido (debe ser off, on o extended), conservando el anterior.", "error")
 
+            available_usdc, _, balances_ok = _read_available_balances()
+            if balances_ok:
+                print(f"USDC disponible actual: {_fmt_usdc_value(available_usdc)}")
+            else:
+                print("USDC disponible actual: no disponible")
+
+            budget_default_text = (
+                _fmt_usdc_value(bot_usdc_budget_default)
+                if bot_usdc_budget_default > 0
+                else "0"
+            )
+            new_budget = input(
+                f"Saldo USDC total a emplear por el bot [{budget_default_text}] "
+                "(0 = sin límite explícito): "
+            ).strip().lower()
+            if new_budget:
+                try:
+                    if new_budget in {"max", "todo", "all"}:
+                        if not balances_ok:
+                            raise ValueError("no se pudo leer USDC disponible")
+                        parsed_budget = available_usdc
+                    else:
+                        parsed_budget = Decimal(new_budget)
+
+                    if parsed_budget < 0:
+                        raise ValueError("el saldo no puede ser negativo")
+                    if balances_ok and parsed_budget > available_usdc:
+                        raise ValueError(
+                            f"el saldo asignado ({_fmt_usdc_value(parsed_budget)}) "
+                            f"supera el USDC disponible ({_fmt_usdc_value(available_usdc)})"
+                        )
+                    bot_usdc_budget_default = parsed_budget
+                except Exception as exc:
+                    log_event(f"[ERROR] Valor de saldo asignado inválido: {exc}. Conservando el anterior.", "error")
+
             # Guardar la configuración
             save_grid_config(
                 grid_levels_below,
@@ -1419,6 +1842,7 @@ def run_cli() -> None:
                 str(step_percent_default),
                 trailing_up_default,
                 trailing_down_default,
+                str(bot_usdc_budget_default),
             )
             print("✓ Configuración guardada como predeterminada.")
 
