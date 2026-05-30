@@ -20,6 +20,11 @@ from types_ import LogEntry, OrderInfo
 BACKTEST_OUTPUT_DIR = Path("backtesting")
 
 
+class BacktestCancelled(Exception):
+    """Cancelación controlada del backtest desde la CLI."""
+    pass
+
+
 def input_with_esc(prompt: str) -> str:
     """
     Función de input personalizada que permite cancelar con ESC.
@@ -30,8 +35,8 @@ def input_with_esc(prompt: str) -> str:
         if msvcrt.kbhit():
             ch = msvcrt.getch()
             if ch == b'\x1b':  # ESC key
-                print()  # newline
-                raise KeyboardInterrupt("Backtest cancelado con ESC")
+                print()
+                raise BacktestCancelled("Backtest cancelado con ESC")
             elif ch == b'\r':  # Enter
                 print()
                 return buffer
@@ -91,6 +96,7 @@ class PaperGridEngine(GridEngine):
         self.paper_btc: Decimal = Decimal("0")
         self.realized_profit: Decimal = Decimal("0")
         self._paper_order_index: dict[str, str] = {}
+        self._paper_order_snapshot: dict[str, OrderInfo] = {}
         self._paper_last_fill: Optional[OrderInfo] = None
         # Habilita trailing up y down extendidos durante el backtest
         self.trailing_up_mode   = 'extended'
@@ -208,6 +214,7 @@ class PaperGridEngine(GridEngine):
         with self._state_lock:
             self.active_orders[key] = order_info
             self._paper_order_index[order_id] = key
+            self._paper_order_snapshot[order_id] = self._clone_order_info(order_info)
 
     def _place_order_safe(
         self,
@@ -227,14 +234,22 @@ class PaperGridEngine(GridEngine):
 
     def cancel_order(self, order_id: str) -> tuple[dict[str, Any], list[LogEntry]]:
         key = self._paper_order_index.pop(order_id, None)
-        if key is None:
-            return {"status_code": 204}, []
 
-        info = self.active_orders.get(key)
+        info: Optional[OrderInfo] = None
+
+        if key is not None:
+            info = self.active_orders.get(key)
+
+        if info is None:
+            info = self._paper_order_snapshot.pop(order_id, None)
+        else:
+            self._paper_order_snapshot.pop(order_id, None)
+
         if info is None:
             return {"status_code": 204}, []
 
         order_size = self._order_size(info)
+
         if info["side"] == "buy":
             self.paper_usdc += Decimal(str(info["price"])) * order_size
         elif info["side"] == "sell":
@@ -253,6 +268,7 @@ class PaperGridEngine(GridEngine):
         order_id = str(snapshot.get("order_id", ""))
         if order_id != "virtual":
             self._paper_order_index.pop(order_id, None)
+            self._paper_order_snapshot.pop(order_id, None)
 
         side = str(snapshot["side"])
         price = Decimal(str(snapshot["price"]))
@@ -669,182 +685,182 @@ def run_grid_backtest(
 
 
 def prompt_backtest() -> None:
-    print("\n=== Backtesting Grid ===")
-    print("Usa la logica de GridEngine con exchange simulado. Fechas en formato YYYYMMDD.")
-    print("Presiona ESC en cualquier momento para cancelar.")
+    try:
+        print("\n=== Backtesting Grid ===")
+        print("Usa la logica de GridEngine con exchange simulado. Fechas en formato YYYYMMDD.")
+        print("Presiona ESC en cualquier momento para cancelar.")
 
-    # Defaults
-    default_saldo = "1000"
-    default_size = "0.0005"
-    default_step = "200"
-    default_price = "75000"
-    default_trailing_up = "extended"
-    default_trailing_down = "on"
+        # Defaults
+        default_saldo = "1000"
+        default_size = "0.0005"
+        default_step = "200"
+        default_price = "75000"
+        default_trailing_up = "extended"
+        default_trailing_down = "on"
 
-    today = datetime.utcnow().date()
-    start_default = (today - timedelta(days=29)).strftime("%Y%m%d")
-    end_default = today.strftime("%Y%m%d")
+        today = datetime.utcnow().date()
+        start_default = (today - timedelta(days=29)).strftime("%Y%m%d")
+        end_default = today.strftime("%Y%m%d")
 
-    def ask_decimal(label: str, default: str) -> Decimal:
-        while True:
-            raw = input_with_esc(f"{label} [{default}]: ").strip()
-            if not raw:
-                raw = default
-            try:
-                return Decimal(raw)
-            except Exception:
-                print("Valor invalido. Introduce un numero.")
-
-    def ask_decimal_list(label: str, default: str) -> list[Decimal]:
-        while True:
-            raw = input_with_esc(f"{label} [{default}]: ").strip()
-            if not raw:
-                raw = default
-
-            values: list[Decimal] = []
-            invalid = False
-            for part in raw.split(","):
-                item = part.strip()
-                if not item:
-                    invalid = True
-                    break
+        def ask_decimal(label: str, default: str) -> Decimal:
+            while True:
+                raw = input_with_esc(f"{label} [{default}]: ").strip()
+                if not raw:
+                    raw = default
                 try:
-                    value = Decimal(item)
+                    return Decimal(raw)
                 except Exception:
-                    invalid = True
-                    break
-                if value <= 0:
-                    invalid = True
-                    break
-                values.append(value)
+                    print("Valor invalido. Introduce un numero.")
 
-            if values and not invalid:
-                return values
+        def ask_decimal_list(label: str, default: str) -> list[Decimal]:
+            while True:
+                raw = input_with_esc(f"{label} [{default}]: ").strip()
+                if not raw:
+                    raw = default
 
-            print("Valor invalido. Introduce uno o varios numeros separados por comas.")
+                values: list[Decimal] = []
+                invalid = False
+                for part in raw.split(","):
+                    item = part.strip()
+                    if not item:
+                        invalid = True
+                        break
+                    try:
+                        value = Decimal(item)
+                    except Exception:
+                        invalid = True
+                        break
+                    if value <= 0:
+                        invalid = True
+                        break
+                    values.append(value)
 
-    def ask_date(label: str, default: str) -> str:
-        raw = input_with_esc(f"{label} [{default}]: ").strip()
-        return raw or default
+                if values and not invalid:
+                    return values
 
-    def ask_trailing_mode(label: str, default: str) -> str:
-        """Pregunta por el modo de trailing y valida la respuesta."""
-        while True:
-            raw = input_with_esc(f"{label} (off/on/extended) [{default}]: ").strip().lower()
-            if not raw:
-                return default
-            if raw in ("off", "on", "extended"):
-                return raw
-            print("Opción inválida. Debe ser off, on o extended.")
+                print("Valor invalido. Introduce uno o varios numeros separados por comas.")
 
-    def ask_trailing_modes(label: str, default: str) -> list[str]:
-        """Pregunta por uno o varios modos de trailing separados por comas."""
-        valid_modes = {"off", "on", "extended"}
-        while True:
-            raw = input_with_esc(f"{label} (off/on/extended, separados por comas) [{default}]: ").strip().lower()
-            if not raw:
-                raw = default
-
-            values = [part.strip() for part in raw.split(",") if part.strip()]
-            if values and all(value in valid_modes for value in values):
-                return values
-
-            print("Opcion invalida. Usa off, on, extended o una lista separada por comas.")
-
-    def ask_non_negative_int(label: str, default: int) -> int:
-        while True:
+        def ask_date(label: str, default: str) -> str:
             raw = input_with_esc(f"{label} [{default}]: ").strip()
-            if not raw:
-                return default
-            try:
-                value = int(raw)
-            except Exception:
-                print("Valor invalido. Introduce un entero.")
-                continue
-            if value < 0:
-                print("Valor invalido. Debe ser cero o mayor.")
-                continue
-            return value
+            return raw or default
 
-    saldo = ask_decimal("Saldo USDC", default_saldo)
-    # Permite ingresar listas de sizes y steps para ejecutar múltiples combinaciones de backtest.
-    sizes = ask_decimal_list("Size BTC por orden. Admite varios sizes separados por comas.", default_size)
-    steps = ask_decimal_list("Step USDC entre lineas. Admite varios steps separados por comas.", default_step)
+        def ask_trailing_mode(label: str, default: str) -> str:
+            """Pregunta por el modo de trailing y valida la respuesta."""
+            while True:
+                raw = input_with_esc(f"{label} (off/on/extended) [{default}]: ").strip().lower()
+                if not raw:
+                    return default
+                if raw in ("off", "on", "extended"):
+                    return raw
+                print("Opción inválida. Debe ser off, on o extended.")
 
-    initial_price = ask_decimal("Precio inicial", default_price)
+        def ask_trailing_modes(label: str, default: str) -> list[str]:
+            """Pregunta por uno o varios modos de trailing separados por comas."""
+            valid_modes = {"off", "on", "extended"}
+            while True:
+                raw = input_with_esc(f"{label} (off/on/extended, separados por comas) [{default}]: ").strip().lower()
+                if not raw:
+                    raw = default
 
-    center = _quantize_price(initial_price)
-    combos = [(size, step) for size in sizes for step in steps]
-    max_lines_by_combo = [
-        _calculate_max_buy_only_lines(
-            saldo=saldo,
-            size=size,
-            step=_quantize_price(step),
-            center=center,
-        )
-        for size, step in combos
-    ]
-    max_total_lines = min(max_lines_by_combo) if max_lines_by_combo else 0
-    print(
-        f"\nBacktests a ejecutar: {len(combos)} "
-        f"({len(sizes)} size(s) x {len(steps)} step(s))."
-    )
-    print(f"Lineas maximas estimadas para que quepan todas las combinaciones: {max_total_lines} en total (si todas fuesen abajo).")
-    print("La distribucion arriba/abajo cambia el saldo necesario.")
+                values = [part.strip() for part in raw.split(",") if part.strip()]
+                if values and all(value in valid_modes for value in values):
+                    return values
 
-    if max_total_lines <= 0:
-        print("[!] El saldo no permite abrir ninguna linea con esos size/step y precio inicial.")
-        return
+                print("Opcion invalida. Usa off, on, extended o una lista separada por comas.")
 
-    valid_combos: list[tuple[Decimal, Decimal]] = []
-    while True:
-        levels_above = ask_non_negative_int("Cuantas lineas quieres poner arriba", 0)
-        levels_below = ask_non_negative_int("Cuantas lineas quieres poner abajo", max_total_lines)
+        def ask_non_negative_int(label: str, default: int) -> int:
+            while True:
+                raw = input_with_esc(f"{label} [{default}]: ").strip()
+                if not raw:
+                    return default
+                try:
+                    value = int(raw)
+                except Exception:
+                    print("Valor invalido. Introduce un entero.")
+                    continue
+                if value < 0:
+                    print("Valor invalido. Debe ser cero o mayor.")
+                    continue
+                return value
 
-        if levels_above + levels_below <= 0:
-            print("[!] Debes colocar al menos una linea.")
-            continue
+        saldo = ask_decimal("Saldo USDC", default_saldo)
+        # Permite ingresar listas de sizes y steps para ejecutar múltiples combinaciones de backtest.
+        sizes = ask_decimal_list("Size BTC por orden. Admite varios sizes separados por comas.", default_size)
+        steps = ask_decimal_list("Step USDC entre lineas. Admite varios steps separados por comas.", default_step)
 
-        valid_combos = []
-        skipped_combos = []
-        for size, step in combos:
-            grid_step = _quantize_price(step)
-            required_balance = _required_balance_for_grid(
-                levels_above=levels_above,
-                levels_below=levels_below,
+        initial_price = ask_decimal("Precio inicial", default_price)
+
+        center = _quantize_price(initial_price)
+        combos = [(size, step) for size in sizes for step in steps]
+        max_lines_by_combo = [
+            _calculate_max_buy_only_lines(
+                saldo=saldo,
                 size=size,
-                step=grid_step,
+                step=_quantize_price(step),
                 center=center,
             )
-            if required_balance > saldo:
-                skipped_combos.append((size, step, required_balance))
-            else:
-                valid_combos.append((size, step))
+            for size, step in combos
+        ]
+        max_total_lines = min(max_lines_by_combo) if max_lines_by_combo else 0
+        print(
+            f"\nBacktests a ejecutar: {len(combos)} "
+            f"({len(sizes)} size(s) x {len(steps)} step(s))."
+        )
+        print(f"Lineas maximas estimadas para que quepan todas las combinaciones: {max_total_lines} en total (si todas fuesen abajo).")
+        print("La distribucion arriba/abajo cambia el saldo necesario.")
 
-        if not valid_combos:
-            min_required = min(required for _, _, required in skipped_combos)
-            print(
-                f"[!] Esa distribucion no cabe en ninguna combinacion. "
-                f"La mas barata requiere {_price_key(min_required)} USDC y tienes {_price_key(saldo)} USDC."
-            )
-            continue
+        if max_total_lines <= 0:
+            print("[!] El saldo no permite abrir ninguna linea con esos size/step y precio inicial.")
+            return
 
-        if skipped_combos:
-            print(f"[!] Se omitiran {len(skipped_combos)} combinacion(es) que no caben en el saldo.")
-        break
+        valid_combos: list[tuple[Decimal, Decimal]] = []
+        while True:
+            levels_above = ask_non_negative_int("Cuantas lineas quieres poner arriba", 0)
+            levels_below = ask_non_negative_int("Cuantas lineas quieres poner abajo", max_total_lines)
 
-    start_date = ask_date("Fecha inicio (YYYYMMDD)", start_default)
-    end_date = ask_date("Fecha final (YYYYMMDD)", end_default)
-    trailing_ups = ask_trailing_modes("Trailing up", default_trailing_up)
-    trailing_downs = ask_trailing_modes("Trailing down", default_trailing_down)
-    run_combos = [
-        (size, step, trailing_up, trailing_down)
-        for size, step in valid_combos
-        for trailing_up in trailing_ups
-        for trailing_down in trailing_downs
-    ]
+            if levels_above + levels_below <= 0:
+                print("[!] Debes colocar al menos una linea.")
+                continue
 
-    try:
+            valid_combos = []
+            skipped_combos = []
+            for size, step in combos:
+                grid_step = _quantize_price(step)
+                required_balance = _required_balance_for_grid(
+                    levels_above=levels_above,
+                    levels_below=levels_below,
+                    size=size,
+                    step=grid_step,
+                    center=center,
+                )
+                if required_balance > saldo:
+                    skipped_combos.append((size, step, required_balance))
+                else:
+                    valid_combos.append((size, step))
+
+            if not valid_combos:
+                min_required = min(required for _, _, required in skipped_combos)
+                print(
+                    f"[!] Esa distribucion no cabe en ninguna combinacion. "
+                    f"La mas barata requiere {_price_key(min_required)} USDC y tienes {_price_key(saldo)} USDC."
+                )
+                continue
+
+            if skipped_combos:
+                print(f"[!] Se omitiran {len(skipped_combos)} combinacion(es) que no caben en el saldo.")
+            break
+
+        start_date = ask_date("Fecha inicio (YYYYMMDD)", start_default)
+        end_date = ask_date("Fecha final (YYYYMMDD)", end_default)
+        trailing_ups = ask_trailing_modes("Trailing up", default_trailing_up)
+        trailing_downs = ask_trailing_modes("Trailing down", default_trailing_down)
+        run_combos = [
+            (size, step, trailing_up, trailing_down)
+            for size, step in valid_combos
+            for trailing_up in trailing_ups
+            for trailing_down in trailing_downs
+        ]
+
         since = _parse_date_to_ms(start_date)
         until = _parse_date_to_ms(end_date, end_of_day=True)
         if since > until:
@@ -872,55 +888,58 @@ def prompt_backtest() -> None:
                 output_label=output_label,
             )
             results.append((size, step, trailing_up, trailing_down, result))
-    except (Exception, KeyboardInterrupt) as exc:
-        if isinstance(exc, KeyboardInterrupt):
-            print("\n[!] Backtest cancelado con ESC.")
-        else:
-            print(f"\n[!] Backtest cancelado: {exc}")
+
+        if not results:
+            print("\n[!] No se ejecuto ningun backtest.")
+            return
+
+        print("\n=== RESULTADOS BACKTEST ===")
+        print(f"Precio inicial     : {_price_key(initial_price)} USDC")
+        print(f"Backtests ejecutados: {len(results)}")
+        print(f"Lineas totales     : {levels_above + levels_below} ({levels_above} arriba / {levels_below} abajo)")
+        print(f"\n  {'Size':>12} {'Step':>10} {'T.Up':>8} {'T.Down':>8} {'Fills':>8} {'Profit':>12} {'PnL MTM':>12} {'CSV'}")
+        print(f"  {'-' * 102}")
+
+        best: Optional[tuple[Decimal, Decimal, str, str, BacktestResult, Decimal]] = None
+        for size, step, trailing_up, trailing_down, result in results:
+            pnl = result.end_equity - result.start_equity
+            if best is None or pnl > best[5]:
+                best = (size, step, trailing_up, trailing_down, result, pnl)
+            print(
+                f"  {fmt_amount(size):>12} {_price_key(step):>10} "
+                f"{trailing_up:>8} {trailing_down:>8} "
+                f"{result.fills:>8} {_price_key(result.realized_profit):>12} "
+                f"{_price_key(pnl):>12} {result.output_path}"
+            )
+
+        if best is not None:
+            best_size, best_step, best_trailing_up, best_trailing_down, best_result, best_pnl = best
+            best_pct = (
+                best_pnl / best_result.start_equity * Decimal("100")
+                if best_result.start_equity
+                else Decimal("0")
+            )
+            print(
+                f"\nMejor PnL MTM      : size {fmt_amount(best_size)}, step {_price_key(best_step)} "
+                f"trailing {best_trailing_up}/{best_trailing_down} "
+                f"=> {_price_key(best_pnl)} USDC ({fmt_amount(best_pct)}%)"
+            )
+
+        _write_backtest_summary(
+            saldo=saldo,
+            initial_price=initial_price,
+            levels_above=levels_above,
+            levels_below=levels_below,
+            start_date=start_date,
+            end_date=end_date,
+            results=results,
+        )
+
+    except BacktestCancelled:
+        print("\n[!] Backtest cancelado con ESC.")
         return
 
-    if not results:
-        print("\n[!] No se ejecuto ningun backtest.")
+    except Exception as exc:
+        print(f"\n[!] Backtest cancelado: {exc}")
         return
 
-    print("\n=== RESULTADOS BACKTEST ===")
-    print(f"Precio inicial     : {_price_key(initial_price)} USDC")
-    print(f"Backtests ejecutados: {len(results)}")
-    print(f"Lineas totales     : {levels_above + levels_below} ({levels_above} arriba / {levels_below} abajo)")
-    print(f"\n  {'Size':>12} {'Step':>10} {'T.Up':>8} {'T.Down':>8} {'Fills':>8} {'Profit':>12} {'PnL MTM':>12} {'CSV'}")
-    print(f"  {'-' * 102}")
-
-    best: Optional[tuple[Decimal, Decimal, str, str, BacktestResult, Decimal]] = None
-    for size, step, trailing_up, trailing_down, result in results:
-        pnl = result.end_equity - result.start_equity
-        if best is None or pnl > best[5]:
-            best = (size, step, trailing_up, trailing_down, result, pnl)
-        print(
-            f"  {fmt_amount(size):>12} {_price_key(step):>10} "
-            f"{trailing_up:>8} {trailing_down:>8} "
-            f"{result.fills:>8} {_price_key(result.realized_profit):>12} "
-            f"{_price_key(pnl):>12} {result.output_path}"
-        )
-
-    if best is not None:
-        best_size, best_step, best_trailing_up, best_trailing_down, best_result, best_pnl = best
-        best_pct = (
-            best_pnl / best_result.start_equity * Decimal("100")
-            if best_result.start_equity
-            else Decimal("0")
-        )
-        print(
-            f"\nMejor PnL MTM      : size {fmt_amount(best_size)}, step {_price_key(best_step)} "
-            f"trailing {best_trailing_up}/{best_trailing_down} "
-            f"=> {_price_key(best_pnl)} USDC ({fmt_amount(best_pct)}%)"
-        )
-
-    _write_backtest_summary(
-        saldo=saldo,
-        initial_price=initial_price,
-        levels_above=levels_above,
-        levels_below=levels_below,
-        start_date=start_date,
-        end_date=end_date,
-        results=results,
-    )

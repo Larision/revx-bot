@@ -1881,6 +1881,9 @@ class GridEngine:
                             },
                         ))
 
+                        if is_virtual:
+                            trailing_down_sell_release_keys.add(_price_key(upper_sell_price))
+
                         next_buy_key = _price_key(next_buy_price)
                         if next_buy_key not in self.active_orders:
                             virtual_info = cast(OrderInfo, {
@@ -1988,6 +1991,10 @@ class GridEngine:
                             }),
                         ))
                     orders_to_place.append((next_sell_price, "sell", order_size, None))
+
+                    if is_virtual:
+                        trailing_down_sell_release_keys.add(_price_key(next_sell_price))
+                        
                     trailing_logs.append(
                         f"[ENGINE] Rebalance trailing down: grid extendido a {_price_key(trail_down_price)}"
                     )
