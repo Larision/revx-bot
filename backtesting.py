@@ -11,7 +11,8 @@ from pathlib import Path
 from typing import Any, Optional, Sequence, cast
 
 from api import _price_key, fmt_amount, get_market_trades_page
-from config import SYMBOL, TICK_SIZE
+from cli import _epoch_ms_to_iso
+from config import SYMBOL, TICK_SIZE, WINDOW_MS
 from engine import GridEngine
 from logger import log_event
 from types_ import LogEntry, OrderInfo
@@ -451,44 +452,44 @@ def _select_trade_fill_keys(
     return []
 
 
-MAX_WINDOW_MS = 30 * 24 * 60 * 60 * 1000
-
-
 def _load_market_trades(symbol: str, since: int, until: int) -> list[dict[str, Any]]:
-    trades: list[dict[str, Any]] = []
+    symbol = SYMBOL
+    all_rows: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
-
     window_start = since
 
+    # Descargar por ventanas de 30 días
     while window_start <= until:
-        window_end = min(window_start + MAX_WINDOW_MS - 1, until)
-        cursor: Optional[str] = None
+        window_end = min(window_start + WINDOW_MS - 1, until)
+        print(f"\n--- Descargando ventana ---")
+        print(f"Desde: {datetime.fromtimestamp(window_start/1000)}")
+        print(f"Hasta: {datetime.fromtimestamp(window_end/1000)}")
 
+        cursor = None
         while True:
             response, logs = get_market_trades_page(
                 symbol=symbol,
                 start_date=window_start,
                 end_date=window_end,
-                cursor=cursor,
+                cursor=cursor
             )
-
-            for entry in logs:
-                log_event(f"[BACKTEST] {entry['msg']}", entry.get("level", "info"))
+            for l in logs:
+                log_event(f"[LOG] {l['msg']}", l.get("level", "info"))
 
             if not isinstance(response, dict) or response.get("error"):
+                print("Error obteniendo datos de mercado")
                 raise RuntimeError("No se pudieron obtener trades de mercado para el backtest.")
 
             data = response.get("data", [])
             if isinstance(data, list):
                 for row in data:
-                    if not isinstance(row, dict):
+                    tid = row.get("tid")
+                    if tid and tid in seen_ids:
                         continue
-                    trade_id = str(row.get("tid") or row.get("id") or "")
-                    if trade_id and trade_id in seen_ids:
-                        continue
-                    if trade_id:
-                        seen_ids.add(trade_id)
-                    trades.append(row)
+                    if tid:
+                        seen_ids.add(tid)
+                    row["tdt_iso"] = _epoch_ms_to_iso(row.get("tdt"))
+                    all_rows.append(row)
 
             metadata = response.get("metadata", {})
             cursor = metadata.get("next_cursor") if isinstance(metadata, dict) else None
@@ -497,7 +498,7 @@ def _load_market_trades(symbol: str, since: int, until: int) -> list[dict[str, A
 
         window_start = window_end + 1
 
-    return sorted(trades, key=_item_time_ms)
+    return sorted(all_rows, key=_item_time_ms)
 
 
 def _write_backtest_summary(
