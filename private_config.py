@@ -144,7 +144,25 @@ def get_trailing_down_default(default: str) -> str:
     return val.strip() if val else default
 
 
-def save_grid_config(levels_below: int, levels_above: int, base_size: str, step_percent: str, trailing_up: str, trailing_down: str) -> None:
+def get_bot_usdc_budget_default(default: str) -> str:
+    """Lee bot_usdc_budget de [grid] en private_config.ini.
+
+    Un valor <= 0 se interpreta en la CLI como presupuesto no fijado.
+    """
+    cfg = _load()
+    val = cfg.get("grid", "bot_usdc_budget", fallback=None)
+    return val.strip() if val else default
+
+
+def save_grid_config(
+    levels_below: int,
+    levels_above: int,
+    base_size: str,
+    step_percent: str,
+    trailing_up: str,
+    trailing_down: str,
+    bot_usdc_budget: str,
+) -> None:
     """Guarda la configuración de grid en private_config.ini."""
     cfg = _load()
     if not cfg.has_section("grid"):
@@ -155,5 +173,6 @@ def save_grid_config(levels_below: int, levels_above: int, base_size: str, step_
     cfg.set("grid", "step_percent", step_percent)
     cfg.set("grid", "trailing_up", trailing_up)
     cfg.set("grid", "trailing_down", trailing_down)
+    cfg.set("grid", "bot_usdc_budget", bot_usdc_budget)
     with open(PRIVATE_CONFIG_PATH, "w", encoding="utf-8") as f:
         cfg.write(f)
