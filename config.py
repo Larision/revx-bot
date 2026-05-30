@@ -11,6 +11,7 @@ STATE_PATH = Path("grid_state.json")   # estado persistente del grid
 
 BASE_URL: str = os.environ.get("REVX_BASE_URL", "https://revx.revolut.com")
 SYMBOL: str = "BTC-USDC"  # Cambiar aquí afecta todo el programa
+MAX_TRADES_HISTORY_LIMIT = 1900
 
 DEFAULT_GRID_LEVELS_BELOW: int = 3
 DEFAULT_GRID_LEVELS_ABOVE: int = 3

@@ -3,7 +3,7 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 
-from config import SYMBOL, TICK_SIZE
+from config import SYMBOL, TICK_SIZE, MAX_TRADES_HISTORY_LIMIT
 from types_ import LogEntry
 from logger import log_event
 from http_client import send_request
@@ -69,6 +69,73 @@ def _parse_balances(balances_resp: Any) -> Tuple[Decimal, Decimal]:
             btc_balance = amount
 
     return usdc_balance, btc_balance
+
+
+def check_balances_for_grid(
+    base_size: Decimal,
+    grid: List[Decimal],
+    center_price: Optional[Decimal] = None,
+) -> Tuple[bool, List[LogEntry]]:
+    """Verifica que hay saldo suficiente para cubrir todos los niveles del grid."""
+    logs: List[LogEntry] = []
+    balances_resp, blogs = get_all_balances()
+    logs.extend(blogs)
+
+    usdc_balance, btc_balance = _parse_balances(balances_resp)
+
+    if center_price is None:
+        mid_idx     = len(grid) // 2
+        buy_prices  = grid[:mid_idx]
+        sell_prices = grid[mid_idx + 1:]
+    else:
+        buy_prices  = [p for p in grid if p < center_price]
+        sell_prices = [p for p in grid if p > center_price]
+
+    required_usdc = sum((base_size * p for p in buy_prices), Decimal("0"))
+    required_btc  = base_size * Decimal(len(sell_prices))
+
+    if usdc_balance < required_usdc:
+        log_event(
+            f"Saldo USDC insuficiente: {_price_key(usdc_balance)} < {_price_key(required_usdc)}",
+            "warning", logs
+        )
+        return False, logs
+
+    if btc_balance < required_btc:
+        log_event(
+            f"Saldo BTC insuficiente: {_price_key(btc_balance)} < {fmt_amount(required_btc)}",
+            "warning", logs
+        )
+        return False, logs
+
+    log_event("Saldos suficientes para grid.", "info", logs)
+    return True, logs
+
+
+def get_current_price() -> Tuple[Optional[Decimal], List[LogEntry]]:
+    """
+    Obtiene el mid price a partir del order book público (best bid + best ask).
+    Más reactivo que el ticker — se actualiza con cada cambio en el book.
+    No requiere autenticación.
+
+    Nota: asks vienen ordenados de mayor a menor, por lo que:
+      - best_bid = bids[0]  (el más alto)
+      - best_ask = asks[-1] (el más bajo)
+    """
+    response, logs = get_order_book()
+
+    price: Optional[Decimal] = None
+
+    if isinstance(response, dict):
+        data = response.get("data", response)
+        try:
+            best_bid = Decimal(str(data["bids"][0]["p"]))
+            best_ask = Decimal(str(data["asks"][-1]["p"]))  # ← último, no primero
+            price = (best_bid + best_ask) / 2
+        except (KeyError, IndexError, TypeError):
+            price = None
+
+    return price, logs
 
 
 # =========================================================
@@ -225,9 +292,6 @@ def get_historical_orders(limit: int = 50) -> Tuple[Dict[str, Any], List[LogEntr
     return response, logs
 
 
-MAX_TRADES_HISTORY_LIMIT = 1900
-
-
 def get_market_trades_page(
     symbol: str,
     start_date: Optional[int] = None,
@@ -295,47 +359,76 @@ def get_candles(
     return response, logs
 
 
-def get_current_price() -> Tuple[Optional[Decimal], List[LogEntry]]:
+def get_order_book() -> Tuple[Dict[str, Any], List[LogEntry]]:
     """
-    Obtiene el mid price a partir del order book público (best bid + best ask).
-    Más reactivo que el ticker — se actualiza con cada cambio en el book.
+    Recupera el order book público para el símbolo configurado.
     No requiere autenticación.
 
-    Nota: asks vienen ordenados de mayor a menor, por lo que:
-      - best_bid = bids[0]  (el más alto)
-      - best_ask = asks[-1] (el más bajo)
+    Response example:
+    {
+        "data": {
+            "asks": [
+                {
+                "aid": "ETH",
+                "anm": "Ethereum",
+                "s": "SELL",
+                "p": "4600",
+                "pc": "USD",
+                "pn": "MONE",
+                "q": "17",
+                "qc": "ETH",
+                "qn": "UNIT",
+                "ve": "REVX",
+                "no": "3",
+                "ts": "CLOB",
+                "pdt": 3318215482991
+                },
+                ...
+            ],
+            "bids": [
+                {
+                "aid": "ETH",
+                "anm": "Ethereum",
+                "s": "BUYI",
+                "p": "4550",
+                "pc": "USD",
+                "pn": "MONE",
+                "q": "0.25",
+                "qc": "ETH",
+                "qn": "UNIT",
+                "ve": "REVX",
+                "no": "1",
+                "ts": "CLOB",
+                "pdt": 3318215482991
+                },
+                ...
+            ]
+        },
+        "metadata": { "timestamp": 1772907590743 }
+    }
     """
     response, logs = send_request(
         "GET",
         f"/api/1.0/public/order-book/{SYMBOL}",
     )
+    return response, logs
 
-    price: Optional[Decimal] = None
 
-    if isinstance(response, dict):
-        data = response.get("data", response)
-        try:
-            best_bid = Decimal(str(data["bids"][0]["p"]))
-            best_ask = Decimal(str(data["asks"][-1]["p"]))  # ← último, no primero
-            price = (best_bid + best_ask) / 2
-        except (KeyError, IndexError, TypeError):
-            price = None
-
-    return price, logs
-
-def get_ticker_price() -> Tuple[Dict[str, Any], List[LogEntry]]:
+def get_ticker() -> Tuple[Dict[str, Any], List[LogEntry]]:
     """
-    Obtiene el mid price a partir del ticker (last_price). Menos reactivo que el order book, se actualiza solo con trades.
+    Obtiene el mejor bid y ask, el mid price calculado a partir de 
+    bid/ask y el precio calculado por el ultimo trade (last_price).
+    Menos reactivo que el order book, se actualiza solo con trades.
 
     Response example:
     {
         "data": [
             {
-      "symbol": "ETH/USD",
-      "bid": "0.02",
-      "ask": "0.02",
-      "mid": "0.02",
-      "last_price": "0.02"
+            "symbol": "ETH/USD",
+            "bid": "0.02",
+            "ask": "0.02",
+            "mid": "0.02",
+            "last_price": "0.02"
             }
         ],
         "metadata": {
@@ -352,42 +445,3 @@ def get_ticker_price() -> Tuple[Dict[str, Any], List[LogEntry]]:
 
     return response, logs
 
-def check_balances_for_grid(
-    base_size: Decimal,
-    grid: List[Decimal],
-    center_price: Optional[Decimal] = None,
-) -> Tuple[bool, List[LogEntry]]:
-    """Verifica que hay saldo suficiente para cubrir todos los niveles del grid."""
-    logs: List[LogEntry] = []
-    balances_resp, blogs = get_all_balances()
-    logs.extend(blogs)
-
-    usdc_balance, btc_balance = _parse_balances(balances_resp)
-
-    if center_price is None:
-        mid_idx     = len(grid) // 2
-        buy_prices  = grid[:mid_idx]
-        sell_prices = grid[mid_idx + 1:]
-    else:
-        buy_prices  = [p for p in grid if p < center_price]
-        sell_prices = [p for p in grid if p > center_price]
-
-    required_usdc = sum((base_size * p for p in buy_prices), Decimal("0"))
-    required_btc  = base_size * Decimal(len(sell_prices))
-
-    if usdc_balance < required_usdc:
-        log_event(
-            f"Saldo USDC insuficiente: {_price_key(usdc_balance)} < {_price_key(required_usdc)}",
-            "warning", logs
-        )
-        return False, logs
-
-    if btc_balance < required_btc:
-        log_event(
-            f"Saldo BTC insuficiente: {_price_key(btc_balance)} < {fmt_amount(required_btc)}",
-            "warning", logs
-        )
-        return False, logs
-
-    log_event("Saldos suficientes para grid.", "info", logs)
-    return True, logs
