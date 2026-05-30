@@ -218,3 +218,4 @@ __pycache__/
 start.sh
 grid_state.json
 resumen_resultados.txt
+tax_lots.json
