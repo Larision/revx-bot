@@ -51,8 +51,28 @@ class GridEngine:
             levels_below: Niveles por debajo del centro.
             levels_above: Niveles por encima del centro.
 
-    El estado se persiste automáticamente en STATE_PATH para permitir
-    recuperación tras reinicios.
+        El estado se persiste automáticamente en STATE_PATH para permitir
+        recuperación tras reinicios.
+
+        Trailings:
+        - trailing up on: al ejecutar el ultimo SELL, se añade un SELL virtual encima.
+            Al ejecutarse ese SELL virtual, se crea la orden BUY real correspondiente 
+            y se recrea otro SELL virtual encima.
+            Se cancelan ordenes BUY reales bajos para liberar USDC si es necesario.
+        - trailing up extended: igual pero con tamaños decrecientes en los SELL virtuales
+            para reducir el riesgo de sobreextensión. El tamaño de cada SELL virtual se reduce
+            un 2.5% respecto al anterior, hasta un mínimo del 50% de base_size.
+            El grid principal mantiene el tamaño base.
+            Se cancelan ordenes BUY reales bajos para liberar USDC si es necesario.
+        - trailing down on: al ejecutar el ultimo BUY, se añade un BUY virtual debajo.
+            Al ejecutarse ese BUY virtual, se crea la orden SELL real correspondiente y
+            se recrea otro BUY virtual debajo.
+            Se cancelan ordenes SELL reales altos para liberar BTC si es necesario.
+        - trailing down extended: igual pero los BUY virtuales añadidos por el trailing down 
+            tienen la mitad del tamaño base para reducir el riesgo de sobreextensión.
+            Se cancelan ordenes SELL reales altos para liberar BTC si es necesario.
+            El grid principal mantiene el tamaño.
+
     """
 
     def __init__(
