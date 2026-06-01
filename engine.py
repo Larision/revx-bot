@@ -104,10 +104,13 @@ class GridEngine:
         # Trailing up extendido / híbrido:
         # - El grid normal mantiene base_size.
         # - Cada nivel añadido por trailing up reduce el tamaño un 2.5%.
-        # - El tamaño nunca baja del 30% de base_size.
+        # - El tamaño nunca baja del 50% de base_size.
         self.trailing_up_reduction_per_level: Decimal = Decimal("0.025")
         self.trailing_up_min_factor: Decimal = Decimal("0.50")
         self._trailing_up_steps: int = 0
+
+        # Trailing down extendido:
+        # - Los niveles añadidos por trailing down extended tienen la mitad del tamaño base.
 
         self._trailing_down_extended_drops: int = 0
 
@@ -159,11 +162,11 @@ class GridEngine:
         except Exception:
             return self.base_size
 
-    def _is_extended_order(self, info: Optional[OrderInfo]) -> bool:
+    def _is_extended_down_order(self, info: Optional[OrderInfo]) -> bool:
         """Retorna True si la orden pertenece al grid extendido inferior."""
         return bool(info) and bool(info.get("extended"))
 
-    def _extended_order_size(self) -> Decimal:
+    def _extended_up_order_size(self) -> Decimal:
         """Tamaño fijo de las órdenes extended: 50% del base_size."""
         return self.base_size * Decimal("0.5")
 
@@ -441,7 +444,7 @@ class GridEngine:
                 order_id = str(info.get('order_id'))
                 if order_id in {'virtual', 'pending_post_only', 'pending_manual', 'pending_cancel'}:
                     continue
-                if self._is_extended_order(info):
+                if self._is_extended_down_order(info):
                     continue
                 try:
                     candidates.append((Decimal(key), key, self._clone_order_info(info)))
@@ -1136,7 +1139,7 @@ class GridEngine:
             if not extended_levels:
                 default_extended_step = base_step if base_step is not None else step
                 for info in active_orders.values():
-                    if not self._is_extended_order(info) or default_extended_step is None:
+                    if not self._is_extended_down_order(info) or default_extended_step is None:
                         continue
                     grid_step = self._decimal_from_meta(info.get("grid_step"), default_extended_step)
                     if info.get("side") == "buy":
@@ -1770,7 +1773,7 @@ class GridEngine:
 
             filled_key = _price_key(price)
             is_virtual = order_id == "virtual"
-            is_extended = self._is_extended_order(info) or filled_key in self.extended_levels
+            is_extended = self._is_extended_down_order(info) or filled_key in self.extended_levels
             handled = False
 
             # El contador de trailing up se recalcula desde la orden/nivel ejecutado.
@@ -1824,7 +1827,7 @@ class GridEngine:
 
                 if is_virtual:
                     if self.trailing_down_mode == "extended":
-                        extended_size = self._extended_order_size()
+                        extended_size = self._extended_up_order_size()
                         next_buy_price = (price - grid_step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
 
                         self._trailing_down_extended_drops += 1
@@ -1938,7 +1941,7 @@ class GridEngine:
                 next_buy_price = (price - base_step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
 
                 if self.trailing_down_mode == "extended":
-                    extended_size = self._extended_order_size()
+                    extended_size = self._extended_up_order_size()
                     self._mark_extended_level_locked(next_buy_price, base_step)
 
                     orders_to_place.append((next_sell_price, "sell", order_size, None))
@@ -2290,7 +2293,7 @@ class GridEngine:
                 if raw_step is not None:
                     grid_step = self._decimal_from_meta(raw_step, step)
                     paired_sell_price = (level + grid_step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
-                    order_size = self._extended_order_size()
+                    order_size = self._extended_up_order_size()
                     metadata = {
                         "extended": True,
                         "grid_step": grid_step,
@@ -2313,7 +2316,7 @@ class GridEngine:
                             continue
 
                         if paired_sell_price == level:
-                            order_size = self._extended_order_size()
+                            order_size = self._extended_up_order_size()
                             metadata = {
                                 "extended": True,
                                 "grid_step": grid_step,
