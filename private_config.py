@@ -14,6 +14,15 @@ Lee private_config.ini con el siguiente formato:
     token   = TU_TOKEN
     chat_id = 123456789
 
+    [grid]
+    levels_below = 3
+    levels_above = 3
+    base_size = 0.00008
+    step_percent = 0.002
+    trailing_up = extended
+    trailing_down = on
+    bot_usdc_budget = 1000
+
 Si [telegram] enabled = false, el programa no cargará ni arrancará el bot.
 """
 
@@ -169,10 +178,10 @@ def save_grid_config(
         cfg.add_section("grid")
     cfg.set("grid", "levels_below", str(levels_below))
     cfg.set("grid", "levels_above", str(levels_above))
-    cfg.set("grid", "base_size", base_size)
-    cfg.set("grid", "step_percent", step_percent)
-    cfg.set("grid", "trailing_up", trailing_up)
-    cfg.set("grid", "trailing_down", trailing_down)
-    cfg.set("grid", "bot_usdc_budget", bot_usdc_budget)
+    cfg.set("grid", "base_size", str(base_size))
+    cfg.set("grid", "step_percent", str(step_percent))
+    cfg.set("grid", "trailing_up", str(trailing_up))
+    cfg.set("grid", "trailing_down", str(trailing_down))
+    cfg.set("grid", "bot_usdc_budget", str(bot_usdc_budget))
     with open(PRIVATE_CONFIG_PATH, "w", encoding="utf-8") as f:
         cfg.write(f)

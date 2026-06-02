@@ -5,13 +5,16 @@ Comandos disponibles:
   /status    — precio actual, órdenes activas, fills de sesión y trailings
   /grid      — niveles del grid con órdenes
   /balance   — balances disponibles y fondos comprometidos en el grid
+  /config    — muestra la configuración guardada del grid
+  /set_config — cambia un valor de configuración guardada
   /trailings — muestra o configura trailing up/down
   /taxstatus — resumen FIFO fiscal
   /taxlots   — lotes FIFO abiertos
+  /taxunmatched — incidencias FIFO
   /taxsim    — simulación FIFO de una venta
   /taxaddlot — importa lote fiscal inicial/manual
   /taxreport — exporta CSV/JSON fiscales
-  /start_engine  — arranca el engine (recupera estado si existe)
+  /start_engine  — previsualiza y arranca el engine con confirmación
   /stop      — detiene el engine (requiere confirmación)
   /add_order — añade una orden manual (guiado por pasos)
   /cancel    — cancela una orden por precio (requiere confirmación)
@@ -31,7 +34,7 @@ import asyncio
 import logging
 import threading
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, cast
 
@@ -45,14 +48,18 @@ from telegram.ext import (
     filters,
 )
 
-from api import _price_key, fmt_amount, get_current_price
+from api import _parse_balances, _price_key, fmt_amount, get_all_balances, get_current_price
 from cli import format_balances_live
 from config import (
     DEFAULT_BASE_SIZE,
     DEFAULT_GRID_LEVELS_ABOVE,
     DEFAULT_GRID_LEVELS_BELOW,
     DEFAULT_STEP_PERCENT,
+    DEFAULT_TRAILING_DOWN,
+    DEFAULT_TRAILING_UP,
     STATE_PATH,
+    SYMBOL,
+    TICK_SIZE,
 )
 from logger import log_event
 from trailing import (
@@ -272,6 +279,310 @@ def _apply_trailing_config(
     return True, _format_trailing_status(engine)
 
 
+def _decimal_or_default(value: object, default: Decimal) -> Decimal:
+    """Convierte un valor de configuración a Decimal con fallback seguro."""
+    try:
+        return Decimal(str(value).strip())
+    except Exception:
+        return Decimal(str(default))
+
+
+def _parse_percent_value(value: str) -> Decimal:
+    """Parsea step_percent; admite valores decimales o texto con % al final."""
+    text = value.strip().replace(",", ".")
+    if text.endswith("%"):
+        return Decimal(text[:-1].strip()) / Decimal("100")
+    return Decimal(text)
+
+
+def _load_grid_config() -> dict[str, Any]:
+    """Carga la configuración persistida del grid con defaults seguros."""
+    from private_config import (
+        get_base_size_default,
+        get_bot_usdc_budget_default,
+        get_grid_levels_above,
+        get_grid_levels_below,
+        get_step_percent_default,
+        get_trailing_down_default,
+        get_trailing_up_default,
+    )
+
+    base_size = _decimal_or_default(
+        get_base_size_default(str(DEFAULT_BASE_SIZE)),
+        DEFAULT_BASE_SIZE,
+    )
+    step_percent = _decimal_or_default(
+        get_step_percent_default(str(DEFAULT_STEP_PERCENT)),
+        DEFAULT_STEP_PERCENT,
+    )
+    bot_usdc_budget = _decimal_or_default(
+        get_bot_usdc_budget_default("0"),
+        Decimal("0"),
+    )
+    trailing_up = normalize_trailing_up_mode(
+        get_trailing_up_default(str(DEFAULT_TRAILING_UP))
+    )
+    trailing_down = normalize_trailing_down_mode(
+        get_trailing_down_default(str(DEFAULT_TRAILING_DOWN))
+    )
+
+    return {
+        "levels_below": max(0, int(get_grid_levels_below(DEFAULT_GRID_LEVELS_BELOW))),
+        "levels_above": max(0, int(get_grid_levels_above(DEFAULT_GRID_LEVELS_ABOVE))),
+        "base_size": base_size,
+        "step_percent": step_percent,
+        "trailing_up": trailing_up,
+        "trailing_down": trailing_down,
+        "bot_usdc_budget": bot_usdc_budget if bot_usdc_budget > 0 else Decimal("0"),
+    }
+
+
+def _save_grid_config_from_dict(cfg: dict[str, Any]) -> None:
+    """Persiste una configuración de grid ya validada."""
+    from private_config import save_grid_config
+
+    save_grid_config(
+        int(cfg["levels_below"]),
+        int(cfg["levels_above"]),
+        str(cfg["base_size"]),
+        str(cfg["step_percent"]),
+        str(cfg["trailing_up"]),
+        str(cfg["trailing_down"]),
+        str(cfg["bot_usdc_budget"]),
+    )
+
+
+def _format_budget(value: Decimal) -> str:
+    """Formatea el presupuesto asignado al bot."""
+    if value <= 0:
+        return "0 (sin límite explícito)"
+    return f"{_price_key(value)} USDC"
+
+
+def _format_grid_config(cfg: dict[str, Any]) -> str:
+    """Construye el texto visible para /config."""
+    lines = [
+        "⚙️ *CONFIG GRID*",
+        "```",
+        f"Symbol          : {SYMBOL}",
+        f"Levels below    : {cfg['levels_below']}",
+        f"Levels above    : {cfg['levels_above']}",
+        f"Base size       : {fmt_amount(cfg['base_size'])} BTC",
+        f"Step percent    : {fmt_amount(cfg['step_percent'] * Decimal('100'))}%",
+        f"Trailing up     : {trailing_mode_label(str(cfg['trailing_up']))}",
+        f"Trailing down   : {trailing_mode_label(str(cfg['trailing_down']))}",
+        f"Bot USDC budget : {_format_budget(Decimal(str(cfg['bot_usdc_budget'])))}",
+        "```",
+        "Cambiar un valor:",
+        "`/set_config levels_below 3`",
+        "`/set_config levels_above 3`",
+        "`/set_config base_size 0.00008`",
+        "`/set_config step_percent 0.2%`",
+        "`/set_config trailing_up extended`",
+        "`/set_config trailing_down on`",
+        "`/set_config bot_usdc_budget 1000`",
+    ]
+    if _engine_running():
+        lines.append("\nEl cambio de configuración afecta a próximos arranques. Para el engine activo usa /trailings.")
+    return "\n".join(lines)
+
+
+def _set_config_usage() -> str:
+    """Texto de ayuda para /set_config."""
+    return (
+        "Uso:\n"
+        "`/set_config levels_below 3`\n"
+        "`/set_config levels_above 3`\n"
+        "`/set_config base_size 0.00008`\n"
+        "`/set_config step_percent 0.2%`\n"
+        "`/set_config trailing_up off|on|extended`\n"
+        "`/set_config trailing_down off|on|extended`\n"
+        "`/set_config bot_usdc_budget 1000`\n"
+        "También puedes usar `max` en bot_usdc_budget para tomar el USDC disponible."
+    )
+
+
+def _read_available_balances_for_telegram() -> tuple[Optional[Decimal], Optional[Decimal], list[dict[str, str]]]:
+    """Lee saldos disponibles USDC/BTC para preflight de Telegram."""
+    logs: list[dict[str, str]] = []
+    try:
+        balances_resp, balance_logs = get_all_balances()
+        for log_item in balance_logs:
+            logs.append({"level": log_item.get("level", "info"), "msg": log_item["msg"]})
+    except Exception as exc:
+        logs.append({"level": "error", "msg": f"No se pudieron consultar balances: {exc}"})
+        return None, None, logs
+
+    if not isinstance(balances_resp, dict) or balances_resp.get("error"):
+        logs.append({"level": "error", "msg": f"Respuesta inválida consultando balances: {balances_resp}"})
+        return None, None, logs
+
+    usdc_balance, btc_balance = _parse_balances(balances_resp)
+    return usdc_balance, btc_balance, logs
+
+
+def _build_grid_levels_for_start(cfg: dict[str, Any], initial_price: Decimal) -> tuple[Decimal, list[Decimal]]:
+    """Calcula step y niveles iniciales para el preflight de arranque."""
+    center = Decimal(str(initial_price)).quantize(TICK_SIZE, rounding=ROUND_DOWN)
+    step = (center * Decimal(str(cfg["step_percent"]))).quantize(TICK_SIZE, rounding=ROUND_DOWN)
+    if step <= 0:
+        raise ValueError("step calculado inválido")
+
+    levels: list[Decimal] = []
+    for i in range(-int(cfg["levels_below"]), int(cfg["levels_above"]) + 1):
+        lvl = (center + (Decimal(i) * step)).quantize(TICK_SIZE, rounding=ROUND_DOWN)
+        levels.append(lvl)
+    return step, sorted(set(levels))
+
+
+def _build_start_preflight_text(cfg: dict[str, Any], initial_price: Decimal) -> tuple[bool, str]:
+    """Genera el resumen previo de arranque y valida fondos/presupuesto."""
+    try:
+        step, levels = _build_grid_levels_for_start(cfg, initial_price)
+    except Exception as exc:
+        return False, f"❌ Configuración inválida: {exc}"
+
+    base_size = Decimal(str(cfg["base_size"]))
+    if base_size <= 0:
+        return False, "❌ Configuración inválida: base_size debe ser mayor que cero."
+
+    center = Decimal(str(initial_price)).quantize(TICK_SIZE, rounding=ROUND_DOWN)
+    buy_prices = [lvl for lvl in levels if lvl < center]
+    sell_prices = [lvl for lvl in levels if lvl > center]
+
+    required_usdc = sum((base_size * price for price in buy_prices), Decimal("0"))
+    required_btc = base_size * Decimal(len(sell_prices))
+    required_btc_value = required_btc * center
+    total_required_value = required_usdc + required_btc_value
+
+    usdc_balance, btc_balance, logs = _read_available_balances_for_telegram()
+    for log_item in logs:
+        log_event(f"[TELEGRAM] {log_item['msg']}", log_item.get("level", "info"))
+
+    if usdc_balance is None or btc_balance is None:
+        return False, "❌ No se pudieron leer balances fiables para validar el arranque."
+
+    current_total_value = usdc_balance + (btc_balance * center)
+    configured_budget = Decimal(str(cfg["bot_usdc_budget"]))
+    effective_budget = configured_budget if configured_budget > 0 else current_total_value
+    budget_label = _format_budget(configured_budget)
+
+    missing_btc = required_btc - btc_balance
+    if missing_btc < 0:
+        missing_btc = Decimal("0")
+    missing_btc_cost = missing_btc * center
+
+    budget_ok = effective_budget >= total_required_value
+    usdc_ok = usdc_balance >= required_usdc
+    btc_ok = btc_balance >= required_btc
+    ok = budget_ok and usdc_ok and btc_ok
+
+    lines = [
+        "🚀 *PREVIEW START ENGINE*",
+        "```",
+        f"Symbol             : {SYMBOL}",
+        f"Precio inicial     : {_price_key(center)} USDC",
+        f"Step calculado     : {_price_key(step)} USDC ({fmt_amount(Decimal(str(cfg['step_percent'])) * Decimal('100'))}%)",
+        f"Levels below/above : {cfg['levels_below']} / {cfg['levels_above']}",
+        f"Base size          : {fmt_amount(base_size)} BTC",
+        f"Trailing up/down   : {str(cfg['trailing_up']).upper()} / {str(cfg['trailing_down']).upper()}",
+        "",
+        "Fondos necesarios",
+        f"USDC para BUYs     : {_price_key(required_usdc)} USDC",
+        f"BTC para SELLs     : {fmt_amount(required_btc)} BTC",
+        f"Valor BTC estim.   : {_price_key(required_btc_value)} USDC",
+        f"Capital estimado   : {_price_key(total_required_value)} USDC",
+        "",
+        "Balance disponible",
+        f"USDC disponible    : {_price_key(usdc_balance)} USDC",
+        f"BTC disponible     : {fmt_amount(btc_balance)} BTC",
+        f"Valor cuenta estim.: {_price_key(current_total_value)} USDC",
+        f"Saldo asignado bot : {budget_label}",
+    ]
+
+    if missing_btc > 0:
+        lines.extend([
+            "",
+            "BTC inicial faltante",
+            f"BTC a comprar      : {fmt_amount(missing_btc)} BTC",
+            f"Coste estimado     : {_price_key(missing_btc_cost)} USDC",
+        ])
+
+    lines.append("```")
+
+    if ok:
+        lines.append("✅ Fondos suficientes. Responde /confirm para iniciar o /abort para cancelar.")
+    else:
+        reasons: list[str] = []
+        if not budget_ok:
+            reasons.append(
+                f"presupuesto asignado insuficiente ({_price_key(effective_budget)} < {_price_key(total_required_value)} USDC)"
+            )
+        if not usdc_ok:
+            reasons.append(
+                f"USDC insuficiente para BUYs ({_price_key(usdc_balance)} < {_price_key(required_usdc)})"
+            )
+        if not btc_ok:
+            reasons.append(
+                f"BTC insuficiente para SELLs ({fmt_amount(btc_balance)} < {fmt_amount(required_btc)})"
+            )
+        lines.append("❌ No se puede iniciar: " + "; ".join(reasons) + ".")
+
+    return ok, "\n".join(lines)
+
+
+async def _execute_start_engine(
+    message: Message,
+    *,
+    recover_state: bool,
+    initial_price: Optional[Decimal],
+    cfg: Optional[dict[str, Any]] = None,
+) -> None:
+    """Inicializa y arranca el engine desde Telegram con la configuración indicada."""
+    if recover_state and not STATE_PATH.exists():
+        await message.reply_text("❌ Ya no existe estado previo que recuperar.")
+        return
+
+    cfg = cfg or _load_grid_config()
+
+    from engine import GridEngine
+
+    engine = GridEngine(
+        levels_below=int(cfg["levels_below"]),
+        levels_above=int(cfg["levels_above"]),
+        step_percent=Decimal(str(cfg["step_percent"])),
+        base_size=Decimal(str(cfg["base_size"])),
+        initial_price=initial_price,
+    )
+
+    if not recover_state:
+        engine.set_trailing(str(cfg["trailing_up"]), str(cfg["trailing_down"]))
+
+    try:
+        engine.initialize(recover_state=recover_state)
+    except Exception as exc:
+        log_event(f"[TELEGRAM] No se pudo inicializar el engine: {exc}", "error")
+        await message.reply_text(f"❌ No se pudo inicializar el engine: {exc}")
+        return
+
+    thread = threading.Thread(
+        target=engine.run,
+        daemon=True,
+        name="GridEngineThread",
+    )
+    thread.start()
+
+    _state.engine = engine
+    _state.engine_thread = thread
+
+    if recover_state:
+        log_event("[TELEGRAM] Engine iniciado via Telegram recuperando estado.", "info")
+        await message.reply_text("✅ Engine en marcha recuperando estado previo.")
+    else:
+        log_event("[TELEGRAM] Engine iniciado via Telegram desde configuración guardada.", "info")
+        await message.reply_text("✅ Engine en marcha con la configuración guardada.")
+
+
 # =========================================================
 # Notificaciones (llamadas desde el engine)
 # =========================================================
@@ -429,6 +740,125 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await message.reply_text(f"💰 *BALANCE*\n```\n{balance_text}\n```", parse_mode="Markdown")
 
 
+async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    del context
+    if not _authorized(update):
+        return
+
+    message = _get_message(update)
+    if message is None:
+        return
+
+    try:
+        cfg = _load_grid_config()
+        await message.reply_text(_format_grid_config(cfg), parse_mode="Markdown")
+    except Exception as exc:
+        log_event(f"[TELEGRAM] Error leyendo configuración: {exc}", "error")
+        await message.reply_text(f"❌ No se pudo leer la configuración: {exc}")
+
+
+async def cmd_set_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        return
+
+    message = _get_message(update)
+    if message is None:
+        return
+
+    args = context.args or []
+    if len(args) < 2:
+        await message.reply_text(_set_config_usage(), parse_mode="Markdown")
+        return
+
+    key_raw = args[0].strip().lower().replace("-", "_")
+    value_raw = " ".join(args[1:]).strip()
+    aliases = {
+        "below": "levels_below",
+        "abajo": "levels_below",
+        "levels_below": "levels_below",
+        "above": "levels_above",
+        "arriba": "levels_above",
+        "levels_above": "levels_above",
+        "size": "base_size",
+        "base_size": "base_size",
+        "step": "step_percent",
+        "step_percent": "step_percent",
+        "tu": "trailing_up",
+        "up": "trailing_up",
+        "trailing_up": "trailing_up",
+        "td": "trailing_down",
+        "down": "trailing_down",
+        "trailing_down": "trailing_down",
+        "budget": "bot_usdc_budget",
+        "saldo": "bot_usdc_budget",
+        "bot_budget": "bot_usdc_budget",
+        "bot_usdc_budget": "bot_usdc_budget",
+    }
+    key = aliases.get(key_raw)
+    if key is None:
+        await message.reply_text(_set_config_usage(), parse_mode="Markdown")
+        return
+
+    try:
+        cfg = _load_grid_config()
+
+        if key in {"levels_below", "levels_above"}:
+            parsed_int = int(value_raw)
+            if parsed_int < 0:
+                raise ValueError("los niveles no pueden ser negativos")
+            cfg[key] = parsed_int
+
+        elif key == "base_size":
+            parsed_decimal = Decimal(value_raw.replace(",", "."))
+            if parsed_decimal <= 0:
+                raise ValueError("base_size debe ser mayor que cero")
+            cfg[key] = parsed_decimal
+
+        elif key == "step_percent":
+            parsed_percent = _parse_percent_value(value_raw)
+            if parsed_percent <= 0:
+                raise ValueError("step_percent debe ser mayor que cero")
+            cfg[key] = parsed_percent
+
+        elif key == "trailing_up":
+            parsed_mode = parse_trailing_up_mode(value_raw)
+            if parsed_mode is None:
+                raise ValueError("trailing_up debe ser off, on o extended")
+            cfg[key] = parsed_mode
+
+        elif key == "trailing_down":
+            parsed_mode = parse_trailing_down_mode(value_raw)
+            if parsed_mode is None:
+                raise ValueError("trailing_down debe ser off, on o extended")
+            cfg[key] = parsed_mode
+
+        elif key == "bot_usdc_budget":
+            normalized = value_raw.strip().lower()
+            if normalized in {"max", "todo", "all"}:
+                usdc_balance, _, logs = _read_available_balances_for_telegram()
+                for log_item in logs:
+                    log_event(f"[TELEGRAM] {log_item['msg']}", log_item.get("level", "info"))
+                if usdc_balance is None:
+                    raise ValueError("no se pudo leer el USDC disponible")
+                cfg[key] = usdc_balance
+            else:
+                parsed_budget = Decimal(value_raw.replace(",", "."))
+                if parsed_budget < 0:
+                    raise ValueError("bot_usdc_budget no puede ser negativo")
+                cfg[key] = parsed_budget
+
+        _save_grid_config_from_dict(cfg)
+
+    except Exception as exc:
+        await message.reply_text(f"❌ Valor inválido para `{key}`: {exc}", parse_mode="Markdown")
+        return
+
+    await message.reply_text(
+        f"✅ Configuración actualizada: `{key}` = `{cfg[key]}`\n\n" + _format_grid_config(cfg),
+        parse_mode="Markdown",
+    )
+
+
 async def cmd_trailings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return
@@ -487,7 +917,6 @@ async def cmd_trailings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def cmd_start_engine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    del context
     if not _authorized(update):
         return
 
@@ -499,55 +928,68 @@ async def cmd_start_engine(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await message.reply_text("⚠️ El engine ya está corriendo.")
         return
 
-    from engine import GridEngine
+    args = [arg.strip().lower() for arg in (context.args or [])]
+    cfg = _load_grid_config()
 
-    recover_state = STATE_PATH.exists()
-    initial_price: Optional[Decimal] = None
-
-    if recover_state:
-        await message.reply_text("📂 Estado previo detectado — recuperando grid...")
-    else:
-        current_price, logs = get_current_price()
-        for log_item in logs:
-            log_event(f"[TELEGRAM] {log_item['msg']}", log_item.get("level", "info"))
-
-        if current_price is None:
-            await message.reply_text("❌ No se pudo obtener precio actual para iniciar el grid.")
-            return
-
-        initial_price = current_price
+    valid_args = {"recover", "recuperar", "fresh", "new", "nuevo", "desde_cero", "reset"}
+    if args and args[0] not in valid_args:
         await message.reply_text(
-            f"🚀 Iniciando grid desde cero con precio inicial `{_price_key(initial_price)} USDC`...",
+            "Uso:\n"
+            "`/start_engine`\n"
+            "`/start_engine recover`\n"
+            "`/start_engine fresh`",
             parse_mode="Markdown",
         )
-
-    engine = GridEngine(
-        levels_below=DEFAULT_GRID_LEVELS_BELOW,
-        levels_above=DEFAULT_GRID_LEVELS_ABOVE,
-        step_percent=DEFAULT_STEP_PERCENT,
-        base_size=DEFAULT_BASE_SIZE,
-        initial_price=initial_price,
-    )
-
-    try:
-        engine.initialize(recover_state=recover_state)
-    except Exception as exc:
-        log_event(f"[TELEGRAM] No se pudo inicializar el engine: {exc}", "error")
-        await message.reply_text(f"❌ No se pudo inicializar el engine: {exc}")
         return
 
-    thread = threading.Thread(
-        target=engine.run,
-        daemon=True,
-        name="GridEngineThread",
+    force_fresh = bool(args and args[0] in {"fresh", "new", "nuevo", "desde_cero", "reset"})
+    force_recover = bool(args and args[0] in {"recover", "recuperar"})
+    has_state = STATE_PATH.exists()
+
+    if has_state and not force_fresh:
+        _state.pending_confirm = (
+            "start_engine",
+            {
+                "recover_state": True,
+                "initial_price": None,
+                "cfg": cfg,
+            },
+        )
+        extra = "" if force_recover else "\n\nPara ignorar el estado y arrancar desde cero usa `/start_engine fresh`."
+        await message.reply_text(
+            "📂 Estado previo detectado.\n"
+            "Responde /confirm para recuperar el grid o /abort para cancelar."
+            f"{extra}",
+            parse_mode="Markdown",
+        )
+        return
+
+    if force_recover and not has_state:
+        await message.reply_text("⚪ No hay estado previo que recuperar.")
+        return
+
+    current_price, logs = get_current_price()
+    for log_item in logs:
+        log_event(f"[TELEGRAM] {log_item['msg']}", log_item.get("level", "info"))
+
+    if current_price is None:
+        await message.reply_text("❌ No se pudo obtener precio actual para iniciar el grid.")
+        return
+
+    ok, preflight_text = _build_start_preflight_text(cfg, current_price)
+    await message.reply_text(preflight_text, parse_mode="Markdown")
+
+    if not ok:
+        return
+
+    _state.pending_confirm = (
+        "start_engine",
+        {
+            "recover_state": False,
+            "initial_price": current_price,
+            "cfg": cfg,
+        },
     )
-    thread.start()
-
-    _state.engine = engine
-    _state.engine_thread = thread
-
-    log_event("[TELEGRAM] Engine iniciado via Telegram.", "info")
-    await message.reply_text("✅ Engine en marcha.")
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     del context
@@ -672,6 +1114,19 @@ async def cmd_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     action, kwargs = _state.pending_confirm
     _state.pending_confirm = None
+
+    if action == "start_engine":
+        if _engine_running():
+            await message.reply_text("⚠️ El engine ya está corriendo.")
+            return
+
+        await _execute_start_engine(
+            message,
+            recover_state=bool(kwargs.get("recover_state", False)),
+            initial_price=cast(Optional[Decimal], kwargs.get("initial_price")),
+            cfg=cast(Optional[dict[str, Any]], kwargs.get("cfg")),
+        )
+        return
 
     if action == "stop":
         engine = _get_engine()
@@ -1149,6 +1604,8 @@ def start_telegram_bot() -> None:
         app.add_handler(CommandHandler("status", cmd_status))
         app.add_handler(CommandHandler("grid", cmd_grid))
         app.add_handler(CommandHandler("balance", cmd_balance))
+        app.add_handler(CommandHandler("config", cmd_config))
+        app.add_handler(CommandHandler("set_config", cmd_set_config))
         app.add_handler(CommandHandler("trailings", cmd_trailings))
         app.add_handler(CommandHandler("start_engine", cmd_start_engine))
         app.add_handler(CommandHandler("stop", cmd_stop))
