@@ -195,11 +195,6 @@ class PaperGridEngine(GridEngine):
             "placed_at": time.time(),
         })
 
-        # FIX Bug 1: paired_buy_price se asigna siempre para SELLs, salvo que
-        # el metadata ya lo traiga (órdenes extended que lo calculan explícitamente).
-        # La condición original "metadata is None" excluía las SELLs de trailing-up
-        # (metadata = {"trailing_up_step": N}), haciendo que se usase center_price
-        # como coste base en lugar del BUY real, sobreestimando realized_profit.
         if side == "sell":
             metadata_has_paired = (
                 isinstance(metadata, dict) and "paired_buy_price" in metadata
@@ -425,9 +420,6 @@ def _select_trade_fill_keys(
     snapshot = engine.get_runtime_snapshot()["active_orders"]
 
     if trade_price > previous_price:
-        # FIX Bug 4: el rango es exclusivo en el extremo inferior (previous_price)
-        # para evitar doble-fill en niveles de frontera. Un SELL en previous_price
-        # ya habría sido procesado en el ciclo anterior si existía.
         return sorted(
             [
                 key
@@ -627,11 +619,6 @@ def run_grid_backtest(
     fills: list[dict[str, str]] = []
     last_price = center
 
-    # FIX Bug 3: inicializar previous_price con el precio del primer trade real,
-    # no con center. Si se usa center y el mercado abre lejos (ej. center=75000,
-    # primer trade=71000), todos los BUYs entre ambos se ejecutan de golpe en el
-    # primer ciclo, produciendo un estado irreal. Usando el primer trade como punto
-    # de partida, el grid solo reacciona a movimientos a partir de ese instante.
     previous_price = _trade_price(trades[0]) if trades else center
     for trade in trades:
         trade_price = _trade_price(trade)
