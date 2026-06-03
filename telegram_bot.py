@@ -2,12 +2,14 @@
 telegram_bot.py — Interfaz de control y monitorización via Telegram.
 
 Comandos disponibles:
+  /help      — muestra ayuda con comandos disponibles
   /status    — precio actual, órdenes activas, fills de sesión y trailings
   /grid      — niveles del grid con órdenes
   /balance   — balances disponibles y fondos comprometidos en el grid
   /config    — muestra la configuración guardada del grid
   /set_config — cambia un valor de configuración guardada
   /trailings — muestra o configura trailing up/down
+  /analyze   — resumen de fills emparejados y beneficio estimado
   /taxstatus — resumen FIFO fiscal
   /taxlots   — lotes FIFO abiertos
   /taxunmatched — incidencias FIFO
@@ -18,6 +20,8 @@ Comandos disponibles:
   /stop      — detiene el engine (requiere confirmación)
   /add_order — añade una orden manual (guiado por pasos)
   /cancel    — cancela una orden por precio (requiere confirmación)
+  /confirm   — confirma una acción pendiente
+  /abort     — cancela una acción pendiente
 
 Notificaciones automáticas:
   - Fill confirmado
@@ -634,6 +638,59 @@ async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_T
 # =========================================================
 # Handlers de comandos
 # =========================================================
+
+def _build_help_text() -> str:
+    """Construye la ayuda visible del bot de Telegram."""
+    return "\n".join([
+        "🤖 *GRID BOT — AYUDA*",
+        "",
+        "*Estado y monitorización*",
+        "`/status` — estado del engine, precio, órdenes, fills y trailings",
+        "`/grid` — niveles del grid y órdenes registradas",
+        "`/balance` — saldos disponibles y fondos comprometidos en el grid",
+        "`/analyze` — resumen de fills emparejados y beneficio estimado",
+        "",
+        "*Configuración*",
+        "`/config` — muestra la configuración guardada del grid",
+        "`/set_config clave valor` — cambia un valor de configuración",
+        "`/trailings` — muestra trailing up/down del engine activo",
+        "`/trailings up off|on|extended` — cambia trailing up en caliente",
+        "`/trailings down off|on|extended` — cambia trailing down en caliente",
+        "",
+        "*Arranque, parada y órdenes*",
+        "`/start_engine` — previsualiza y arranca el engine con confirmación",
+        "`/start_engine recover` — recupera estado previo si existe",
+        "`/start_engine fresh` — ignora estado previo y arranca desde cero",
+        "`/stop` — detiene el engine; conserva órdenes del exchange",
+        "`/add_order` — añade una orden manual guiada por pasos",
+        "`/cancel` — cancela una orden real por precio con confirmación",
+        "`/confirm` — confirma una acción pendiente",
+        "`/abort` — cancela una acción pendiente",
+        "",
+        "*Fiscal FIFO*",
+        "`/taxstatus` — resumen del ledger FIFO fiscal",
+        "`/taxlots [limite]` — lista lotes FIFO abiertos",
+        "`/taxunmatched [limite]` — lista ventas sin lotes suficientes",
+        "`/taxsim precio [cantidad_btc]` — simula una venta FIFO sin modificar archivos",
+        "`/taxaddlot fecha precio cantidad_btc [nota]` — importa un lote manual",
+        "`/taxreport` — envía los archivos fiscales disponibles",
+        "",
+        "Las acciones sensibles quedan pendientes hasta responder `/confirm` o `/abort`.",
+    ])
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Muestra la lista de comandos disponibles y su uso básico."""
+    del context
+    if not _authorized(update):
+        return
+
+    message = _get_message(update)
+    if message is None:
+        return
+
+    await message.reply_text(_build_help_text(), parse_mode="Markdown")
+
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     del context
@@ -1601,6 +1658,7 @@ def start_telegram_bot() -> None:
         app = Application.builder().token(token).build()
         _app = app
 
+        app.add_handler(CommandHandler("help", cmd_help))
         app.add_handler(CommandHandler("status", cmd_status))
         app.add_handler(CommandHandler("grid", cmd_grid))
         app.add_handler(CommandHandler("balance", cmd_balance))
