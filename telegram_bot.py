@@ -233,8 +233,9 @@ def _format_trailing_status(engine: "GridEngine") -> str:
         f"Trailing up   : `{trailing_mode_label(up_mode)}`\n"
         f"Trailing down : `{trailing_mode_label(down_mode)}`\n\n"
         "Cambiar configuración:\n"
-        "`/trailings up off`, `/trailings up on` o `/trailings up extended`\n"
-        "`/trailings down off`, `/trailings down on` o `/trailings down extended`"
+        "`/trailings up off|on|extended|fixed_quote`\n"
+        "`/trailings down off|on|extended`\n\n"
+        "Al poner un trailing en `off`, se eliminan sus órdenes virtuales pendientes."
     )
 
 

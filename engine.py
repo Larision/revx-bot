@@ -55,26 +55,28 @@ class GridEngine:
         recuperación tras reinicios.
 
         Trailings:
-        - trailing up on: al ejecutar el ultimo SELL, se añade un SELL virtual encima.
-            Al ejecutarse ese SELL virtual, se crea la orden BUY real correspondiente 
-            y se recrea otro SELL virtual encima.
-            Se cancelan ordenes BUY reales bajos para liberar USDC si es necesario.
-        - trailing up extended: igual pero con tamaños decrecientes en los SELL virtuales
-            para reducir el riesgo de sobreextensión. El tamaño de cada SELL virtual se reduce
-            un 2.5% respecto al anterior, hasta un mínimo del 50% de base_size.
-            El grid principal mantiene el tamaño base.
-            Se cancelan ordenes BUY reales bajos para liberar USDC si es necesario.
-        - trailing up fixed_quote: usa un quote fijo igual al valor USDC de la última
-            línea superior original del grid. Cada BUY creado por trailing up usa
-            size = quote_fijo / precio_buy, y el SELL posterior mantiene ese size.
-        - trailing down on: al ejecutar el ultimo BUY, se añade un BUY virtual debajo.
-            Al ejecutarse ese BUY virtual, se crea la orden SELL real correspondiente y
-            se recrea otro BUY virtual debajo.
-            Se cancelan ordenes SELL reales altos para liberar BTC si es necesario.
-        - trailing down extended: igual pero los BUY virtuales añadidos por el trailing down 
-            tienen la mitad del tamaño base para reducir el riesgo de sobreextensión.
-            Se cancelan ordenes SELL reales altos para liberar BTC si es necesario.
-            El grid principal mantiene el tamaño.
+        - trailing up
+            - on: al ejecutar el ultimo SELL, se añade un SELL virtual encima.
+                Al ejecutarse ese SELL virtual, se crea la orden BUY real correspondiente 
+                y se recrea otro SELL virtual encima.
+                Se cancelan ordenes BUY reales bajos para liberar USDC si es necesario.
+            - extended: igual pero con tamaños decrecientes en los SELL virtuales
+                para reducir el riesgo de sobreextensión. El tamaño de cada SELL virtual se reduce
+                un 2.5% respecto al anterior, hasta un mínimo del 50% de base_size.
+                El grid principal mantiene el tamaño base.
+                Se cancelan ordenes BUY reales bajos para liberar USDC si es necesario.
+            - fixed_quote: usa un quote fijo igual al valor USDC de la última
+                línea superior original del grid. Cada BUY creado por trailing up usa
+                size = quote_fijo / precio_buy, y el SELL posterior mantiene ese size.
+        - trailing down
+            - on: al ejecutar el ultimo BUY, se añade un BUY virtual debajo.
+                Al ejecutarse ese BUY virtual, se crea la orden SELL real correspondiente y
+                se recrea otro BUY virtual debajo.
+                Se cancelan ordenes SELL reales altos para liberar BTC si es necesario.
+            - extended: igual pero los BUY virtuales añadidos por el trailing down 
+                tienen la mitad del tamaño base para reducir el riesgo de sobreextensión.
+                Se cancelan ordenes SELL reales altos para liberar BTC si es necesario.
+                El grid principal mantiene el tamaño.
 
     """
 
@@ -845,6 +847,8 @@ class GridEngine:
         """Actualiza la configuracion de trailing sin reiniciar el engine."""
         up_mode = self._normalise_trailing_up_mode(up)
         down_mode = self._normalise_trailing_down_mode(down)
+        removed_virtuals: List[str] = []
+
         with self._state_lock:
             self.trailing_up_mode = up_mode
             self.trailing_up_enabled = up_mode != 'off'
@@ -855,10 +859,49 @@ class GridEngine:
             if down_mode != 'extended':
                 self._trailing_down_extended_drops = 0
 
+            keys_to_remove: set[str] = set()
+            for key, info in list(self.active_orders.items()):
+                order_id = str(info.get("order_id"))
+                if order_id != "virtual":
+                    continue
+
+                side = str(info.get("side"))
+                if up_mode == "off" and side == "sell":
+                    keys_to_remove.add(key)
+                    removed_virtuals.append(f"SELL {key}")
+                elif down_mode == "off" and side == "buy":
+                    keys_to_remove.add(key)
+                    removed_virtuals.append(f"BUY {key}")
+
+            if keys_to_remove:
+                for key in keys_to_remove:
+                    self.active_orders.pop(key, None)
+                    self.extended_levels.pop(key, None)
+
+                self.levels = [
+                    level for level in self.levels
+                    if _price_key(level) not in keys_to_remove
+                ]
+
         log_event(
             f"[ENGINE] Trailing actualizado → up: {up_mode.upper()} | down: {down_mode.upper()}",
             'info'
         )
+        if removed_virtuals:
+            log_event(
+                "[ENGINE] Virtuales eliminadas por trailing OFF: "
+                + ", ".join(sorted(removed_virtuals)),
+                "info",
+            )
+
+        with self._state_lock:
+            should_save_state = (
+                self.center_price is not None
+                and self.step is not None
+                and bool(self.levels)
+            )
+        if should_save_state:
+            self.save_state()
 
     # ----------------------------------------------------------
     # SNAPSHOTS / THREAD SAFETY
