@@ -732,29 +732,37 @@ def prompt_backtest() -> None:
             raw = input_with_esc(f"{label} [{default}]: ").strip()
             return raw or default
 
-        def ask_trailing_mode(label: str, default: str) -> str:
+        def _normalize_trailing_alias(value: str) -> str:
+            normalized = value.strip().lower()
+            if normalized in {"quote", "quote_fijo", "fixed-quote", "fixedquote"}:
+                return "fixed_quote"
+            return normalized
+
+        def ask_trailing_mode(label: str, default: str, valid_modes: set[str]) -> str:
             """Pregunta por el modo de trailing y valida la respuesta."""
+            options = "/".join(sorted(valid_modes))
             while True:
-                raw = input_with_esc(f"{label} (off/on/extended) [{default}]: ").strip().lower()
+                raw = input_with_esc(f"{label} ({options}) [{default}]: ").strip().lower()
                 if not raw:
                     return default
-                if raw in ("off", "on", "extended"):
-                    return raw
-                print("Opción inválida. Debe ser off, on o extended.")
+                normalized = _normalize_trailing_alias(raw)
+                if normalized in valid_modes:
+                    return normalized
+                print(f"Opción inválida. Debe ser uno de: {options}.")
 
-        def ask_trailing_modes(label: str, default: str) -> list[str]:
+        def ask_trailing_modes(label: str, default: str, valid_modes: set[str]) -> list[str]:
             """Pregunta por uno o varios modos de trailing separados por comas."""
-            valid_modes = {"off", "on", "extended"}
+            options = "/".join(sorted(valid_modes))
             while True:
-                raw = input_with_esc(f"{label} (off/on/extended, separados por comas) [{default}]: ").strip().lower()
+                raw = input_with_esc(f"{label} ({options}, separados por comas) [{default}]: ").strip().lower()
                 if not raw:
                     raw = default
 
-                values = [part.strip() for part in raw.split(",") if part.strip()]
+                values = [_normalize_trailing_alias(part) for part in raw.split(",") if part.strip()]
                 if values and all(value in valid_modes for value in values):
                     return values
 
-                print("Opcion invalida. Usa off, on, extended o una lista separada por comas.")
+                print(f"Opcion invalida. Usa {options} o una lista separada por comas.")
 
         def ask_non_negative_int(label: str, default: int) -> int:
             while True:
@@ -840,8 +848,16 @@ def prompt_backtest() -> None:
 
         start_date = ask_date("Fecha inicio (YYYYMMDD)", start_default)
         end_date = ask_date("Fecha final (YYYYMMDD)", end_default)
-        trailing_ups = ask_trailing_modes("Trailing up", default_trailing_up)
-        trailing_downs = ask_trailing_modes("Trailing down", default_trailing_down)
+        trailing_ups = ask_trailing_modes(
+            "Trailing up",
+            default_trailing_up,
+            {"off", "on", "extended", "fixed_quote"},
+        )
+        trailing_downs = ask_trailing_modes(
+            "Trailing down",
+            default_trailing_down,
+            {"off", "on", "extended"},
+        )
         run_combos = [
             (size, step, trailing_up, trailing_down)
             for size, step in valid_combos

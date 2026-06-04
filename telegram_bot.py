@@ -274,7 +274,7 @@ def _apply_trailing_config(
     new_up = current_up if trailing_up is None else _normalize_trailing_up_mode(trailing_up)
     new_down = current_down if trailing_down is None else _normalize_trailing_down_mode(trailing_down)
 
-    if new_up not in {"off", "on", "extended"}:
+    if new_up not in {"off", "on", "extended", "fixed_quote"}:
         return False, "Modo de trailing up inválido."
     if new_down not in {"off", "on", "extended"}:
         return False, "Modo de trailing down inválido."
@@ -399,7 +399,7 @@ def _set_config_usage() -> str:
         "`/set_config levels_above 3`\n"
         "`/set_config base_size 0.00008`\n"
         "`/set_config step_percent 0.2%`\n"
-        "`/set_config trailing_up off|on|extended`\n"
+        "`/set_config trailing_up off|on|extended|fixed_quote`\n"
         "`/set_config trailing_down off|on|extended`\n"
         "`/set_config bot_usdc_budget 1000`\n"
         "También puedes usar `max` en bot_usdc_budget para tomar el USDC disponible."
@@ -654,7 +654,7 @@ def _build_help_text() -> str:
         "`/config` — muestra la configuración guardada del grid",
         "`/set_config clave valor` — cambia un valor de configuración",
         "`/trailings` — muestra trailing up/down del engine activo",
-        "`/trailings up off|on|extended` — cambia trailing up en caliente",
+        "`/trailings up off|on|extended|fixed_quote` — cambia trailing up en caliente",
         "`/trailings down off|on|extended` — cambia trailing down en caliente",
         "",
         "*Arranque, parada y órdenes*",
@@ -880,7 +880,7 @@ async def cmd_set_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         elif key == "trailing_up":
             parsed_mode = parse_trailing_up_mode(value_raw)
             if parsed_mode is None:
-                raise ValueError("trailing_up debe ser off, on o extended")
+                raise ValueError("trailing_up debe ser off, on, extended o fixed_quote")
             cfg[key] = parsed_mode
 
         elif key == "trailing_down":
@@ -943,7 +943,7 @@ async def cmd_trailings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await message.reply_text(
             "Uso:\n"
             "`/trailings`\n"
-            "`/trailings up off|on|extended`\n"
+            "`/trailings up off|on|extended|fixed_quote`\n"
             "`/trailings down off|on|extended`",
             parse_mode="Markdown",
         )
@@ -954,7 +954,7 @@ async def cmd_trailings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if target == "up":
         mode = _parse_trailing_up_mode(value)
         if mode is None:
-            await message.reply_text("Valor inválido. Usa `off`, `on` o `extended`.", parse_mode="Markdown")
+            await message.reply_text("Valor inválido. Usa `off`, `on`, `extended` o `fixed_quote`.", parse_mode="Markdown")
             return
         ok, response = _apply_trailing_config(eng, trailing_up=mode)
 

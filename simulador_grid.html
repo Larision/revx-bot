@@ -44,7 +44,7 @@ h1{font-size:15px;font-weight:600;margin-bottom:12px;letter-spacing:.4px}
 .tbtn.act-off{background:#1a0a0a;border-color:#7f1d1d;color:var(--red)}
 .tbtn.act-on {background:#052e16;border-color:#166534;color:var(--green)}
 .tbtn.act-ext{background:var(--blue-bg);border-color:#1e40af;color:var(--blue)}
-.mbar{display:grid;grid-template-columns:repeat(7,1fr);gap:5px;margin-bottom:10px}
+.mbar{display:grid;grid-template-columns:repeat(8,1fr);gap:5px;margin-bottom:10px}
 .mc{background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:6px 10px}
 .ml{font-size:10px;color:var(--text3);margin-bottom:2px}
 .mv{font-size:12px;font-weight:600}
@@ -107,6 +107,7 @@ button.act:hover{background:var(--border)}
       <button class="tbtn" data-dir="up" data-val="off"      onclick="setTrailing('up','off')">OFF</button>
       <button class="tbtn" data-dir="up" data-val="on"       onclick="setTrailing('up','on')">ON</button>
       <button class="tbtn" data-dir="up" data-val="extended" onclick="setTrailing('up','extended')">EXT</button>
+      <button class="tbtn" data-dir="up" data-val="fixed_quote" onclick="setTrailing('up','fixed_quote')">QUOTE</button>
     </div>
   </div>
   <div class="tgroup">
@@ -157,6 +158,8 @@ function extSize(s){ return r5(s.base_size*0.5); }
 function tuFactor(n){ return Math.max(0.50, 1-0.025*n); }
 function tuSize(s,n){ return r5(s.base_size*tuFactor(n)); }
 function tuStepFrom(o){ return (o.trailing_up_step!=null&&o.trailing_up_step>0)?o.trailing_up_step:0; }
+function tuFixedQuote(s){ return r2(s.anchor_high*s.base_size); }
+function tuFixedQuoteSize(s,price){ return r5(tuFixedQuote(s)/price); }
 
 // ── state factory ─────────────────────────────────────────────────────────────
 function mkS(cfg={}){
@@ -173,6 +176,7 @@ function mkS(cfg={}){
     trailing_up:CFG_UP,trailing_down:CFG_DN,
     drops:0,up_steps:0,fc:0,si:0,
     levels,ext:Object.create(null),orders,
+    anchor_high:r2(price+lines*step),
     usdc:5.00,btc:0.00,
     log:[
       {c:"fill",t:`INIT | price=${price} step=${step} size=${size}`},
@@ -198,7 +202,8 @@ function renderButtons(){
   ["up","dn"].forEach(dir=>{
     const val=dir==="up"?CFG_UP:CFG_DN;
     document.querySelectorAll(`[data-dir="${dir}"]`).forEach(b=>{
-      b.className="tbtn"+(b.dataset.val===val?` act-${val==="extended"?"ext":val}`:"");
+      const cls = val==="extended"||val==="fixed_quote" ? "ext" : val;
+      b.className="tbtn"+(b.dataset.val===val?` act-${cls}`:"");
     });
   });
 }
@@ -451,6 +456,22 @@ function fill(key){
         }else{lg(s,"info",`  tu=ext: vSELL@${tpk} ya existe`);}
         lg(s,"fill",`  tu=ext: BUY@${pk(bp)} sz=${bsz.toFixed(5)} placed=${placed} step=${cur}`);
 
+      }else if(tu==="fixed_quote"){
+        const bsz=tuFixedQuoteSize(s,bp);
+        let placed=false;
+        if(!isV){placed=placeOrd(s,bp,"buy",bsz,false);}
+        else{
+          if(!releaseUsdc(s,bp,bsz))lg(s,"warn",`  ! BUY@${pk(bp)} omitido: USDC`);
+          else placed=placeOrd(s,bp,"buy",bsz,false);
+        }
+        if(!s.orders[tpk]){
+          s.up_steps=0;
+          const vsz=tuFixedQuoteSize(s,tp);
+          addVirt(s,tp,"sell",vsz,false);
+          lg(s,"fill",`  tu=quote: vSELL@${tpk} sz=${vsz.toFixed(5)} quote=${tuFixedQuote(s).toFixed(2)}`);
+        }else{lg(s,"info",`  tu=quote: vSELL@${tpk} ya existe`);}
+        lg(s,"fill",`  tu=quote: BUY@${pk(bp)} sz=${bsz.toFixed(5)} placed=${placed}`);
+
       }else if(tu==="on"){
         let placed=false;
         if(!isV){placed=placeOrd(s,bp,"buy",o.size,false);}
@@ -481,7 +502,10 @@ function fill(key){
 
   // ── SELL intermedio → BUY abajo ──────────────────────────────────────────
   if(!handled&&o.side==="sell"){
-    placeOrd(s,r2(o.price-bs),"buy",o.size,false,null,null,o.trailing_up_step??null);
+    const nbp=r2(o.price-bs);
+    const nsz=(tu==="fixed_quote"&&o.price>=s.anchor_high)?tuFixedQuoteSize(s,nbp):o.size;
+    const tmeta=(tu==="extended")?(o.trailing_up_step??null):null;
+    placeOrd(s,nbp,"buy",nsz,false,null,null,tmeta);
     lg(s,"","  SELL intermedio → BUY abajo"); handled=true;
   }
 
@@ -529,7 +553,7 @@ function render(){
   const mb=document.getElementById("mbar"); mb.innerHTML="";
   const tuc=tuSize(S,S.up_steps).toFixed(5);
   [["base_step",S.base_step],["ext_size",extSize(S).toFixed(5)],["drops",S.drops],
-   ["up_steps",S.up_steps],["tu_size",tuc],["USDC libre",S.usdc.toFixed(4)],["BTC libre",S.btc.toFixed(5)]]
+   ["up_steps",S.up_steps],["tu_size",tuc],["tu_quote",tuFixedQuote(S).toFixed(2)],["USDC libre",S.usdc.toFixed(4)],["BTC libre",S.btc.toFixed(5)]]
     .forEach(([l,v])=>{
       const d=document.createElement("div");d.className="mc";
       d.innerHTML=`<div class="ml">${l}</div><div class="mv">${v}</div>`;

@@ -1198,7 +1198,8 @@ def _trailing_menu(engine: "GridEngine") -> None:
 
     new_up = original_up
     new_down = original_down
-    cycle = ["off", "on", "extended"]
+    up_cycle = ["off", "on", "extended", "fixed_quote"]
+    down_cycle = ["off", "on", "extended"]
 
     while True:
         print("\n=== CONFIGURAR TRAILINGS ===")
@@ -1209,11 +1210,11 @@ def _trailing_menu(engine: "GridEngine") -> None:
         opcion = input("Opción: ").strip()
 
         if opcion == "1":
-            idx = cycle.index(new_up) if new_up in cycle else 0
-            new_up = cycle[(idx + 1) % len(cycle)]
+            idx = up_cycle.index(new_up) if new_up in up_cycle else 0
+            new_up = up_cycle[(idx + 1) % len(up_cycle)]
         elif opcion == "2":
-            idx = cycle.index(new_down) if new_down in cycle else 0
-            new_down = cycle[(idx + 1) % len(cycle)]
+            idx = down_cycle.index(new_down) if new_down in down_cycle else 0
+            new_down = down_cycle[(idx + 1) % len(down_cycle)]
         elif opcion == "3":
             if new_up != original_up or new_down != original_down:
                 confirm = input("¿Aplicar cambios? (s/n): ").strip().lower()
@@ -1787,11 +1788,13 @@ def run_cli() -> None:
                 except Exception:
                     log_event("[ERROR] Valor de step percent inválido, conservando el anterior.", "error")
 
-            new_trailing_up = input(f"Trailing up (off/on/extended) [{trailing_up_default}]: ").strip().lower()
-            if new_trailing_up and new_trailing_up in ("off", "on", "extended"):
+            new_trailing_up = input(f"Trailing up (off/on/extended/fixed_quote) [{trailing_up_default}]: ").strip().lower()
+            if new_trailing_up and new_trailing_up in {"quote", "quote_fijo", "fixed-quote", "fixedquote"}:
+                new_trailing_up = "fixed_quote"
+            if new_trailing_up and new_trailing_up in ("off", "on", "extended", "fixed_quote"):
                 trailing_up_default = new_trailing_up
             elif new_trailing_up:
-                log_event("[ERROR] Valor de trailing up inválido (debe ser off, on o extended), conservando el anterior.", "error")
+                log_event("[ERROR] Valor de trailing up inválido (debe ser off, on, extended o fixed_quote), conservando el anterior.", "error")
 
             new_trailing_down = input(f"Trailing down (off/on/extended) [{trailing_down_default}]: ").strip().lower()
             if new_trailing_down and new_trailing_down in ("off", "on", "extended"):

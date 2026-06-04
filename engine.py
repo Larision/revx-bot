@@ -64,6 +64,9 @@ class GridEngine:
             un 2.5% respecto al anterior, hasta un mínimo del 50% de base_size.
             El grid principal mantiene el tamaño base.
             Se cancelan ordenes BUY reales bajos para liberar USDC si es necesario.
+        - trailing up fixed_quote: usa un quote fijo igual al valor USDC de la última
+            línea superior original del grid. Cada BUY creado por trailing up usa
+            size = quote_fijo / precio_buy, y el SELL posterior mantiene ese size.
         - trailing down on: al ejecutar el ultimo BUY, se añade un BUY virtual debajo.
             Al ejecutarse ese BUY virtual, se crea la orden SELL real correspondiente y
             se recrea otro BUY virtual debajo.
@@ -116,7 +119,7 @@ class GridEngine:
         self._state_lock = threading.RLock()
 
         # Flags de trailing
-        self.trailing_up_mode: str = 'extended'  # 'off' | 'on' | 'extended'
+        self.trailing_up_mode: str = 'extended'  # 'off' | 'on' | 'extended' | 'fixed_quote'
         self.trailing_up_enabled: bool = True  # compatibilidad con estado antiguo
         self.trailing_down_mode: str = 'on'  # 'off' | 'on' | 'extended'
         self.trailing_down_enabled: bool = True  # compatibilidad con estado antiguo
@@ -205,6 +208,21 @@ class GridEngine:
     def _current_trailing_up_size(self) -> Decimal:
         """Tamaño que corresponde al contador actual de trailing up."""
         return self._trailing_up_size_for_steps(self._trailing_up_steps)
+
+    def _trailing_up_fixed_quote_locked(self) -> Decimal:
+        """Quote fijo del trailing up: ultima linea superior original * base_size."""
+        anchor_high = self._trailing_up_anchor_high_locked()
+        if anchor_high is None or self.base_size <= 0:
+            return Decimal("0")
+        return Decimal(str(anchor_high)) * self.base_size
+
+    def _trailing_up_fixed_quote_size_locked(self, price: Decimal) -> Decimal:
+        """Calcula size para fixed_quote usando quote_fijo / precio."""
+        price_dec = Decimal(str(price))
+        quote = self._trailing_up_fixed_quote_locked()
+        if quote <= 0 or price_dec <= 0:
+            return self.base_size
+        return quote / price_dec
 
     def _trailing_up_anchor_high_locked(self) -> Optional[Decimal]:
         """Techo original del grid principal, usado como ancla del trailing up."""
@@ -910,6 +928,7 @@ class GridEngine:
             "trailing_up_reduction_per_level": str(self.trailing_up_reduction_per_level),
             "trailing_up_min_factor": str(self.trailing_up_min_factor),
             "trailing_up_current_size": str(self._current_trailing_up_size()),
+            "trailing_up_fixed_quote": str(self._trailing_up_fixed_quote_locked()),
             "trailing_down_mode": self.trailing_down_mode,
             "trailing_down_enabled": self.trailing_down_enabled,
             "center_price": str(self.center_price) if self.center_price else None,
@@ -957,6 +976,7 @@ class GridEngine:
                 "trailing_up_reduction_per_level": self.trailing_up_reduction_per_level,
                 "trailing_up_min_factor": self.trailing_up_min_factor,
                 "trailing_up_current_size": self._current_trailing_up_size(),
+                "trailing_up_fixed_quote": self._trailing_up_fixed_quote_locked(),
                 "trailing_down_mode": self.trailing_down_mode,
                 "trailing_down_enabled": self.trailing_down_enabled,
                 "trailing_down_extended_drops": self._trailing_down_extended_drops,
@@ -2032,16 +2052,23 @@ class GridEngine:
                     getattr(self, "trailing_up_mode", self.trailing_up_enabled)
                 )
                 extended_trailing_up = trailing_up_mode == "extended"
+                fixed_quote_trailing_up = trailing_up_mode == "fixed_quote"
                 current_trailing_up_step = (
                     self._trailing_up_step_from_order_locked(price, "sell", info)
                     if extended_trailing_up else 0
                 )
                 next_buy_price = (price - base_step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
-                buy_metadata = (
-                    self._trailing_up_metadata_for_step(current_trailing_up_step)
-                    if extended_trailing_up else None
-                )
-                buy_size = self._trailing_up_size_from_metadata(buy_metadata, order_size)
+
+                if fixed_quote_trailing_up:
+                    buy_metadata = None
+                    buy_size = self._trailing_up_fixed_quote_size_locked(next_buy_price)
+                else:
+                    buy_metadata = (
+                        self._trailing_up_metadata_for_step(current_trailing_up_step)
+                        if extended_trailing_up else None
+                    )
+                    buy_size = self._trailing_up_size_from_metadata(buy_metadata, order_size)
+
                 orders_to_place.append((
                     next_buy_price,
                     "buy",
@@ -2064,6 +2091,11 @@ class GridEngine:
                                 order_size,
                             )
                             self._trailing_up_steps = next_trailing_up_steps
+                        elif fixed_quote_trailing_up:
+                            next_trailing_up_steps = 0
+                            trailing_up_size = self._trailing_up_fixed_quote_size_locked(trail_up_price)
+                            virtual_metadata = None
+                            self._trailing_up_steps = 0
                         else:
                             next_trailing_up_steps = 0
                             trailing_up_size = order_size
@@ -2088,7 +2120,7 @@ class GridEngine:
                             if is_virtual:
                                 trailing_logs.append(
                                     f"[ENGINE] Trailing up extended: virtual SELL {filled_key} activada; "
-                                    f"BUY {_price_key(next_buy_price)} size {fmt_amount(order_size)} y nueva "
+                                    f"BUY {_price_key(next_buy_price)} size {fmt_amount(buy_size)} y nueva "
                                     f"virtual SELL {trail_up_key} size {fmt_amount(trailing_up_size)} "
                                     f"(step {next_trailing_up_steps}, factor "
                                     f"{self._trailing_up_factor_for_steps(next_trailing_up_steps):.3f})"
@@ -2100,11 +2132,26 @@ class GridEngine:
                                     f"(step {next_trailing_up_steps}, factor "
                                     f"{self._trailing_up_factor_for_steps(next_trailing_up_steps):.3f})"
                                 )
+                        elif fixed_quote_trailing_up:
+                            quote = self._trailing_up_fixed_quote_locked()
+                            if is_virtual:
+                                trailing_logs.append(
+                                    f"[ENGINE] Trailing up fixed_quote: virtual SELL {filled_key} activada; "
+                                    f"BUY {_price_key(next_buy_price)} size {fmt_amount(buy_size)} "
+                                    f"(quote {_price_key(quote)}) y nueva virtual SELL {trail_up_key} "
+                                    f"size {fmt_amount(trailing_up_size)}"
+                                )
+                            else:
+                                trailing_logs.append(
+                                    f"[ENGINE] Rebalance trailing up fixed_quote: virtual SELL registrada en {trail_up_key} "
+                                    f"size {fmt_amount(trailing_up_size)} "
+                                    f"(quote {_price_key(quote)})"
+                                )
                         else:
                             if is_virtual:
                                 trailing_logs.append(
                                     f"[ENGINE] Trailing up normal: virtual SELL {filled_key} activada; "
-                                    f"BUY {_price_key(next_buy_price)} size {fmt_amount(order_size)} y nueva "
+                                    f"BUY {_price_key(next_buy_price)} size {fmt_amount(buy_size)} y nueva "
                                     f"virtual SELL {trail_up_key} size {fmt_amount(trailing_up_size)}"
                                 )
                             else:
@@ -2124,9 +2171,16 @@ class GridEngine:
 
             elif not handled and side == "buy":
                 next_sell_price = (price + base_step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
-                trailing_up_step = self._trailing_up_step_from_order_locked(price, "buy", info)
-                trailing_up_metadata = self._trailing_up_metadata_for_step(trailing_up_step)
-                trailing_up_size = self._trailing_up_size_from_metadata(trailing_up_metadata, order_size)
+                trailing_up_mode = self._normalise_trailing_up_mode(
+                    getattr(self, "trailing_up_mode", self.trailing_up_enabled)
+                )
+                if trailing_up_mode == "extended":
+                    trailing_up_step = self._trailing_up_step_from_order_locked(price, "buy", info)
+                    trailing_up_metadata = self._trailing_up_metadata_for_step(trailing_up_step)
+                    trailing_up_size = self._trailing_up_size_from_metadata(trailing_up_metadata, order_size)
+                else:
+                    trailing_up_metadata = None
+                    trailing_up_size = order_size
                 orders_to_place.append((
                     next_sell_price,
                     "sell",
@@ -2137,9 +2191,24 @@ class GridEngine:
 
             elif not handled and side == "sell":
                 next_buy_price = (price - base_step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
-                trailing_up_step = self._trailing_up_step_from_order_locked(price, "sell", info)
-                trailing_up_metadata = self._trailing_up_metadata_for_step(trailing_up_step)
-                trailing_up_size = self._trailing_up_size_from_metadata(trailing_up_metadata, order_size)
+                trailing_up_mode = self._normalise_trailing_up_mode(
+                    getattr(self, "trailing_up_mode", self.trailing_up_enabled)
+                )
+                if trailing_up_mode == "extended":
+                    trailing_up_step = self._trailing_up_step_from_order_locked(price, "sell", info)
+                    trailing_up_metadata = self._trailing_up_metadata_for_step(trailing_up_step)
+                    trailing_up_size = self._trailing_up_size_from_metadata(trailing_up_metadata, order_size)
+                elif trailing_up_mode == "fixed_quote":
+                    anchor_high = self._trailing_up_anchor_high_locked()
+                    use_fixed_quote = anchor_high is not None and price >= anchor_high
+                    trailing_up_metadata = None
+                    trailing_up_size = (
+                        self._trailing_up_fixed_quote_size_locked(next_buy_price)
+                        if use_fixed_quote else order_size
+                    )
+                else:
+                    trailing_up_metadata = None
+                    trailing_up_size = order_size
                 orders_to_place.append((
                     next_buy_price,
                     "buy",
