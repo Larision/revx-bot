@@ -588,6 +588,15 @@ def _fmt_usdc_value(value: Decimal) -> str:
     return _price_key(Decimal(str(value)))
 
 
+def _fmt_grid_size(value: object) -> str:
+    """Formatea sizes del grid a 8 decimales maximo para no descuadrar tablas."""
+    try:
+        size = Decimal(str(value)).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+    except Exception:
+        return "?"
+    return fmt_amount(size)
+
+
 def _read_available_balances() -> Tuple[Decimal, Decimal, bool]:
     """Lee balances disponibles de USDC y BTC; indica si la consulta fue válida."""
     try:
@@ -1091,7 +1100,7 @@ def _show_grid_levels(engine: "GridEngine") -> None:
             oid = str(info["order_id"])
 
             size = info.get("size", base_size)
-            size_str = fmt_amount(size)
+            size_str = _fmt_grid_size(size)
 
             if oid == "virtual":
                 tag = " [V]"

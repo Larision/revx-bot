@@ -134,6 +134,11 @@ class GridEngine:
         self.trailing_up_min_factor: Decimal = Decimal("0.50")
         self._trailing_up_steps: int = 0
 
+        # Trailing up fixed_quote:
+        # - El quote se bloquea al activar el modo, usando el techo principal
+        #   actual del grid en ese momento, no el techo del arranque original.
+        self._trailing_up_fixed_quote_anchor: Optional[Decimal] = None
+
         # Trailing down extendido:
         # - Los niveles añadidos por trailing down extended tienen la mitad del tamaño base.
 
@@ -211,20 +216,69 @@ class GridEngine:
         """Tamaño que corresponde al contador actual de trailing up."""
         return self._trailing_up_size_for_steps(self._trailing_up_steps)
 
+    def _current_trailing_up_fixed_quote_anchor_locked(self) -> Optional[Decimal]:
+        """Techo principal actual usado al iniciar fixed_quote.
+
+        No usa el centro de arranque. Toma la linea superior principal del estado
+        actual y evita usar una SELL virtual como ancla si hay una linea principal
+        real/vacia justo debajo.
+        """
+        principal_levels = self._principal_levels_locked()
+        if not principal_levels:
+            return self._trailing_up_anchor_high_locked()
+
+        anchor_candidates: List[Decimal] = []
+        for level in principal_levels:
+            key = _price_key(level)
+            info = self.active_orders.get(key)
+            is_virtual_sell = (
+                info is not None
+                and str(info.get("side")) == "sell"
+                and str(info.get("order_id")) == "virtual"
+            )
+            if not is_virtual_sell:
+                anchor_candidates.append(level)
+
+        anchor = max(anchor_candidates or principal_levels)
+        return Decimal(str(anchor)).quantize(TICK_SIZE, rounding=ROUND_DOWN)
+
+    def _lock_trailing_up_fixed_quote_anchor_locked(self) -> Optional[Decimal]:
+        """Fija el ancla de fixed_quote en el techo principal actual."""
+        anchor = self._current_trailing_up_fixed_quote_anchor_locked()
+        self._trailing_up_fixed_quote_anchor = anchor
+        return anchor
+
+    def _trailing_up_fixed_quote_anchor_locked(self) -> Optional[Decimal]:
+        """Devuelve el ancla fijada de fixed_quote o un fallback actual."""
+        if self._trailing_up_fixed_quote_anchor is not None:
+            return Decimal(str(self._trailing_up_fixed_quote_anchor)).quantize(
+                TICK_SIZE,
+                rounding=ROUND_DOWN,
+            )
+        return self._current_trailing_up_fixed_quote_anchor_locked()
+
     def _trailing_up_fixed_quote_locked(self) -> Decimal:
-        """Quote fijo del trailing up: ultima linea superior original * base_size."""
-        anchor_high = self._trailing_up_anchor_high_locked()
+        """Quote fijo del trailing up: ancla fixed_quote * base_size."""
+        anchor_high = self._trailing_up_fixed_quote_anchor_locked()
         if anchor_high is None or self.base_size <= 0:
             return Decimal("0")
         return Decimal(str(anchor_high)) * self.base_size
 
     def _trailing_up_fixed_quote_size_locked(self, price: Decimal) -> Decimal:
-        """Calcula size para fixed_quote usando quote_fijo / precio."""
+        """Calcula size para fixed_quote usando quote_fijo / precio.
+
+        El modo fixed_quote no debe aumentar el tamaño por encima del base_size.
+        Si el precio de recompra queda por debajo del ancla, el size se limita
+        al base_size para que la primera vuelta empiece como una linea normal.
+        """
         price_dec = Decimal(str(price))
         quote = self._trailing_up_fixed_quote_locked()
         if quote <= 0 or price_dec <= 0:
             return self.base_size
-        return quote / price_dec
+
+        calculated = quote / price_dec
+        capped = min(calculated, self.base_size)
+        return capped.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
 
     def _trailing_up_anchor_high_locked(self) -> Optional[Decimal]:
         """Techo original del grid principal, usado como ancla del trailing up."""
@@ -850,12 +904,36 @@ class GridEngine:
         removed_virtuals: List[str] = []
 
         with self._state_lock:
+            previous_up_mode = self.trailing_up_mode
             self.trailing_up_mode = up_mode
             self.trailing_up_enabled = up_mode != 'off'
             self.trailing_down_mode = down_mode
             self.trailing_down_enabled = down_mode != 'off'
             if up_mode != 'extended':
                 self._trailing_up_steps = 0
+            if up_mode == 'fixed_quote':
+                current_anchor = self._current_trailing_up_fixed_quote_anchor_locked()
+                stored_anchor = self._trailing_up_fixed_quote_anchor_locked()
+                should_relock_anchor = (
+                    previous_up_mode != 'fixed_quote'
+                    or self._trailing_up_fixed_quote_anchor is None
+                    or (
+                        current_anchor is not None
+                        and stored_anchor is not None
+                        and stored_anchor > current_anchor
+                    )
+                )
+                if should_relock_anchor:
+                    anchor = self._lock_trailing_up_fixed_quote_anchor_locked()
+                else:
+                    anchor = stored_anchor
+                quote = self._trailing_up_fixed_quote_locked()
+                if anchor is not None and quote > 0:
+                    fixed_quote_log = (
+                        f" | anchor {_price_key(anchor)} | quote {_price_key(quote)}"
+                    )
+            else:
+                self._trailing_up_fixed_quote_anchor = None
             if down_mode != 'extended':
                 self._trailing_down_extended_drops = 0
 
@@ -971,6 +1049,10 @@ class GridEngine:
             "trailing_up_reduction_per_level": str(self.trailing_up_reduction_per_level),
             "trailing_up_min_factor": str(self.trailing_up_min_factor),
             "trailing_up_current_size": str(self._current_trailing_up_size()),
+            "trailing_up_fixed_quote_anchor": (
+                str(self._trailing_up_fixed_quote_anchor_locked())
+                if self._trailing_up_fixed_quote_anchor_locked() is not None else None
+            ),
             "trailing_up_fixed_quote": str(self._trailing_up_fixed_quote_locked()),
             "trailing_down_mode": self.trailing_down_mode,
             "trailing_down_enabled": self.trailing_down_enabled,
@@ -1019,6 +1101,7 @@ class GridEngine:
                 "trailing_up_reduction_per_level": self.trailing_up_reduction_per_level,
                 "trailing_up_min_factor": self.trailing_up_min_factor,
                 "trailing_up_current_size": self._current_trailing_up_size(),
+                "trailing_up_fixed_quote_anchor": self._trailing_up_fixed_quote_anchor_locked(),
                 "trailing_up_fixed_quote": self._trailing_up_fixed_quote_locked(),
                 "trailing_down_mode": self.trailing_down_mode,
                 "trailing_down_enabled": self.trailing_down_enabled,
@@ -1242,6 +1325,9 @@ class GridEngine:
                 raw.get("trailing_up_mode", raw.get("trailing_up_enabled", True))
             )
             trailing_up_enabled = trailing_up_mode != "off"
+            trailing_up_fixed_quote_anchor = _parse_optional_decimal(
+                raw.get("trailing_up_fixed_quote_anchor")
+            )
             trailing_up_steps = int(raw.get("trailing_up_steps", 0) or 0)
             trailing_up_reduction_per_level = self._decimal_from_meta(
                 raw.get("trailing_up_reduction_per_level"),
@@ -1287,6 +1373,11 @@ class GridEngine:
                 self.trailing_up_reduction_per_level = trailing_up_reduction_per_level
                 self.trailing_up_min_factor = trailing_up_min_factor
                 self._trailing_up_steps = max(0, trailing_up_steps)
+                self._trailing_up_fixed_quote_anchor = trailing_up_fixed_quote_anchor
+                if trailing_up_mode == "fixed_quote" and self._trailing_up_fixed_quote_anchor is None:
+                    self._lock_trailing_up_fixed_quote_anchor_locked()
+                if trailing_up_mode != "fixed_quote":
+                    self._trailing_up_fixed_quote_anchor = None
                 self.trailing_down_mode = trailing_down_mode
                 self.trailing_down_enabled = trailing_down_mode != 'off'
                 self._trailing_down_extended_drops = max(0, trailing_down_extended_drops)
@@ -1382,6 +1473,8 @@ class GridEngine:
             self.base_step = step
             self.levels = levels
             self.extended_levels = {}
+            if self.trailing_up_mode == "fixed_quote":
+                self._lock_trailing_up_fixed_quote_anchor_locked()
 
         ok, _ = check_balances_for_grid(self.base_size, levels, center_price=center_price)
         if not ok:
@@ -2104,7 +2197,15 @@ class GridEngine:
 
                 if fixed_quote_trailing_up:
                     buy_metadata = None
-                    buy_size = self._trailing_up_fixed_quote_size_locked(next_buy_price)
+                    # Cuando se ejecuta una SELL real del techo principal, el BUY
+                    # inmediatamente inferior sigue siendo la pareja normal de esa
+                    # linea y conserva el size ejecutado. El fixed_quote empieza en
+                    # la virtual superior; si esa virtual se activa, entonces el
+                    # BUY resultante usa quote fijo, limitado como maximo al base_size.
+                    buy_size = (
+                        self._trailing_up_fixed_quote_size_locked(next_buy_price)
+                        if is_virtual else order_size
+                    )
                 else:
                     buy_metadata = (
                         self._trailing_up_metadata_for_step(current_trailing_up_step)
@@ -2242,7 +2343,7 @@ class GridEngine:
                     trailing_up_metadata = self._trailing_up_metadata_for_step(trailing_up_step)
                     trailing_up_size = self._trailing_up_size_from_metadata(trailing_up_metadata, order_size)
                 elif trailing_up_mode == "fixed_quote":
-                    anchor_high = self._trailing_up_anchor_high_locked()
+                    anchor_high = self._trailing_up_fixed_quote_anchor_locked()
                     use_fixed_quote = anchor_high is not None and price >= anchor_high
                     trailing_up_metadata = None
                     trailing_up_size = (

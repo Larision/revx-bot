@@ -159,7 +159,16 @@ function tuFactor(n){ return Math.max(0.50, 1-0.025*n); }
 function tuSize(s,n){ return r5(s.base_size*tuFactor(n)); }
 function tuStepFrom(o){ return (o.trailing_up_step!=null&&o.trailing_up_step>0)?o.trailing_up_step:0; }
 function tuFixedQuote(s){ return r2(s.anchor_high*s.base_size); }
-function tuFixedQuoteSize(s,price){ return r5(tuFixedQuote(s)/price); }
+function tuFixedQuoteSize(s,price){ return r5(Math.min(s.base_size, tuFixedQuote(s)/price)); }
+function currentFixedQuoteAnchor(s){
+  const pl=principalLevels(s);
+  if(!pl.length)return s.anchor_high;
+  const candidates=pl.filter(lvl=>{
+    const o=s.orders[pk(lvl)];
+    return !(o&&o.side==="sell"&&o.oid==="virtual");
+  });
+  return r2(Math.max(...(candidates.length?candidates:pl)));
+}
 
 // ── state factory ─────────────────────────────────────────────────────────────
 function mkS(cfg={}){
@@ -190,10 +199,16 @@ function cp(s){ return{...s,levels:[...s.levels],ext:{...s.ext},
 
 // ── UI actions ────────────────────────────────────────────────────────────────
 function setTrailing(dir,val){
+  const prevUp=CFG_UP;
   if(dir==="up") CFG_UP=val; else CFG_DN=val;
   if(S){
     S.trailing_up=CFG_UP; S.trailing_down=CFG_DN;
-    lg(S,"info",`  ⚙ trailing_${dir}=${val} (cambio en caliente — mirrors engine.set_trailing)`);
+    if(dir==="up"&&val==="fixed_quote"&&prevUp!=="fixed_quote"){
+      S.anchor_high=currentFixedQuoteAnchor(S);
+      lg(S,"info",`  ⚙ trailing_up=fixed_quote anchor=${pk(S.anchor_high)} quote=${tuFixedQuote(S).toFixed(2)}`);
+    }else{
+      lg(S,"info",`  ⚙ trailing_${dir}=${val} (cambio en caliente — mirrors engine.set_trailing)`);
+    }
   }
   renderButtons(); if(S) render();
 }
@@ -457,7 +472,7 @@ function fill(key){
         lg(s,"fill",`  tu=ext: BUY@${pk(bp)} sz=${bsz.toFixed(5)} placed=${placed} step=${cur}`);
 
       }else if(tu==="fixed_quote"){
-        const bsz=tuFixedQuoteSize(s,bp);
+        const bsz=isV?tuFixedQuoteSize(s,bp):o.size;
         let placed=false;
         if(!isV){placed=placeOrd(s,bp,"buy",bsz,false);}
         else{

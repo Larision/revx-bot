@@ -364,6 +364,15 @@ def _format_budget(value: Decimal) -> str:
     return f"{_price_key(value)} USDC"
 
 
+def _fmt_grid_size(value: object) -> str:
+    """Formatea sizes del grid a 8 decimales maximo para salidas Telegram."""
+    try:
+        size = Decimal(str(value)).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+    except Exception:
+        return "?"
+    return fmt_amount(size)
+
+
 def _format_grid_config(cfg: dict[str, Any]) -> str:
     """Construye el texto visible para /config."""
     lines = [
@@ -764,7 +773,7 @@ async def cmd_grid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 tag = "[M]"
             else:
                 tag = ""
-            size_text = fmt_amount(size) if size is not None else "?"
+            size_text = _fmt_grid_size(size) if size is not None else "?"
             lines.append(f"{key:>12}  {side:<4} {size_text:<8} {tag}")
         else:
             lines.append(f"{key:>12}  ---  vacío")
