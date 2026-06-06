@@ -143,7 +143,8 @@ def menu_exportar_datos():
         print("\n=== Obtener y exportar datos ===")
         print("1. Histórico de mercado")
         print("2. Histórico de candles")
-        print("3. Atrás")
+        print("3. Histórico de transacciones")
+        print("4. Atrás")
 
         opcion = input("Selecciona una opción: ").strip()
 
@@ -152,6 +153,8 @@ def menu_exportar_datos():
         elif opcion == "2":
             exportar_datos_candles()
         elif opcion == "3":
+            exportar_datos_transacciones()
+        elif opcion == "4":
             break
         else:
             print("Opción inválida")
@@ -159,11 +162,10 @@ def menu_exportar_datos():
 
 def exportar_datos_mercado():
     """
-    Submenú interactivo para descargar y exportar trades públicos de mercado (hasta 30 días por solicitud, con auto‑división).
+    Submenú interactivo para descargar y exportar trades públicos de mercado (hasta 7 días por solicitud, con auto‑división).
     Los resultados se guardan como un archivo CSV.
     """
     print("\n=== Obtener histórico de mercado (trades públicos) ===")
-    print("=== Rango máximo por petición: 30 días (auto-splitting activado) ===")
 
     symbol = input(f"Symbol [{SYMBOL}]: ").strip() or SYMBOL
 
@@ -197,7 +199,7 @@ def exportar_datos_mercado():
     seen_ids: set[str] = set()
     window_start = since
 
-    # Descargar por ventanas de 30 días
+    # Descargar por ventanas de 7 días
     while window_start <= until:
         window_end = min(window_start + WINDOW_MS - 1, until)
         print(f"\n--- Descargando ventana ---")
@@ -343,6 +345,108 @@ def exportar_datos_candles():
     print(f"CSV generado: {filename}")
     print(f"Candles exportados: {len(data)}")
 
+
+def exportar_datos_transacciones():
+    """
+    Submenú interactivo para descargar y exportar datos privados históricos de transacciones (fills).
+    Los resultados se guardan como un archivo CSV.
+    """
+    print("\n=== Obtener histórico de transacciones personal(fills) ===")
+
+    symbol = input(f"Symbol [{SYMBOL}]: ").strip() or SYMBOL
+
+    # Fechas de inicio y fin
+    while True:
+        start_str = input("Fecha inicio (YYYYMMDD): ").strip()
+        try:
+            since = _parse_date_to_ms(start_str)
+            break
+        except ValueError:
+            print("Formato inválido. Usa YYYYMMDD")
+
+    while True:
+        end_str = input("Fecha fin (YYYYMMDD) [hoy]: ").strip()
+        if not end_str:
+            until = int(time.time() * 1000)
+            break
+        try:
+            until = _parse_date_to_ms(end_str, end_of_day=True)
+            break
+        except ValueError:
+            print("Formato inválido. Usa YYYYMMDD")
+
+    if since > until:
+        print("La fecha de inicio no puede ser mayor que la fecha de fin.")
+        return
+    
+    from api import get_private_trades
+
+    all_rows: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    window_start = since
+
+    # Descargar por ventanas de 7 días
+    while window_start <= until:
+        window_end = min(window_start + WINDOW_MS - 1, until)
+        print(f"\n--- Descargando ventana ---")
+        print(f"Desde: {datetime.fromtimestamp(window_start/1000)}")
+        print(f"Hasta: {datetime.fromtimestamp(window_end/1000)}")
+
+        cursor = None
+        while True:
+            response, logs = get_private_trades(
+                symbol=symbol,
+                start_date=window_start,
+                end_date=window_end,
+                cursor=cursor
+            )
+            for l in logs:
+                log_event(f"[LOG] {l['msg']}", l.get("level", "info"))
+
+            if not isinstance(response, dict) or response.get("error"):
+                print("Error obteniendo datos privados de transacciones")
+                raise RuntimeError("No se pudieron obtener los datos privados de transacciones.")
+
+            data = response.get("data", [])
+            if isinstance(data, list):
+                for row in data:
+                    tid = row.get("tid")
+                    if tid and tid in seen_ids:
+                        continue
+                    if tid:
+                        seen_ids.add(tid)
+                    row["tdt_iso"] = _epoch_ms_to_iso(row.get("tdt"))
+                    all_rows.append(row)
+
+            metadata = response.get("metadata", {})
+            cursor = metadata.get("next_cursor") if isinstance(metadata, dict) else None
+            if not cursor:
+                break
+
+        window_start = window_end + 1
+
+    if not all_rows:
+        print("No hay datos.")
+        return
+
+    end_label = end_str if end_str else "now"
+    filename = Path(f"historial_de_transacciones_propias-{symbol}-{start_str}_to_{end_label}.csv")
+
+    # Orden cronológico ascendente
+    all_rows.sort(key=lambda r: int(r.get("tdt") or 0))
+
+    fieldnames = sorted({k for row in all_rows for k in row.keys()})
+
+    with filename.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for row in all_rows:
+            writer.writerow(row)
+            
+    print("\n=== EXPORT COMPLETADO ===")
+    print(f"CSV generado: {filename}")
+    print(f"Transacciones únicas exportadas: {len(all_rows)}")
 
 
 # =========================================================

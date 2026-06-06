@@ -292,6 +292,40 @@ def get_historical_orders(limit: int = 50) -> Tuple[Dict[str, Any], List[LogEntr
     return response, logs
 
 
+def get_private_trades(
+    symbol: str,
+    start_date: Optional[int] = None,
+    end_date: Optional[int] = None,
+    limit: Optional[int] = None,
+    cursor: Optional[str] = None,
+) -> Tuple[Dict[str, Any], List[LogEntry]]:
+    """
+    Recupera una pagina de trades privados (fills) para un simbolo.
+
+    El endpoint pagina con cursor y acepta fechas epoch en milisegundos. El
+    limite se acota al maximo admitido para evitar rechazos de API.
+    """
+    params = []
+
+    if start_date is not None:
+        params.append(("start_date", int(start_date)))
+    if end_date is not None:
+        params.append(("end_date", int(end_date)))
+    if cursor:
+        params.append(("cursor", str(cursor)))
+    if limit is not None:
+        params.append(("limit", max(1, min(int(limit), MAX_TRADES_HISTORY_LIMIT))))
+    query = urlencode(params)
+
+    response, logs = send_request(
+        "GET",
+        f"/api/1.0/trades/private/{symbol}",
+        query=query
+    )
+
+    return response, logs
+
+
 def get_market_trades_page(
     symbol: str,
     start_date: Optional[int] = None,
