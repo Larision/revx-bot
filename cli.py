@@ -1357,6 +1357,74 @@ def _add_manual_order(engine: "GridEngine") -> None:
     print("  ✓ Orden registrada en el engine.")
 
 
+def _cancel_order_by_price(engine: "GridEngine") -> None:
+    """
+    Función interactiva para cancelar una orden activa del motor especificando su precio.
+    """
+    snapshot = engine.get_runtime_snapshot()
+    active_orders = snapshot["active_orders"]
+
+    if not active_orders:
+        print("  No hay órdenes activas registradas en el engine.")
+        return
+
+    print("\n  Órdenes activas registradas:")
+    print(f"  {'Side':<5}  {'Precio':>12}  {'Order ID'}")
+    print("  " + "-" * 62)
+
+    for key, info in sorted(active_orders.items(), key=lambda item: Decimal(item[0]), reverse=True):
+        oid = str(info["order_id"])
+        if oid == "virtual":
+            tag = " [virtual]"
+        elif oid == "pending_post_only":
+            tag = " [latente]"
+        elif oid == "pending_manual":
+            tag = " [reservada]"
+        elif oid == "pending_cancel":
+            tag = " [cancelando]"
+        else:
+            tag = ""
+        print(f"  {str(info['side']).upper():<5}  {key:>12}  {oid}{tag}")
+
+    while True:
+        raw_price = input("\n  Precio de la orden a cancelar: ").strip()
+        if not raw_price:
+            print("  Precio vacío.")
+            continue
+        try:
+            target_key = _price_key(Decimal(raw_price))
+            break
+        except Exception:
+            print("  Precio inválido.")
+
+    info = engine.get_order_info(target_key)
+    if info is None:
+        print(f"  [!] No hay orden en {target_key}.")
+        return
+
+    order_id = str(info["order_id"])
+    side = str(info["side"]).upper()
+
+    if order_id in {"virtual", "pending_post_only", "pending_manual", "pending_cancel"}:
+        print(f"  [!] La orden en {target_key} no se puede cancelar desde aquí ({order_id}).")
+        return
+
+    confirm = input(f"  ¿Cancelar {side} en {target_key} ({order_id})? (s/n): ").strip().lower()
+    if not confirm.startswith("s"):
+        print("  Abortado.")
+        return
+
+    ok, logs, error_msg = engine.cancel_order_by_key(target_key, expected_order_id=order_id)
+    for entry in logs:
+        log_event(f"[CANCEL] {entry['msg']}", entry["level"])
+
+    if not ok:
+        print(f"  [!] {error_msg or 'No se pudo cancelar la orden.'}")
+        return
+
+    print(f"  ✓ Orden cancelada en {target_key}.")
+
+
 def _fill_empty_levels(engine: "GridEngine") -> None:
     """
     Activa un llenado manual de los niveles vacíos del grid utilizando un precio fresco.
@@ -1416,7 +1484,8 @@ def run_engine_menu(engine: "GridEngine", engine_thread: threading.Thread) -> No
         print("  3. Activar-Desactivar trailings")
         print("  4. Ver balances")
         print("  5. Añadir orden manual")
-        print("  6. Fill empty levels")
+        print("  6. Cancelar orden por precio")
+        print("  7. Fill empty levels")
         print("  v. Volver al menú principal")
         print("=" * 40)
 
@@ -1436,6 +1505,8 @@ def run_engine_menu(engine: "GridEngine", engine_thread: threading.Thread) -> No
         elif opcion == "5":
             _add_manual_order(engine)
         elif opcion == "6":
+            _cancel_order_by_price(engine)
+        elif opcion == "7":
             _fill_empty_levels(engine)
         elif opcion.lower() == "v":
             print("  Volviendo al menú principal...")
