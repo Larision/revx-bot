@@ -22,6 +22,7 @@ from config import (
     STATE_PATH,
     SYMBOL,
     TICK_SIZE,
+    VERSION,
     WINDOW_MS,
 )
 from logger import log_event, log_file
@@ -1589,7 +1590,7 @@ def run_cli() -> None:
     trailing_down_default: str    = get_trailing_down_default("off")
     bot_usdc_budget_default: Decimal = Decimal(get_bot_usdc_budget_default("0"))
 
-    print("GRID ENGINE v1.1 — CLI INTERACTIVO")
+    print(f"GRID ENGINE {VERSION} — CLI INTERACTIVO")
 
     # Arrancar bot de Telegram solo si está habilitado en private_config.ini
     if telegram_enabled and start_telegram_bot is not None:
