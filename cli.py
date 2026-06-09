@@ -1403,6 +1403,92 @@ def format_balances_live(engine: Optional["GridEngine"] = None) -> str:
     return "\n".join(lines)
 
 
+def _format_balance_value(currency: str, value: Decimal) -> str:
+    """Formatea un valor de balance según la moneda para una salida legible."""
+    code = currency.strip().upper()
+    if code in {"USDC", "USD", "EUR", "GBP"}:
+        return _price_key(value)
+    return fmt_amount(value)
+
+
+def _format_balances_nonzero() -> str:
+    """Devuelve un resumen legible mostrando solo monedas con saldo positivo."""
+    try:
+        balances_resp, _ = get_all_balances()
+    except Exception as exc:
+        return f"No se pudieron consultar los balances: {exc}"
+
+    entries: list[dict[str, Any]] = []
+
+    if isinstance(balances_resp, list):
+        entries = [row for row in balances_resp if isinstance(row, dict)]
+    elif isinstance(balances_resp, dict):
+        for key in ("balances", "data", "items", "results"):
+            value = balances_resp.get(key)
+            if isinstance(value, list):
+                entries = [row for row in value if isinstance(row, dict)]
+                break
+
+        if not entries:
+            entries = [value for value in balances_resp.values() if isinstance(value, dict)]
+
+    def _to_decimal(raw: object) -> Decimal:
+        try:
+            return Decimal(str(raw))
+        except Exception:
+            return Decimal("0")
+
+    lines = [
+        "──────────────────────────────────────",
+        "BALANCES CON SALDO",
+        "──────────────────────────────────────",
+    ]
+
+    shown = 0
+    for entry in entries:
+        currency = str(entry.get("currency") or entry.get("symbol") or entry.get("asset") or "").strip().upper()
+        if not currency:
+            continue
+
+        available = _to_decimal(
+            entry.get("available")
+            or entry.get("free")
+            or entry.get("balance")
+            or entry.get("available_balance")
+            or entry.get("quantity")
+            or 0
+        )
+        reserved = _to_decimal(
+            entry.get("reserved")
+            or entry.get("locked")
+            or entry.get("hold")
+            or entry.get("reserved_balance")
+            or 0
+        )
+        total = _to_decimal(
+            entry.get("total")
+            or entry.get("amount")
+            or entry.get("available_balance")
+            or (available + reserved)
+        )
+
+        if total <= 0 and available <= 0 and reserved <= 0:
+            continue
+
+        shown += 1
+        lines.append(
+            f"{currency:<6} disponible: {_format_balance_value(currency, available)}"
+            f" | reservado: {_format_balance_value(currency, reserved)}"
+            f" | total: {_format_balance_value(currency, total)}"
+        )
+
+    if shown == 0:
+        lines.append("Sin balances con saldo positivo.")
+
+    lines.append("──────────────────────────────────────")
+    return "\n".join(lines)
+
+
 def _show_balances_live(engine: Optional["GridEngine"] = None) -> None:
     """
     Imprime los balances actuales (incluyendo asignaciones del grid) en la consola.
@@ -1755,8 +1841,7 @@ def run_cli() -> None:
         # --------------------------------------------------
         elif opcion == "2":
             print("\n=== Ver balances ===")
-            balances, _ = get_all_balances()
-            log_event(f"{json.dumps(balances, indent=2, ensure_ascii=False)}", "info")
+            print(_format_balances_nonzero())
 
         # --------------------------------------------------
         # 3. Obtener y exportar datos
