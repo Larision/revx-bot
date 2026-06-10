@@ -88,6 +88,7 @@ class GridEngine:
         initial_price: Optional[Decimal] = None,
         levels_below: Optional[int] = None,
         levels_above: Optional[int] = None,
+        reserve_usdc: Optional[Decimal] = None,
     ) -> None:
         
         # Parámetros de configuración
@@ -99,6 +100,9 @@ class GridEngine:
         self.base_size: Decimal      = Decimal(str(base_size))
         self.initial_price: Optional[Decimal] = (
             Decimal(str(initial_price)) if initial_price is not None else None
+        )
+        self.reserve_usdc: Decimal = (
+            Decimal(str(reserve_usdc)) if reserve_usdc is not None else MIN_USDC_RESERVE
         )
 
         # Estado dinámico del grid
@@ -512,10 +516,10 @@ class GridEngine:
         return protected
 
     def _get_available_usdc(self) -> Decimal:
-        """Calcula USDC disponible para nuevas órdenes (reservando MIN_USDC_RESERVE)."""
+        """Calcula USDC disponible para nuevas órdenes (reservando self.reserve_usdc)."""
         balances_resp, _ = get_all_balances()
         usdc_balance, _ = _parse_balances(balances_resp)
-        available = usdc_balance - MIN_USDC_RESERVE
+        available = usdc_balance - self.reserve_usdc
         return available if available > 0 else Decimal('0')
 
     def _get_available_btc(self) -> Decimal:

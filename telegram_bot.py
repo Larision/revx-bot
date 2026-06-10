@@ -307,6 +307,7 @@ def _load_grid_config() -> dict[str, Any]:
         get_bot_usdc_budget_default,
         get_grid_levels_above,
         get_grid_levels_below,
+        get_reserve_usdc_default,
         get_step_percent_default,
         get_trailing_down_default,
         get_trailing_up_default,
@@ -330,6 +331,11 @@ def _load_grid_config() -> dict[str, Any]:
     trailing_down = normalize_trailing_down_mode(
         get_trailing_down_default(str(DEFAULT_TRAILING_DOWN))
     )
+    from config import MIN_USDC_RESERVE
+    reserve_usdc = _decimal_or_default(
+        get_reserve_usdc_default(str(MIN_USDC_RESERVE)),
+        MIN_USDC_RESERVE,
+    )
 
     return {
         "levels_below": max(0, int(get_grid_levels_below(DEFAULT_GRID_LEVELS_BELOW))),
@@ -338,6 +344,7 @@ def _load_grid_config() -> dict[str, Any]:
         "step_percent": step_percent,
         "trailing_up": trailing_up,
         "trailing_down": trailing_down,
+        "reserve_usdc": reserve_usdc,
         "bot_usdc_budget": bot_usdc_budget if bot_usdc_budget > 0 else Decimal("0"),
     }
 
@@ -353,6 +360,7 @@ def _save_grid_config_from_dict(cfg: dict[str, Any]) -> None:
         str(cfg["step_percent"]),
         str(cfg["trailing_up"]),
         str(cfg["trailing_down"]),
+        str(cfg.get("reserve_usdc", "0")),
         str(cfg["bot_usdc_budget"]),
     )
 
@@ -375,6 +383,8 @@ def _fmt_grid_size(value: object) -> str:
 
 def _format_grid_config(cfg: dict[str, Any]) -> str:
     """Construye el texto visible para /config."""
+    from config import MIN_USDC_RESERVE
+    reserve_usdc = Decimal(str(cfg.get("reserve_usdc", MIN_USDC_RESERVE)))
     lines = [
         "⚙️ *CONFIG GRID*",
         "```",
@@ -385,6 +395,7 @@ def _format_grid_config(cfg: dict[str, Any]) -> str:
         f"Step percent    : {fmt_amount(cfg['step_percent'] * Decimal('100'))}%",
         f"Trailing up     : {trailing_mode_label(str(cfg['trailing_up']))}",
         f"Trailing down   : {trailing_mode_label(str(cfg['trailing_down']))}",
+        f"Reserve USDC    : {_price_key(reserve_usdc)} USDC",
         f"Bot USDC budget : {_format_budget(Decimal(str(cfg['bot_usdc_budget'])))}",
         "```",
         "Cambiar un valor:",
@@ -394,6 +405,7 @@ def _format_grid_config(cfg: dict[str, Any]) -> str:
         "`/set_config step_percent 0.2%`",
         "`/set_config trailing_up extended`",
         "`/set_config trailing_down on`",
+        "`/set_config reserve_usdc 30`",
         "`/set_config bot_usdc_budget 1000`",
     ]
     if _engine_running():
@@ -411,6 +423,7 @@ def _set_config_usage() -> str:
         "`/set_config step_percent 0.2%`\n"
         "`/set_config trailing_up off|on|extended|fixed_quote`\n"
         "`/set_config trailing_down off|on|extended`\n"
+        "`/set_config reserve_usdc 30`\n"
         "`/set_config bot_usdc_budget 1000`\n"
         "También puedes usar `max` en bot_usdc_budget para tomar el USDC disponible."
     )
@@ -567,6 +580,7 @@ async def _execute_start_engine(
         step_percent=Decimal(str(cfg["step_percent"])),
         base_size=Decimal(str(cfg["base_size"])),
         initial_price=initial_price,
+        reserve_usdc=Decimal(str(cfg.get("reserve_usdc", "0"))),
     )
 
     if not recover_state:
@@ -662,7 +676,7 @@ def _build_help_text() -> str:
         "",
         "*Configuración*",
         "`/config` — muestra la configuración guardada del grid",
-        "`/set_config clave valor` — cambia un valor de configuración",
+        "`/set_config clave valor` — cambia un valor de configuración (`levels_below`, `levels_above`, `base_size`, `step_percent`, `trailing_up`, `trailing_down`, `reserve_usdc`, `bot_usdc_budget`)",
         "`/trailings` — muestra trailing up/down del engine activo",
         "`/trailings up off|on|extended|fixed_quote` — cambia trailing up en caliente",
         "`/trailings down off|on|extended` — cambia trailing down en caliente",
@@ -856,6 +870,9 @@ async def cmd_set_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "td": "trailing_down",
         "down": "trailing_down",
         "trailing_down": "trailing_down",
+        "reserve": "reserve_usdc",
+        "reserva": "reserve_usdc",
+        "reserve_usdc": "reserve_usdc",
         "budget": "bot_usdc_budget",
         "saldo": "bot_usdc_budget",
         "bot_budget": "bot_usdc_budget",
@@ -898,6 +915,12 @@ async def cmd_set_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if parsed_mode is None:
                 raise ValueError("trailing_down debe ser off, on o extended")
             cfg[key] = parsed_mode
+
+        elif key == "reserve_usdc":
+            parsed_reserve = Decimal(value_raw.replace(",", "."))
+            if parsed_reserve < 0:
+                raise ValueError("reserve_usdc no puede ser negativo")
+            cfg[key] = parsed_reserve
 
         elif key == "bot_usdc_budget":
             normalized = value_raw.strip().lower()

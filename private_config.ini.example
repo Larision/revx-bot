@@ -16,4 +16,5 @@ base_size = 10
 step_percent = 0.5
 trailing_up = off  # trailing_up admite: off, on, extended, fixed_quote
 trailing_down = off  # trailing_down admite: off, on, extended
+reserve_usdc = 30
 bot_usdc_budget = 1000

@@ -24,6 +24,7 @@ from config import (
     TICK_SIZE,
     VERSION,
     WINDOW_MS,
+    MIN_USDC_RESERVE,
 )
 from logger import log_event, log_file
 from trailing import (
@@ -1023,6 +1024,7 @@ def show_grid_preview(
     step_percent: Decimal,
     trailing_up: str,
     trailing_down: str,
+    reserve_usdc: Decimal,
     bot_usdc_budget: Decimal,
 ) -> Tuple[bool, Optional[Decimal]]:
     """
@@ -1120,6 +1122,7 @@ def show_grid_preview(
 
     _lp(f"    Saldo asignado bot   : {budget_text}")
     _lp(f"    USDC disponible      : {_fmt_usdc_value(usdc_balance)} USDC")
+    _lp(f"    USDC reservado       : {_fmt_usdc_value(reserve_usdc)} USDC")
     _lp(f"    BTC disponible       : {fmt_amount(btc_balance)} BTC")
     _lp(f"    Valor cuenta estim.  : {_fmt_usdc_value(current_total_value)} USDC")
 
@@ -1754,6 +1757,7 @@ def run_cli() -> None:
     from private_config import (
         get_base_size_default,
         get_bot_usdc_budget_default,
+        get_reserve_usdc_default,
         get_grid_levels_above,
         get_grid_levels_below,
         get_step_percent_default,
@@ -1778,6 +1782,7 @@ def run_cli() -> None:
     step_percent_default: Decimal = Decimal(get_step_percent_default(str(DEFAULT_STEP_PERCENT)))
     trailing_up_default:  str     = get_trailing_up_default("off")
     trailing_down_default: str    = get_trailing_down_default("off")
+    reserve_usdc_default:  Decimal = Decimal(get_reserve_usdc_default(str(MIN_USDC_RESERVE)))
     bot_usdc_budget_default: Decimal = Decimal(get_bot_usdc_budget_default("0"))
 
     print(f"GRID ENGINE {VERSION} — CLI INTERACTIVO")
@@ -1927,6 +1932,7 @@ def run_cli() -> None:
                     step_percent_default,
                     trailing_up_default,
                     trailing_down_default,
+                    reserve_usdc_default,
                     bot_usdc_budget_default,
                 )
                 if not confirmar:
@@ -1939,6 +1945,7 @@ def run_cli() -> None:
                 step_percent=step_percent_default,
                 base_size=base_size_default,
                 initial_price=initial_price,
+                reserve_usdc=reserve_usdc_default,
             )
 
             if not recover_state:
@@ -2078,6 +2085,25 @@ def run_cli() -> None:
             else:
                 print("USDC disponible actual: no disponible")
 
+            new_usdc_reserve = input(
+                f"Cuanto USDC quieres reservar como colchón de seguridad: [{_fmt_usdc_value(reserve_usdc_default)}]: "
+            ).strip().lower()
+
+            if new_usdc_reserve:
+                try:
+                    reserve_usdc_default = Decimal(new_usdc_reserve)
+                    if reserve_usdc_default < 0:
+                        raise ValueError("el colchón de seguridad no puede ser negativo")
+                    if balances_ok and reserve_usdc_default > available_usdc:
+                        raise ValueError(
+                            f"el colchón de seguridad asignado ({_fmt_usdc_value(reserve_usdc_default)}) "
+                            f"supera el USDC disponible ({_fmt_usdc_value(available_usdc)})"
+                        )
+                    log_event(f"Colchón de seguridad actualizado a {_fmt_usdc_value(reserve_usdc_default)} USDC", "info")
+                except Exception as exc:
+                    log_event(f"[ERROR] Valor de colchón de seguridad inválido: {exc}. Conservando el anterior ({_fmt_usdc_value(reserve_usdc_default)}).", "error")
+                    reserve_usdc_default = reserve_usdc_default
+
             budget_default_text = (
                 _fmt_usdc_value(bot_usdc_budget_default)
                 if bot_usdc_budget_default > 0
@@ -2087,25 +2113,34 @@ def run_cli() -> None:
                 f"Saldo USDC total a emplear por el bot [{budget_default_text}] "
                 "(0 = sin límite explícito): "
             ).strip().lower()
+
             if new_budget:
                 try:
                     if new_budget in {"max", "todo", "all"}:
                         if not balances_ok:
                             raise ValueError("no se pudo leer USDC disponible")
-                        parsed_budget = available_usdc
+                        parsed_budget = max(Decimal("0"), available_usdc - reserve_usdc_default)
                     else:
                         parsed_budget = Decimal(new_budget)
 
                     if parsed_budget < 0:
                         raise ValueError("el saldo no puede ser negativo")
-                    if balances_ok and parsed_budget > available_usdc:
-                        raise ValueError(
-                            f"el saldo asignado ({_fmt_usdc_value(parsed_budget)}) "
-                            f"supera el USDC disponible ({_fmt_usdc_value(available_usdc)})"
-                        )
+                    
+                    if balances_ok:
+                        max_budget = max(Decimal("0"), available_usdc - reserve_usdc_default)
+                        if parsed_budget > max_budget:
+                            raise ValueError(
+                                f"el saldo asignado ({_fmt_usdc_value(parsed_budget)}) "
+                                f"supera el USDC disponible ({_fmt_usdc_value(max_budget)})"
+                            )
                     bot_usdc_budget_default = parsed_budget
+
                 except Exception as exc:
                     log_event(f"[ERROR] Valor de saldo asignado inválido: {exc}. Conservando el anterior.", "error")
+            
+            elif balances_ok:
+                bot_usdc_budget_default = max(Decimal("0"), available_usdc - reserve_usdc_default)
+                log_event(f"Saldo asignado actualizado a {_fmt_usdc_value(bot_usdc_budget_default)} USDC (ajustado automáticamente según el colchón de seguridad)", "info")
 
             # Guardar la configuración
             save_grid_config(
@@ -2115,6 +2150,7 @@ def run_cli() -> None:
                 str(step_percent_default),
                 trailing_up_default,
                 trailing_down_default,
+                str(reserve_usdc_default),
                 str(bot_usdc_budget_default),
             )
             print("✓ Configuración guardada como predeterminada.")
