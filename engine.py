@@ -532,8 +532,16 @@ class GridEngine:
     #  Métodos de manipulación de órdenes virtuales y selección
     # ----------------------------------------------------------------------
 
-    def _find_highest_real_sell_order(self) -> Optional[Tuple[str, OrderInfo]]:
-        """Devuelve la orden SELL real más alta para poder liberar saldo en trailing extendido."""
+    def _find_highest_real_sell_order(
+        self,
+        *,
+        include_extended: bool = False,
+    ) -> Optional[Tuple[str, OrderInfo]]:
+        """Devuelve la orden SELL real más alta para liberar BTC.
+
+        Por defecto mantiene el comportamiento anterior y excluye SELL extended.
+        Cuando include_extended=True también permite cancelar SELL extended.
+        """
         with self._state_lock:
             candidates: List[Tuple[Decimal, str, OrderInfo]] = []
             for key, info in self.active_orders.items():
@@ -542,7 +550,7 @@ class GridEngine:
                 order_id = str(info.get('order_id'))
                 if order_id in {'virtual', 'pending_post_only', 'pending_manual', 'pending_cancel'}:
                     continue
-                if self._is_extended_down_order(info):
+                if not include_extended and self._is_extended_down_order(info):
                     continue
                 try:
                     candidates.append((Decimal(key), key, self._clone_order_info(info)))
@@ -801,14 +809,14 @@ class GridEngine:
         while estimated_available < required:
             if max_cancellations is not None and cancellations >= max_cancellations:
                 log_event(
-                    f"[ENGINE] Trailing down extended: BTC insuficiente para SELL {target_key} "
+                    f"[ENGINE] Trailing down: BTC insuficiente para SELL {target_key} "
                     f"tras {cancellations} cancelaciones "
                     f"({fmt_amount(estimated_available)} < {fmt_amount(required)})",
                     "warning"
                 )
                 return False
 
-            candidate = self._find_highest_real_sell_order()
+            candidate = self._find_highest_real_sell_order(include_extended=True)
             if candidate is None:
                 refreshed_available = self._get_available_btc()
                 if refreshed_available > estimated_available:
@@ -817,7 +825,7 @@ class GridEngine:
                     return True
 
                 log_event(
-                    f"[ENGINE] Trailing down extended: no hay SELL real alto cancelable "
+                    f"[ENGINE] Trailing down: no hay SELL real alto cancelable "
                     f"para liberar BTC ({fmt_amount(estimated_available)} < {fmt_amount(required)})",
                     "warning"
                 )
@@ -834,7 +842,7 @@ class GridEngine:
                 current["order_id"] = "pending_cancel"
 
             log_event(
-                f"[ENGINE] Trailing down extended: cancelando SELL alto {cancel_level_key} "
+                f"[ENGINE] Trailing down: cancelando SELL alto {cancel_level_key} "
                 f"size {fmt_amount(cancel_size)} para liberar BTC antes de SELL {target_key} "
                 f"size {fmt_amount(required)}",
                 "info"
@@ -858,7 +866,7 @@ class GridEngine:
                 removed_virtual_key = self._remove_highest_virtual_sell_order()
                 if removed_virtual_key is not None:
                     log_event(
-                        f"[ENGINE] Trailing down extended: virtual SELL de techo "
+                        f"[ENGINE] Trailing down: virtual SELL de techo "
                         f"{removed_virtual_key} eliminada tras cancelar SELL alto {cancel_level_key}",
                         "info"
                     )
@@ -866,7 +874,7 @@ class GridEngine:
                 estimated_available += cancel_size
                 if estimated_available >= required:
                     log_event(
-                        f"[ENGINE] Trailing down extended: BTC estimado liberado con SELL "
+                        f"[ENGINE] Trailing down: BTC estimado liberado con SELL "
                         f"{cancel_level_key}; _place_order_safe esperara si el exchange "
                         f"aun no actualizo el disponible",
                         "info"
@@ -893,7 +901,7 @@ class GridEngine:
                 error_msg = str(err_body)
                 error_id = ""
             log_event(
-                f"[ENGINE] Trailing down extended: cancel fallido en {cancel_level_key}: "
+                f"[ENGINE] Trailing down: cancel fallido en {cancel_level_key}: "
                 f"{error_msg} ({error_id})",
                 "warning"
             )
