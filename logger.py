@@ -8,7 +8,7 @@ from types_ import LogEntry
 fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
 # Logger principal: consola + fichero
-logger = logging.getLogger("grid_engine_v1.0")
+logger = logging.getLogger("grid_engine_v1.2")
 logger.setLevel(logging.INFO)
 
 ch = logging.StreamHandler()
@@ -21,7 +21,7 @@ logger.addHandler(fh)
 
 # Logger solo-fichero: para show_grid_preview y otros sitios
 # donde el print ya cubre la consola y no queremos duplicados
-file_logger = logging.getLogger("grid_engine_v1.0.file")
+file_logger = logging.getLogger("grid_engine_v1.2.file")
 file_logger.setLevel(logging.INFO)
 file_logger.addHandler(fh)
 file_logger.propagate = False
