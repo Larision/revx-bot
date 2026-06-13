@@ -134,9 +134,9 @@ class GridEngine:
         # - El grid normal mantiene base_size.
         # - Cada nivel añadido por trailing up reduce el tamaño un 2.5%.
         # - El tamaño nunca baja del 50% de base_size.
-        self.trailing_up_reduction_per_level: Decimal = Decimal("0.025")
-        self.trailing_up_min_factor: Decimal = Decimal("0.50")
-        self._trailing_up_steps: int = 0
+        self.trailing_up_ext_reduction_per_level: Decimal = Decimal("0.025")
+        self.trailing_up_ext_min_factor: Decimal = Decimal("0.50")
+        self._trailing_up_ext_steps: int = 0
 
         # Trailing up fixed_quote:
         # - El quote se bloquea al activar el modo, usando el techo principal
@@ -145,7 +145,6 @@ class GridEngine:
 
         # Trailing down extendido:
         # - Los niveles añadidos por trailing down extended tienen la mitad del tamaño base.
-
         self._trailing_down_extended_drops: int = 0
 
     def _is_virtual_order(self, info: Optional["OrderInfo"]) -> bool:
@@ -185,7 +184,7 @@ class GridEngine:
         return normalize_trailing_down_mode(down)
 
     def _normalise_trailing_up_mode(self, up: object) -> str:
-        """Normaliza el modo de trailing up a 'off', 'on' o 'extended'."""
+        """Normaliza el modo de trailing up a 'off', 'on', 'extended' o 'fixed_quote'."""
         return normalize_trailing_up_mode(up)
 
     def _order_size(self, info: OrderInfo) -> Decimal:
@@ -204,21 +203,21 @@ class GridEngine:
         """Tamaño fijo de las órdenes extended: 50% del base_size."""
         return self.base_size * Decimal("0.5")
 
-    def _trailing_up_factor_for_steps(self, steps: Optional[int] = None) -> Decimal:
-        """Factor de tamaño para el trailing up híbrido según el contador actual."""
-        safe_steps = max(0, self._trailing_up_steps if steps is None else int(steps))
-        factor = Decimal("1") - (self.trailing_up_reduction_per_level * Decimal(safe_steps))
-        if factor < self.trailing_up_min_factor:
-            return self.trailing_up_min_factor
+    def _extended_up_factor_for_steps(self, steps: Optional[int] = None) -> Decimal:
+        """Factor de tamaño para el trailing up extended según el contador actual."""
+        safe_steps = max(0, self._trailing_up_ext_steps if steps is None else int(steps))
+        factor = Decimal("1") - (self.trailing_up_ext_reduction_per_level * Decimal(safe_steps))
+        if factor < self.trailing_up_ext_min_factor:
+            return self.trailing_up_ext_min_factor
         return factor
 
-    def _trailing_up_size_for_steps(self, steps: Optional[int] = None) -> Decimal:
-        """Tamaño base dinámico para nuevos niveles de trailing up."""
-        return self.base_size * self._trailing_up_factor_for_steps(steps)
+    def _extended_up_size_for_steps(self, steps: Optional[int] = None) -> Decimal:
+        """Tamaño base dinámico para nuevos niveles de trailing up extended."""
+        return self.base_size * self._extended_up_factor_for_steps(steps)
 
-    def _current_trailing_up_size(self) -> Decimal:
-        """Tamaño que corresponde al contador actual de trailing up."""
-        return self._trailing_up_size_for_steps(self._trailing_up_steps)
+    def _current_extended_up_size(self) -> Decimal:
+        """Tamaño que corresponde al contador actual de trailing up extended."""
+        return self._extended_up_size_for_steps(self._trailing_up_ext_steps)
 
     def _current_trailing_up_fixed_quote_anchor_locked(self) -> Optional[Decimal]:
         """Techo principal actual usado al iniciar fixed_quote.
@@ -321,7 +320,7 @@ class GridEngine:
 
     def _trailing_up_step_from_size(self, size: Decimal) -> int:
         """Infiere el step por size para estados antiguos sin metadata."""
-        if self.base_size <= 0 or self.trailing_up_reduction_per_level <= 0:
+        if self.base_size <= 0 or self.trailing_up_ext_reduction_per_level <= 0:
             return 0
 
         try:
@@ -332,14 +331,14 @@ class GridEngine:
         if factor >= Decimal("1"):
             return 0
 
-        if factor <= self.trailing_up_min_factor:
+        if factor <= self.trailing_up_ext_min_factor:
             min_steps = (
-                (Decimal("1") - self.trailing_up_min_factor)
-                / self.trailing_up_reduction_per_level
+                (Decimal("1") - self.trailing_up_ext_min_factor)
+                / self.trailing_up_ext_reduction_per_level
             )
             return max(0, int(min_steps.to_integral_value(rounding=ROUND_DOWN)))
 
-        inferred = (Decimal("1") - factor) / self.trailing_up_reduction_per_level
+        inferred = (Decimal("1") - factor) / self.trailing_up_ext_reduction_per_level
         try:
             return max(0, int(inferred.to_integral_value(rounding=ROUND_DOWN)))
         except Exception:
@@ -381,7 +380,7 @@ class GridEngine:
         """Tamaño que corresponde a un trailing_up_step concreto."""
         if step <= 0:
             return self.base_size
-        return self._trailing_up_size_for_steps(step)
+        return self._extended_up_size_for_steps(step)
 
     def _trailing_up_size_from_metadata(
         self,
@@ -413,14 +412,14 @@ class GridEngine:
         """Actualiza el contador al bajar una linea de trailing up."""
         filled_step = self._trailing_up_step_from_order_locked(price, "buy", info)
         next_steps = max(0, filled_step - 1)
-        previous_steps = self._trailing_up_steps
-        self._trailing_up_steps = next_steps
+        previous_steps = self._trailing_up_ext_steps
+        self._trailing_up_ext_steps = next_steps
 
         if previous_steps != next_steps:
             logs.append(
                 f"[ENGINE] Trailing up: contador ajustado {previous_steps} -> "
                 f"{next_steps} tras BUY en {filled_key}; "
-                f"size actual {fmt_amount(self._current_trailing_up_size())}"
+                f"size actual {fmt_amount(self._current_extended_up_size())}"
             )
 
     def _update_trailing_up_steps_after_sell_locked(
@@ -435,13 +434,13 @@ class GridEngine:
         if filled_step <= 0:
             return 0
 
-        previous_steps = self._trailing_up_steps
-        self._trailing_up_steps = filled_step
+        previous_steps = self._trailing_up_ext_steps
+        self._trailing_up_ext_steps = filled_step
         if previous_steps != filled_step:
             logs.append(
                 f"[ENGINE] Trailing up: contador ajustado {previous_steps} -> "
                 f"{filled_step} tras SELL en {filled_key}; "
-                f"size actual {fmt_amount(self._current_trailing_up_size())}"
+                f"size actual {fmt_amount(self._current_extended_up_size())}"
             )
         return filled_step
 
@@ -922,7 +921,7 @@ class GridEngine:
             self.trailing_down_mode = down_mode
             self.trailing_down_enabled = down_mode != 'off'
             if up_mode != 'extended':
-                self._trailing_up_steps = 0
+                self._trailing_up_ext_steps = 0
             if up_mode == 'fixed_quote':
                 current_anchor = self._current_trailing_up_fixed_quote_anchor_locked()
                 stored_anchor = self._trailing_up_fixed_quote_anchor_locked()
@@ -1057,10 +1056,10 @@ class GridEngine:
             "base_size": str(self.base_size),
             "trailing_up_mode": self.trailing_up_mode,
             "trailing_up_enabled": self.trailing_up_enabled,
-            "trailing_up_steps": self._trailing_up_steps,
-            "trailing_up_reduction_per_level": str(self.trailing_up_reduction_per_level),
-            "trailing_up_min_factor": str(self.trailing_up_min_factor),
-            "trailing_up_current_size": str(self._current_trailing_up_size()),
+            "trailing_up_steps": self._trailing_up_ext_steps,
+            "trailing_up_reduction_per_level": str(self.trailing_up_ext_reduction_per_level),
+            "trailing_up_min_factor": str(self.trailing_up_ext_min_factor),
+            "trailing_up_current_size": str(self._current_extended_up_size()),
             "trailing_up_fixed_quote_anchor": (
                 str(self._trailing_up_fixed_quote_anchor_locked())
                 if self._trailing_up_fixed_quote_anchor_locked() is not None else None
@@ -1109,10 +1108,10 @@ class GridEngine:
                 "base_size": self.base_size,
                 "trailing_up_mode": self.trailing_up_mode,
                 "trailing_up_enabled": self.trailing_up_enabled,
-                "trailing_up_steps": self._trailing_up_steps,
-                "trailing_up_reduction_per_level": self.trailing_up_reduction_per_level,
-                "trailing_up_min_factor": self.trailing_up_min_factor,
-                "trailing_up_current_size": self._current_trailing_up_size(),
+                "trailing_up_steps": self._trailing_up_ext_steps,
+                "trailing_up_reduction_per_level": self.trailing_up_ext_reduction_per_level,
+                "trailing_up_min_factor": self.trailing_up_ext_min_factor,
+                "trailing_up_current_size": self._current_extended_up_size(),
                 "trailing_up_fixed_quote_anchor": self._trailing_up_fixed_quote_anchor_locked(),
                 "trailing_up_fixed_quote": self._trailing_up_fixed_quote_locked(),
                 "trailing_down_mode": self.trailing_down_mode,
@@ -1343,11 +1342,11 @@ class GridEngine:
             trailing_up_steps = int(raw.get("trailing_up_steps", 0) or 0)
             trailing_up_reduction_per_level = self._decimal_from_meta(
                 raw.get("trailing_up_reduction_per_level"),
-                self.trailing_up_reduction_per_level,
+                self.trailing_up_ext_reduction_per_level,
             )
             trailing_up_min_factor = self._decimal_from_meta(
                 raw.get("trailing_up_min_factor"),
-                self.trailing_up_min_factor,
+                self.trailing_up_ext_min_factor,
             )
             if trailing_up_min_factor > Decimal("1"):
                 trailing_up_min_factor = Decimal("1")
@@ -1382,9 +1381,9 @@ class GridEngine:
                 self.last_fill_price = last_fill_price
                 self.trailing_up_mode = trailing_up_mode
                 self.trailing_up_enabled = trailing_up_enabled
-                self.trailing_up_reduction_per_level = trailing_up_reduction_per_level
-                self.trailing_up_min_factor = trailing_up_min_factor
-                self._trailing_up_steps = max(0, trailing_up_steps)
+                self.trailing_up_ext_reduction_per_level = trailing_up_reduction_per_level
+                self.trailing_up_ext_min_factor = trailing_up_min_factor
+                self._trailing_up_ext_steps = max(0, trailing_up_steps)
                 self._trailing_up_fixed_quote_anchor = trailing_up_fixed_quote_anchor
                 if trailing_up_mode == "fixed_quote" and self._trailing_up_fixed_quote_anchor is None:
                     self._lock_trailing_up_fixed_quote_anchor_locked()
@@ -1401,7 +1400,7 @@ class GridEngine:
                 f"(guardado hace {age_min:.1f} min, "
                 f"{len(active_orders)} órdenes, "
                 f"{len(levels)} niveles, "
-                f"trailing_up_steps={self._trailing_up_steps})",
+                f"trailing_up_steps={self._trailing_up_ext_steps})",
                 "info"
             )
             return True
@@ -2246,17 +2245,17 @@ class GridEngine:
                                 virtual_metadata,
                                 order_size,
                             )
-                            self._trailing_up_steps = next_trailing_up_steps
+                            self._trailing_up_ext_steps = next_trailing_up_steps
                         elif fixed_quote_trailing_up:
                             next_trailing_up_steps = 0
                             trailing_up_size = self._trailing_up_fixed_quote_size_locked(trail_up_price)
                             virtual_metadata = None
-                            self._trailing_up_steps = 0
+                            self._trailing_up_ext_steps = 0
                         else:
                             next_trailing_up_steps = 0
                             trailing_up_size = order_size
                             virtual_metadata = None
-                            self._trailing_up_steps = 0
+                            self._trailing_up_ext_steps = 0
 
                         self.levels.append(trail_up_price)
 
@@ -2279,14 +2278,14 @@ class GridEngine:
                                     f"BUY {_price_key(next_buy_price)} size {fmt_amount(buy_size)} y nueva "
                                     f"virtual SELL {trail_up_key} size {fmt_amount(trailing_up_size)} "
                                     f"(step {next_trailing_up_steps}, factor "
-                                    f"{self._trailing_up_factor_for_steps(next_trailing_up_steps):.3f})"
+                                    f"{self._extended_up_factor_for_steps(next_trailing_up_steps):.3f})"
                                 )
                             else:
                                 trailing_logs.append(
                                     f"[ENGINE] Rebalance trailing up extended: virtual SELL registrada en {trail_up_key} "
                                     f"size {fmt_amount(trailing_up_size)} "
                                     f"(step {next_trailing_up_steps}, factor "
-                                    f"{self._trailing_up_factor_for_steps(next_trailing_up_steps):.3f})"
+                                    f"{self._extended_up_factor_for_steps(next_trailing_up_steps):.3f})"
                                 )
                         elif fixed_quote_trailing_up:
                             quote = self._trailing_up_fixed_quote_locked()
