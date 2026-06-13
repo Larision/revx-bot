@@ -5,27 +5,66 @@ from config import LOG_PATH
 from types_ import LogEntry
 
 
-fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+# ============================
+#  Color Formatter (solo consola)
+# ============================
 
-# Logger principal: consola + fichero
+class ColorFormatter(logging.Formatter):
+    COLORS = {
+        "DEBUG": "\033[37m",     # gris
+        "INFO": "\033[36m",      # cyan
+        "WARNING": "\033[33m",   # amarillo
+        "ERROR": "\033[31m",     # rojo
+        "CRITICAL": "\033[41m",  # fondo rojo
+    }
+    RESET = "\033[0m"
+
+    def format(self, record):
+        levelname = record.levelname
+        color = self.COLORS.get(levelname, "")
+        record.levelname = f"{color}{levelname}{self.RESET}"
+        return super().format(record)
+
+
+# ============================
+#  Formatters
+# ============================
+
+fmt_file = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+fmt_console = ColorFormatter("%(asctime)s [%(levelname)s] %(message)s")
+
+
+# ============================
+#  Logger principal: consola + fichero
+# ============================
+
 logger = logging.getLogger("grid_engine_v1.2")
 logger.setLevel(logging.INFO)
 
+# Consola (con colores)
 ch = logging.StreamHandler()
-ch.setFormatter(fmt)
+ch.setFormatter(fmt_console)
 logger.addHandler(ch)
 
+# Fichero (sin colores)
 fh = logging.FileHandler(LOG_PATH, encoding="utf-8")
-fh.setFormatter(fmt)
+fh.setFormatter(fmt_file)
 logger.addHandler(fh)
 
-# Logger solo-fichero: para show_grid_preview y otros sitios
-# donde el print ya cubre la consola y no queremos duplicados
+
+# ============================
+#  Logger solo-fichero
+# ============================
+
 file_logger = logging.getLogger("grid_engine_v1.2.file")
 file_logger.setLevel(logging.INFO)
 file_logger.addHandler(fh)
 file_logger.propagate = False
 
+
+# ============================
+#  Funciones de logging
+# ============================
 
 def log_event(
     message: str,
@@ -67,3 +106,4 @@ def log_fill(side: str, price: str, quantity: str) -> None:
             writer.writerow([ts, side, price, quantity, value_usd])
     except Exception as e:
         logger.warning(f"[FILLS] Error escribiendo fills.csv: {e}")
+
