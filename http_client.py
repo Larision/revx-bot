@@ -142,7 +142,8 @@ def send_request(
         return response_json, logs
     except ValueError:
         if r.status_code == 204:
-            log_event(f"Respuesta vacía (status {r.status_code}), operación exitosa.", "info", logs)
+            if logs is not None:
+                logs.append({"level": "info", "msg": f"Respuesta vacía (status {r.status_code}), operación exitosa."})
             return {"status_code": r.status_code, "text": ""}, logs
         log_event(f"Respuesta vacía. Comprobar manualmente.(status {r.status_code})", "warning", logs)
         return {"status_code": r.status_code, "text": r.text}, logs
