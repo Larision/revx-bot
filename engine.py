@@ -139,8 +139,8 @@ class GridEngine:
         self._trailing_up_ext_steps: int = 0
 
         # Trailing up fixed_quote:
-        # - El quote se bloquea al activar el modo, usando el precio central
-        #   actual de la rejilla.
+        # - El quote se bloquea al activar el modo, usando el valor central
+        #   de toda la rejilla actual.
         self._trailing_up_fixed_quote_anchor: Optional[Decimal] = None
 
         # Trailing down extendido:
@@ -220,13 +220,24 @@ class GridEngine:
         return self._extended_up_size_for_steps(self._trailing_up_ext_steps)
 
     def _current_trailing_up_fixed_quote_anchor_locked(self) -> Optional[Decimal]:
-        """Precio central actual usado al iniciar fixed_quote."""
-        if self.center_price is None:
-            return None
-        return Decimal(str(self.center_price)).quantize(TICK_SIZE, rounding=ROUND_DOWN)
+        """Valor central de toda la rejilla actual usado al iniciar fixed_quote."""
+        levels = sorted(set(self.levels))
+        if not levels:
+            return (
+                Decimal(str(self.center_price)).quantize(TICK_SIZE, rounding=ROUND_DOWN)
+                if self.center_price is not None else None
+            )
+
+        midpoint = len(levels) // 2
+        if len(levels) % 2 == 1:
+            anchor = levels[midpoint]
+        else:
+            anchor = (levels[midpoint - 1] + levels[midpoint]) / Decimal("2")
+
+        return Decimal(str(anchor)).quantize(TICK_SIZE, rounding=ROUND_DOWN)
 
     def _lock_trailing_up_fixed_quote_anchor_locked(self) -> Optional[Decimal]:
-        """Fija el ancla de fixed_quote en el precio central actual."""
+        """Fija el ancla de fixed_quote en el valor central de toda la rejilla."""
         anchor = self._current_trailing_up_fixed_quote_anchor_locked()
         self._trailing_up_fixed_quote_anchor = anchor
         return anchor
@@ -911,7 +922,7 @@ class GridEngine:
                     or (
                         current_anchor is not None
                         and stored_anchor is not None
-                        and stored_anchor > current_anchor
+                        and stored_anchor != current_anchor
                     )
                 )
                 if should_relock_anchor:
