@@ -43,7 +43,7 @@ class ShortColorFormatter(ColorFormatter):
 
         def repl(m):
             uid = m.group(1)
-            return f"{{{uid[:4]}...{uid[-6:]}}}"
+            return f"{uid[:4]}...{uid[-6:]}"
 
         record.msg = UUID_RE.sub(repl, msg)
         record.args = ()
