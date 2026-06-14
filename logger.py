@@ -1,8 +1,14 @@
+import copy
 import logging
+import re
 from typing import List, Optional
 
 from config import LOG_PATH
 from types_ import LogEntry
+
+UUID_RE = re.compile(
+    r"\{?([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})\}?"
+)
 
 
 # ============================
@@ -27,11 +33,29 @@ class ColorFormatter(logging.Formatter):
 
 
 # ============================
+# Short UUID Formatter (solo consola)
+# ============================
+
+class ShortColorFormatter(ColorFormatter):
+    def format(self, record):
+        record = copy.copy(record)  # no mutar el record para el file handler
+        msg = record.getMessage()
+
+        def repl(m):
+            uid = m.group(1)
+            return f"{{{uid[:4]}...{uid[-6:]}}}"
+
+        record.msg = UUID_RE.sub(repl, msg)
+        record.args = ()
+        return super().format(record)
+
+
+# ============================
 #  Formatters
 # ============================
 
 fmt_file = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-fmt_console = ColorFormatter("%(asctime)s [%(levelname)s] %(message)s")
+fmt_console = ShortColorFormatter("%(asctime)s [%(levelname)s] %(message)s")
 
 
 # ============================
