@@ -10,7 +10,7 @@ from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from typing import Any, Optional, Sequence, cast
 
-from api import _price_key, fmt_amount, get_market_trades_page, get_candles
+from api import _price_key, fmt_amount, get_historic_market_trades, get_candles
 from cli import _epoch_ms_to_iso
 from config import SYMBOL, TICK_SIZE, WINDOW_MS
 from engine import GridEngine
@@ -536,7 +536,7 @@ def _load_market_trades(symbol: str, since: int, until: int) -> list[dict[str, A
 
         cursor = None
         while True:
-            response, logs = get_market_trades_page(
+            response, logs = get_historic_market_trades(
                 symbol=symbol,
                 start_date=window_start,
                 end_date=window_end,

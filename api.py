@@ -326,7 +326,7 @@ def get_private_trades(
     return response, logs
 
 
-def get_market_trades_page(
+def get_historic_market_trades(
     symbol: str,
     start_date: Optional[int] = None,
     end_date: Optional[int] = None,
@@ -334,7 +334,7 @@ def get_market_trades_page(
     cursor: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], List[LogEntry]]:
     """
-    Recupera una pagina de trades publicos de mercado para un simbolo.
+    Recupera los trades historicos de mercado para un simbolo.
 
     El endpoint pagina con cursor y acepta fechas epoch en milisegundos. El
     limite se acota al maximo admitido para evitar rechazos de API.

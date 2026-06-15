@@ -194,7 +194,7 @@ def exportar_datos_mercado():
         print("La fecha de inicio no puede ser mayor que la fecha de fin.")
         return
 
-    from api import get_market_trades_page
+    from api import get_historic_market_trades
 
     all_rows: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
@@ -209,7 +209,7 @@ def exportar_datos_mercado():
 
         cursor = None
         while True:
-            response, logs = get_market_trades_page(
+            response, logs = get_historic_market_trades(
                 symbol=symbol,
                 start_date=window_start,
                 end_date=window_end,
