@@ -10,7 +10,7 @@ from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from typing import Any, Optional, Sequence, cast
 
-from api import _price_key, fmt_amount, get_market_trades_page
+from api import _price_key, fmt_amount, get_market_trades_page, get_candles
 from cli import _epoch_ms_to_iso
 from config import SYMBOL, TICK_SIZE, WINDOW_MS
 from engine import GridEngine
@@ -104,7 +104,7 @@ class PaperGridEngine(GridEngine):
         self.trailing_up_enabled = True
         self.trailing_down_mode = 'extended'
         self.trailing_down_enabled = True
-        self._trailing_up_steps = 0
+        self._trailing_up_ext_steps = 0
         self._trailing_down_extended_drops = 0
 
     def initialize(self, recover_state: Optional[bool] = None) -> None:
@@ -362,6 +362,83 @@ def _item_time_ms(item: dict[str, Any]) -> int:
 
 def _trade_price(trade: dict[str, Any]) -> Decimal:
     return _decimal_from_item(trade, "price", "p", "rate")
+
+
+def _extract_candle_default_price(candles_resp: Any, *, since: Optional[int] = None, until: Optional[int] = None) -> Optional[Decimal]:
+    """
+    Extrae un precio por defecto a partir de una vela diaria.
+
+    Usa la media entre open y close de la vela que caiga dentro del rango
+    [since, until]. Si hay varias, prioriza la más cercana a since.
+    Soporta respuestas en forma de lista o de dict con claves habituales.
+    """
+    rows: list[dict[str, Any]] = []
+
+    if isinstance(candles_resp, dict):
+        for key in ("data", "candles", "result"):
+            value = candles_resp.get(key)
+            if isinstance(value, list):
+                rows = [row for row in value if isinstance(row, dict)]
+                break
+        if not rows:
+            for value in candles_resp.values():
+                if isinstance(value, list):
+                    rows = [row for row in value if isinstance(row, dict)]
+                    if rows:
+                        break
+    elif isinstance(candles_resp, list):
+        rows = [row for row in candles_resp if isinstance(row, dict)]
+
+    if not rows:
+        return None
+
+    if since is not None or until is not None:
+        filtered: list[dict[str, Any]] = []
+        for row in rows:
+            start_value = row.get("start")
+            if start_value is None:
+                continue
+            try:
+                start_ms = int(start_value)
+            except Exception:
+                continue
+            if since is not None and start_ms < since:
+                continue
+            if until is not None and start_ms > until:
+                continue
+            filtered.append(row)
+        if filtered:
+            rows = sorted(filtered, key=lambda row: int(row.get("start") or 0))
+
+    candle = rows[0]
+    try:
+        open_price = _decimal_from_item(candle, "open", "o", "op", "open_price")
+        close_price = _decimal_from_item(candle, "close", "c", "cl", "close_price")
+    except Exception:
+        return None
+
+    return (open_price + close_price) / Decimal("2")
+
+
+def _default_initial_price_from_date(date_str: str, fallback: Decimal) -> Decimal:
+    """
+    Calcula el precio inicial por defecto usando la vela diaria del día elegido.
+    Si la API falla o no devuelve datos útiles, usa el fallback.
+    """
+    try:
+        since = _parse_date_to_ms(date_str)
+        until = _parse_date_to_ms(date_str, end_of_day=True)
+        response, logs = get_candles(SYMBOL, 1440, since=since, until=until)
+        for l in logs:
+            log_event(f"[LOG] {l['msg']}", l.get("level", "info"))
+        if isinstance(response, dict) and response.get("error"):
+            return fallback
+        price = _extract_candle_default_price(response, since=since, until=until)
+        if price is None or price <= 0:
+            return fallback
+        return price.quantize(TICK_SIZE, rounding=ROUND_DOWN)
+    except Exception:
+        return fallback
 
 
 def _quantize_price(price: Decimal) -> Decimal:
@@ -778,13 +855,17 @@ def prompt_backtest() -> None:
                     print("Valor invalido. Debe ser cero o mayor.")
                     continue
                 return value
+        
+        start_date = ask_date("Fecha inicio (YYYYMMDD)", start_default)
+        suggested_initial_price = _default_initial_price_from_date(start_date, Decimal(default_price))
+        end_date = ask_date("Fecha final (YYYYMMDD)", end_default)
 
         saldo = ask_decimal("Saldo USDC", default_saldo)
         # Permite ingresar listas de sizes y steps para ejecutar múltiples combinaciones de backtest.
         sizes = ask_decimal_list("Size BTC por orden. Admite varios sizes separados por comas.", default_size)
         steps = ask_decimal_list("Step USDC entre lineas. Admite varios steps separados por comas.", default_step)
 
-        initial_price = ask_decimal("Precio inicial", default_price)
+        initial_price = ask_decimal("Precio inicial", fmt_amount(suggested_initial_price))
 
         center = _quantize_price(initial_price)
         combos = [(size, step) for size in sizes for step in steps]
@@ -798,11 +879,12 @@ def prompt_backtest() -> None:
             for size, step in combos
         ]
         max_total_lines = min(max_lines_by_combo) if max_lines_by_combo else 0
+        mitad_lines = max_total_lines // 2
         print(
             f"\nBacktests a ejecutar: {len(combos)} "
             f"({len(sizes)} size(s) x {len(steps)} step(s))."
         )
-        print(f"Lineas maximas estimadas para que quepan todas las combinaciones: {max_total_lines} en total (si todas fuesen abajo).")
+        print(f"Lineas maximas estimadas para que quepan todas las combinaciones: {mitad_lines} en por lado (puede variar algo segun el caso).")
         print("La distribucion arriba/abajo cambia el saldo necesario.")
 
         if max_total_lines <= 0:
@@ -811,8 +893,8 @@ def prompt_backtest() -> None:
 
         valid_combos: list[tuple[Decimal, Decimal]] = []
         while True:
-            levels_above = ask_non_negative_int("Cuantas lineas quieres poner arriba", 0)
-            levels_below = ask_non_negative_int("Cuantas lineas quieres poner abajo", max_total_lines)
+            levels_above = ask_non_negative_int("Cuantas lineas quieres poner arriba", mitad_lines)
+            levels_below = ask_non_negative_int("Cuantas lineas quieres poner abajo", mitad_lines)
 
             if levels_above + levels_below <= 0:
                 print("[!] Debes colocar al menos una linea.")
@@ -846,8 +928,6 @@ def prompt_backtest() -> None:
                 print(f"[!] Se omitiran {len(skipped_combos)} combinacion(es) que no caben en el saldo.")
             break
 
-        start_date = ask_date("Fecha inicio (YYYYMMDD)", start_default)
-        end_date = ask_date("Fecha final (YYYYMMDD)", end_default)
         trailing_ups = ask_trailing_modes(
             "Trailing up",
             default_trailing_up,
