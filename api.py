@@ -367,7 +367,7 @@ def get_candles(
     until: Optional[int] = None,
 ) -> Tuple[Dict[str, Any], List[LogEntry]]:
     """
-    Recupera candles publicas para un simbolo e intervalo.
+    Recupera candles historicos para un simbolo e intervalo.
 
     Args:
         symbol: Par de mercado en formato de la API.
