@@ -199,8 +199,8 @@ class GridEngine:
         """Retorna True si la orden pertenece al grid extendido inferior."""
         return bool(info) and bool(info.get("extended"))
 
-    def _extended_up_order_size(self) -> Decimal:
-        """Tamaño fijo de las órdenes extended: 50% del base_size."""
+    def _extended_down_order_size(self) -> Decimal:
+        """Tamaño fijo de las órdenes down extended: 50% del base_size."""
         return self.base_size * Decimal("0.5")
 
     def _extended_up_factor_for_steps(self, steps: Optional[int] = None) -> Decimal:
@@ -606,6 +606,29 @@ class GridEngine:
             ]
             self.extended_levels.pop(floor_key, None)
             return floor_key
+        
+    def _replace_floor_virtual_after_cancel(
+        self,
+        canceled_price: Decimal,
+        size: Decimal,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Recrea la virtual BUY de suelo tras una cancelación de BUY real bajo."""
+        key = _price_key(canceled_price)
+        with self._state_lock:
+            if key in self.active_orders:
+                return
+
+            self.active_orders[key] = cast(OrderInfo, {
+                "side": "buy",
+                "order_id": "virtual",
+                "price": canceled_price,
+                "size": size,
+                "placed_at": time.time(),
+                **(metadata or {}),
+            })
+            self.levels.append(canceled_price)
+            self.levels = sorted(set(self.levels))
 
     def _remove_highest_virtual_sell_order(self) -> Optional[str]:
         """Elimina la virtual SELL que hace de techo cuando trailing down desmonta SELLs altos."""
@@ -727,14 +750,11 @@ class GridEngine:
                         self.extended_levels.pop(cancel_level_key, None)
 
                 if not floor_virtual_removed:
-                    removed_virtual_key = self._remove_lowest_virtual_buy_order()
+                    self._replace_floor_virtual_after_cancel(
+                        canceled_price=cancel_price,
+                        size=cancel_size,
+                    )
                     floor_virtual_removed = True
-                    if removed_virtual_key is not None:
-                        log_event(
-                            f"[ENGINE] Trailing up: virtual BUY de suelo {removed_virtual_key} "
-                            f"eliminada tras la primera cancelacion de BUY bajo",
-                            "info"
-                        )
 
                 estimated_available += estimated_release
                 if estimated_available >= required:
@@ -2013,7 +2033,7 @@ class GridEngine:
 
                 if is_virtual:
                     if self.trailing_down_mode == "extended":
-                        extended_size = self._extended_up_order_size()
+                        extended_size = self._extended_down_order_size()
                         next_buy_price = (price - grid_step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
 
                         self._trailing_down_extended_drops += 1
@@ -2127,10 +2147,18 @@ class GridEngine:
                 next_buy_price = (price - base_step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
 
                 if self.trailing_down_mode == "extended":
-                    extended_size = self._extended_up_order_size()
+                    extended_size = self._extended_down_order_size()
                     self._mark_extended_level_locked(next_buy_price, base_step)
 
                     orders_to_place.append((next_sell_price, "sell", order_size, None))
+
+                    # Si el toque del suelo principal viene de una BUY virtual
+                    # recreada tras cancelar BUYs bajos, esa BUY no ha aportado
+                    # BTC real. Hay que liberar BTC cancelando SELLs altos antes
+                    # de colocar la SELL de rebalance, igual que en el resto de
+                    # activaciones virtuales de trailing down.
+                    if is_virtual:
+                        trailing_down_sell_release_keys.add(_price_key(next_sell_price))
 
                     next_buy_key = _price_key(next_buy_price)
                     if next_buy_key not in self.active_orders:
@@ -2207,21 +2235,21 @@ class GridEngine:
 
                 if fixed_quote_trailing_up:
                     buy_metadata = None
-                    # Cuando se ejecuta una SELL real del techo principal, el BUY
-                    # inmediatamente inferior sigue siendo la pareja normal de esa
-                    # linea y conserva el size ejecutado. El fixed_quote empieza en
-                    # la virtual superior; si esa virtual se activa, entonces el
-                    # BUY resultante usa quote fijo, limitado como maximo al base_size.
-                    buy_size = (
-                        self._trailing_up_fixed_quote_size_locked(next_buy_price)
-                        if is_virtual else order_size
-                    )
+                    # El BUY inmediatamente inferior es la pareja exacta del SELL
+                    # ejecutado/virtual y debe conservar su mismo size. El size
+                    # fixed_quote ya queda fijado al crear la SELL virtual anterior;
+                    # recalcularlo aquí puede descompensar BTC/USDC por redondeos
+                    # o por estados antiguos sin metadata completa.
+                    buy_size = order_size
                 else:
                     buy_metadata = (
                         self._trailing_up_metadata_for_step(current_trailing_up_step)
                         if extended_trailing_up else None
                     )
-                    buy_size = self._trailing_up_size_from_metadata(buy_metadata, order_size)
+                    # Regla contable: la orden pareja debe tener el mismo size que
+                    # la orden ejecutada. La metadata solo sirve para mantener el
+                    # step lógico del trailing up, no para recalcular el tamaño.
+                    buy_size = order_size
 
                 orders_to_place.append((
                     next_buy_price,
@@ -2331,7 +2359,11 @@ class GridEngine:
                 if trailing_up_mode == "extended":
                     trailing_up_step = self._trailing_up_step_from_order_locked(price, "buy", info)
                     trailing_up_metadata = self._trailing_up_metadata_for_step(trailing_up_step)
-                    trailing_up_size = self._trailing_up_size_from_metadata(trailing_up_metadata, order_size)
+                    # El SELL colocado tras un BUY real debe vender exactamente el
+                    # BTC comprado en ese fill. Recalcular por trailing_up_step puede
+                    # pedir mas BTC del adquirido cuando el size real del BUY es menor
+                    # que el teorico inferido por precio/metadata.
+                    trailing_up_size = order_size
                 else:
                     trailing_up_metadata = None
                     trailing_up_size = order_size
@@ -2351,15 +2383,13 @@ class GridEngine:
                 if trailing_up_mode == "extended":
                     trailing_up_step = self._trailing_up_step_from_order_locked(price, "sell", info)
                     trailing_up_metadata = self._trailing_up_metadata_for_step(trailing_up_step)
-                    trailing_up_size = self._trailing_up_size_from_metadata(trailing_up_metadata, order_size)
+                    # El BUY colocado tras un SELL real recompra exactamente el size
+                    # vendido. La reduccion/incremento de size solo se aplica al crear
+                    # nuevos niveles virtuales, no al cerrar la pareja de un fill.
+                    trailing_up_size = order_size
                 elif trailing_up_mode == "fixed_quote":
-                    anchor_high = self._trailing_up_anchor_high_locked()
-                    use_fixed_quote = anchor_high is not None and price >= anchor_high
                     trailing_up_metadata = None
-                    trailing_up_size = (
-                        self._trailing_up_fixed_quote_size_locked(next_buy_price)
-                        if use_fixed_quote else order_size
-                    )
+                    trailing_up_size = order_size
                 else:
                     trailing_up_metadata = None
                     trailing_up_size = order_size
@@ -2417,20 +2447,42 @@ class GridEngine:
 
         for price_to_place, side_to_place, size_to_place, metadata in orders_to_place:
             place_key = _price_key(price_to_place)
-            if side_to_place == "buy" and place_key in trailing_up_buy_release_keys:
+
+            # Regla defensiva: cualquier orden real creada como consecuencia
+            # directa de una activación virtual necesita liberar el activo
+            # correspondiente antes de enviarse. Una virtual no reserva ni
+            # entrega saldo real en el exchange/backtest.
+            needs_usdc_release = (
+                side_to_place == "buy"
+                and (
+                    place_key in trailing_up_buy_release_keys
+                    or (is_virtual and side == "sell")
+                )
+            )
+            needs_btc_release = (
+                side_to_place == "sell"
+                and (
+                    place_key in trailing_down_sell_release_keys
+                    or (is_virtual and side == "buy")
+                )
+            )
+
+            if needs_usdc_release:
                 if not self._release_usdc_for_trailing_up_buy(price_to_place, size_to_place):
                     log_event(
                         f"[ENGINE] Trailing up: BUY {place_key} omitido por USDC insuficiente",
                         "warning"
                     )
                     continue
-            if side_to_place == "sell" and place_key in trailing_down_sell_release_keys:
+
+            if needs_btc_release:
                 if not self._release_btc_for_trailing_down_sell(price_to_place, size_to_place):
                     log_event(
                         f"[ENGINE] Trailing down extended: SELL {place_key} omitido por BTC insuficiente",
                         "warning"
                     )
                     continue
+
             self._place_order_safe(price_to_place, side_to_place, size_to_place, metadata=metadata)
 
         for virtual_key, virtual_info in virtual_orders_to_add:
@@ -2536,7 +2588,7 @@ class GridEngine:
                 if raw_step is not None:
                     grid_step = self._decimal_from_meta(raw_step, step)
                     paired_sell_price = (level + grid_step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
-                    order_size = self._extended_up_order_size()
+                    order_size = self._extended_down_order_size()
                     metadata = {
                         "extended": True,
                         "grid_step": grid_step,
@@ -2559,7 +2611,7 @@ class GridEngine:
                             continue
 
                         if paired_sell_price == level:
-                            order_size = self._extended_up_order_size()
+                            order_size = self._extended_down_order_size()
                             metadata = {
                                 "extended": True,
                                 "grid_step": grid_step,
