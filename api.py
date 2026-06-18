@@ -223,6 +223,73 @@ def cancel_all_orders() -> Tuple[Dict[str, Any], List[LogEntry]]:
     return response, logs
 
 
+def replace_order(
+    venue_order_id: str,
+    *,
+    price: Optional[Decimal] = None,
+    base_size: Optional[Decimal] = None,
+    quote_size: Optional[Decimal] = None,
+    execution_instructions: Optional[List[str]] = None,
+    client_order_id: Optional[str] = None,
+) -> Tuple[Optional[str], List[LogEntry]]:
+    """
+    Reemplaza una orden existente.
+
+    Retorna (new_order_id, logs), donde new_order_id es el nuevo
+    venue_order_id devuelto por la API o None si falló.
+
+    Nota: la API actualiza el venue_order_id al reemplazar la orden,
+    por lo que el caller debe sustituir el ID antiguo por el nuevo en estado.
+    """
+    import uuid
+    logs: List[LogEntry] = []
+
+    if not venue_order_id:
+        log_event("[API] replace_order: venue_order_id vacío.", "error", logs)
+        return None, logs
+
+    body: Dict[str, Any] = {
+        "client_order_id": client_order_id or str(uuid.uuid4())
+    }
+
+    if base_size is not None:
+        body["base_size"] = fmt_amount(base_size)
+
+    if quote_size is not None:
+        body["quote_size"] = fmt_amount(quote_size)
+
+    if price is not None:
+        body["price"] = _price_key(price)
+
+    # None = preservar instrucciones originales. [] = limpiarlas explícitamente.
+    if execution_instructions is not None:
+        body["execution_instructions"] = execution_instructions
+
+    resp, req_logs = send_request("PUT", f"/api/1.0/orders/{venue_order_id}", body=body)
+    logs.extend(req_logs)
+
+    new_order_id: Optional[str] = None
+    if isinstance(resp, dict) and not resp.get("error"):
+        data = resp.get("data")
+
+        if isinstance(data, dict):
+            venue = data.get("venue_order_id")
+            if isinstance(venue, str):
+                new_order_id = venue
+
+        elif isinstance(data, list) and data:
+            first = data[0]
+            if isinstance(first, dict):
+                venue = first.get("venue_order_id")
+                if isinstance(venue, str):
+                    new_order_id = venue
+
+    if not new_order_id:
+        log_event(f"[API] replace_order: no se obtuvo nuevo venue_order_id. Respuesta: {resp}", "error", logs)
+
+    return new_order_id, logs
+
+
 def place_order(
     side: str,
     price: Decimal,
