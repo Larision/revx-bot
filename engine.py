@@ -582,42 +582,86 @@ class GridEngine:
         return key, info
 
     def _remove_lowest_virtual_buy_order(self) -> Optional[str]:
-        """Elimina la virtual BUY que hace de suelo cuando trailing up desmonta BUYs bajos."""
+        """Elimina una virtual BUY antigua del suelo del grid."""
         with self._state_lock:
-            candidates: List[Tuple[Decimal, str]] = []
-            for key, info in self.active_orders.items():
-                if info.get('side') != 'buy':
-                    continue
-                if str(info.get('order_id')) != 'virtual':
-                    continue
-                try:
-                    candidates.append((Decimal(key), key))
-                except Exception:
-                    continue
+            removed_keys = self._prune_floor_virtual_buys_locked(keep_key=None)
+            return removed_keys[0] if removed_keys else None
 
-            if not candidates:
-                return None
+    def _prune_floor_virtual_buys_locked(self, keep_key: Optional[str] = None) -> List[str]:
+        """
+        Deja una sola BUY virtual de suelo y elimina las demas.
 
-            _, floor_key = min(candidates, key=lambda item: item[0])
-            self.active_orders.pop(floor_key, None)
-            self.levels = [
-                lvl for lvl in self.levels
-                if _price_key(lvl) != floor_key
-            ]
-            self.extended_levels.pop(floor_key, None)
-            return floor_key
-        
+        La BUY virtual representa el siguiente centinela inferior del grid. Cuando
+        trailing up cancela BUYs bajos para liberar USDC, ese centinela debe
+        desplazarse al ultimo BUY cancelado, no acumular todos los anteriores.
+        Debe llamarse con self._state_lock adquirido.
+        """
+        candidates: List[Tuple[Decimal, str]] = []
+        for key, info in self.active_orders.items():
+            if info.get("side") != "buy":
+                continue
+            if str(info.get("order_id")) != "virtual":
+                continue
+            try:
+                candidates.append((Decimal(key), key))
+            except Exception:
+                continue
+
+        if not candidates:
+            return []
+
+        if keep_key is None:
+            # Si no se indica una clave concreta, conserva la virtual mas cercana
+            # al grid real: la de mayor precio entre las BUY virtuales existentes.
+            _, keep_key = max(candidates, key=lambda item: item[0])
+
+        keys_to_remove = {key for _, key in candidates if key != keep_key}
+        if not keys_to_remove:
+            return []
+
+        for key in keys_to_remove:
+            self.active_orders.pop(key, None)
+            self.extended_levels.pop(key, None)
+
+        self.levels = [
+            lvl for lvl in self.levels
+            if _price_key(lvl) not in keys_to_remove
+        ]
+        return sorted(keys_to_remove, key=lambda value: Decimal(value))
+
+    def _metadata_for_virtual_from_cancelled_order(self, info: OrderInfo) -> Dict[str, Any]:
+        """Conserva metadata relevante al convertir una BUY real cancelada en virtual."""
+        metadata: Dict[str, Any] = {}
+        for meta_key in (
+            "extended",
+            "grid_step",
+            "paired_buy_price",
+            "paired_sell_price",
+            "trailing_up_step",
+        ):
+            if meta_key in info and info.get(meta_key) is not None:
+                metadata[meta_key] = info.get(meta_key)
+        return metadata
+
     def _replace_floor_virtual_after_cancel(
         self,
         canceled_price: Decimal,
         size: Decimal,
         metadata: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        """Recrea la virtual BUY de suelo tras una cancelación de BUY real bajo."""
+    ) -> List[str]:
+        """
+        Recoloca la virtual BUY de suelo tras cancelar un BUY real bajo.
+
+        Corrige el caso en el que cada cancelacion iba dejando una BUY virtual
+        antigua en active_orders/levels. La funcion crea o actualiza el nuevo
+        centinela y elimina el resto de BUYs virtuales inferiores.
+        """
         key = _price_key(canceled_price)
+        removed_virtuals: List[str]
         with self._state_lock:
-            if key in self.active_orders:
-                return
+            current = self.active_orders.get(key)
+            if current is not None and str(current.get("order_id")) != "virtual":
+                return []
 
             self.active_orders[key] = cast(OrderInfo, {
                 "side": "buy",
@@ -629,6 +673,9 @@ class GridEngine:
             })
             self.levels.append(canceled_price)
             self.levels = sorted(set(self.levels))
+            removed_virtuals = self._prune_floor_virtual_buys_locked(keep_key=key)
+
+        return removed_virtuals
 
     def _remove_highest_virtual_sell_order(self) -> Optional[str]:
         """Elimina la virtual SELL que hace de techo cuando trailing down desmonta SELLs altos."""
@@ -681,7 +728,6 @@ class GridEngine:
         target_key = _price_key(target_price)
         excluded_keys: set[str] = {target_key}
         cancellations = 0
-        floor_virtual_removed = False
 
         estimated_available = self._get_available_usdc()
         if estimated_available >= required:
@@ -749,12 +795,18 @@ class GridEngine:
                         ]
                         self.extended_levels.pop(cancel_level_key, None)
 
-                if not floor_virtual_removed:
-                    self._replace_floor_virtual_after_cancel(
-                        canceled_price=cancel_price,
-                        size=cancel_size,
+                removed_floor_virtuals = self._replace_floor_virtual_after_cancel(
+                    canceled_price=cancel_price,
+                    size=cancel_size,
+                    metadata=self._metadata_for_virtual_from_cancelled_order(cancel_info),
+                )
+                if removed_floor_virtuals:
+                    log_event(
+                        f"[ENGINE] Trailing up: virtuales BUY antiguas eliminadas "
+                        f"tras mover suelo a {cancel_level_key}: "
+                        + ", ".join(removed_floor_virtuals),
+                        "info",
                     )
-                    floor_virtual_removed = True
 
                 estimated_available += estimated_release
                 if estimated_available >= required:
@@ -1376,6 +1428,8 @@ class GridEngine:
                 if len(missing_levels) == 1:
                     last_fill_price = missing_levels[0]
 
+            removed_virtual_buys: List[str] = []
+
             with self._state_lock:
                 self.levels_below = levels_below
                 self.levels_above = levels_above
@@ -1411,17 +1465,25 @@ class GridEngine:
                 self.trailing_down_mode = trailing_down_mode
                 self.trailing_down_enabled = trailing_down_mode != 'off'
                 self._trailing_down_extended_drops = max(0, trailing_down_extended_drops)
+                removed_virtual_buys = self._prune_floor_virtual_buys_locked(keep_key=None)
 
             saved_at = raw.get("saved_at", 0)
             age_min = (time.time() - saved_at) / 60
             log_event(
                 f"[STATE] Estado recuperado de {STATE_PATH} "
                 f"(guardado hace {age_min:.1f} min, "
-                f"{len(active_orders)} órdenes, "
-                f"{len(levels)} niveles, "
+                f"{len(self.active_orders)} órdenes, "
+                f"{len(self.levels)} niveles, "
                 f"trailing_up_steps={self._trailing_up_ext_steps})",
                 "info"
             )
+            if removed_virtual_buys:
+                log_event(
+                    "[STATE] Virtuales BUY antiguas eliminadas al cargar estado: "
+                    + ", ".join(removed_virtual_buys),
+                    "info",
+                )
+                self.save_state()
             return True
 
         except Exception as e:
