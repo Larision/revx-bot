@@ -144,9 +144,9 @@ def get_current_price() -> Tuple[Optional[Decimal], List[LogEntry]]:
 
 def get_active_orders() -> Tuple[Dict[str, Any], List[LogEntry]]:
     """
-    Retrieve all active orders (new, pending_new, partially_filled).
+    Recupera todas las órdenes activas (new, pending_new, partially_filled).
 
-    Response example:
+    Ejemplo de respuesta:
     {
         "data": [
             {
@@ -169,7 +169,8 @@ def get_active_orders() -> Tuple[Dict[str, Any], List[LogEntry]]:
     return response, logs
 
 def get_order_by_id(order_id: str) -> Tuple[Dict[str, Any], List[LogEntry]]:
-    """Recupera una orden por ID.
+    """
+    Recupera una orden por ID.
     
     Ejemplo de respuesta:
     {
@@ -201,7 +202,7 @@ def get_all_balances() -> Tuple[Dict[str, Any], List[LogEntry]]:
     """
     Recupera todos los saldos de la cuenta.
 
-    Response example:
+    Ejemplo de respuesta:
     [
         { "currency": "BTC",  "available": "1.25", "reserved": "0.10", "total": "1.35" },
         { "currency": "USDC", "available": "5400", "reserved": "100",  "total": "5500" }
@@ -212,13 +213,17 @@ def get_all_balances() -> Tuple[Dict[str, Any], List[LogEntry]]:
 
 
 def cancel_order(order_id: str) -> Tuple[Dict[str, Any], List[LogEntry]]:
-    """Cancela una orden por ID. Returns 204 No Content on success."""
+    """
+    Cancela una orden por ID. Returns 204 No Content on success.
+    """
     response, logs = send_request("DELETE", f"/api/1.0/orders/{order_id}")
     return response, logs
 
 
 def cancel_all_orders() -> Tuple[Dict[str, Any], List[LogEntry]]:
-    """Cancela todas las órdenes activas. Returns 204 No Content on success."""
+    """
+    Cancela todas las órdenes activas. Returns 204 No Content on success.
+    """
     response, logs = send_request("DELETE", "/api/1.0/orders")
     return response, logs
 
@@ -240,6 +245,17 @@ def replace_order(
 
     Nota: la API actualiza el venue_order_id al reemplazar la orden,
     por lo que el caller debe sustituir el ID antiguo por el nuevo en estado.
+
+    Ejemplo de respuesta:
+    {
+        "data": [
+            {
+            "venue_order_id": "7a52e92e-8639-4fe1-abaa-68d3a2d5234b",
+            "client_order_id": "984a4d8a-2a9b-4950-822f-2a40037f02bd",
+            "state": "new"
+            }
+        ]
+    }
     """
     import uuid
     logs: List[LogEntry] = []
@@ -268,24 +284,31 @@ def replace_order(
     resp, req_logs = send_request("PUT", f"/api/1.0/orders/{venue_order_id}", body=body)
     logs.extend(req_logs)
 
+    def _extract_venue_id(payload: Any) -> Optional[str]:
+        if not isinstance(payload, dict):
+            return None
+        for field in ("venue_order_id", "id", "order_id"):
+            value = payload.get(field)
+            if isinstance(value, str) and value:
+                return value
+        return None
+
     new_order_id: Optional[str] = None
     if isinstance(resp, dict) and not resp.get("error"):
         data = resp.get("data")
 
         if isinstance(data, dict):
-            venue = data.get("venue_order_id")
-            if isinstance(venue, str):
-                new_order_id = venue
+            new_order_id = _extract_venue_id(data)
 
         elif isinstance(data, list) and data:
             first = data[0]
-            if isinstance(first, dict):
-                venue = first.get("venue_order_id")
-                if isinstance(venue, str):
-                    new_order_id = venue
+            new_order_id = _extract_venue_id(first)
+
+        if new_order_id is None:
+            new_order_id = _extract_venue_id(resp)
 
     if not new_order_id:
-        log_event(f"[API] replace_order: no se obtuvo nuevo venue_order_id. Respuesta: {resp}", "error", logs)
+        log_event(f"[API] replace_order: no se obtuvo nuevo venue_order_id/id. Respuesta: {resp}", "error", logs)
 
     return new_order_id, logs
 
@@ -343,7 +366,7 @@ def get_historical_orders(limit: int = 50) -> Tuple[Dict[str, Any], List[LogEntr
                filtra por created_date y no por updated_date — lo cual
                causa falsos negativos en órdenes antiguas que se ejecutan tarde.
 
-    Response example:
+    Ejemplo de respuesta:
     {
         "data": [
             { "id": "...", "status": "filled", "price": "60000.00", ... }
@@ -465,7 +488,7 @@ def get_order_book() -> Tuple[Dict[str, Any], List[LogEntry]]:
     Recupera el order book público para el símbolo configurado.
     No requiere autenticación.
 
-    Response example:
+    Ejemplo de respuesta:
     {
         "data": {
             "asks": [
@@ -521,7 +544,7 @@ def get_ticker() -> Tuple[Dict[str, Any], List[LogEntry]]:
     bid/ask y el precio calculado por el ultimo trade (last_price).
     Menos reactivo que el order book, se actualiza solo con trades.
 
-    Response example:
+    Ejemplo de respuesta:
     {
         "data": [
             {

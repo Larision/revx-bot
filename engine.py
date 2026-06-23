@@ -36,6 +36,7 @@ from api import (
     get_historical_orders,
     get_order_by_id,
     place_order as api_place_order,
+    replace_order as api_replace_order,
 )
 
 
@@ -538,7 +539,7 @@ class GridEngine:
                 if info.get('side') != 'sell':
                     continue
                 order_id = str(info.get('order_id'))
-                if order_id in {'virtual', 'pending_post_only', 'pending_manual', 'pending_cancel'}:
+                if order_id in {'virtual', 'pending_post_only', 'pending_manual', 'pending_cancel', 'pending_replace'}:
                     continue
                 if not include_extended and self._is_extended_down_order(info):
                     continue
@@ -568,7 +569,7 @@ class GridEngine:
                 if info.get('side') != 'buy':
                     continue
                 order_id = str(info.get('order_id'))
-                if order_id in {'virtual', 'pending_post_only', 'pending_manual', 'pending_cancel'}:
+                if order_id in {'virtual', 'pending_post_only', 'pending_manual', 'pending_cancel', 'pending_replace'}:
                     continue
                 try:
                     candidates.append((Decimal(key), key, self._clone_order_info(info)))
@@ -1257,7 +1258,7 @@ class GridEngine:
         if expected_order_id is not None and order_id != expected_order_id:
             return False, [], f"La orden en {key} cambió antes de confirmar la cancelación."
 
-        if order_id in {"virtual", "pending_post_only", "pending_manual", "pending_cancel"}:
+        if order_id in {"virtual", "pending_post_only", "pending_manual", "pending_cancel", "pending_replace"}:
             return False, [], f"La orden en {key} no existe todavía en el exchange."
 
         response, logs = self.cancel_order(order_id)
@@ -1786,6 +1787,256 @@ class GridEngine:
         """Wrapper sobre api.cancel_order para uso interno del engine."""
         return cancel_order(order_id)
 
+    def _fixed_quote_resize_candidates_locked(
+        self,
+    ) -> Tuple[
+        List[Tuple[str, OrderInfo, Decimal, Decimal]],
+        List[Tuple[str, OrderInfo, Decimal, Decimal]],
+    ]:
+        """Detecta SELLs de trailing_up fixed_quote que pueden volver a base_size.
+
+        Retorna dos listas con tuplas (price_key, snapshot_info, price, current_size):
+        - reales: requieren replace_order y BTC disponible para el incremento.
+        - state_only: virtuales/latentes que solo existen en el estado local.
+        """
+        default_size = Decimal(str(self.base_size))
+        if default_size <= 0:
+            return [], []
+
+        anchor = self._trailing_up_fixed_quote_anchor_locked()
+        if anchor is None:
+            return [], []
+
+        real_candidates: List[Tuple[str, OrderInfo, Decimal, Decimal]] = []
+        state_only_candidates: List[Tuple[str, OrderInfo, Decimal, Decimal]] = []
+        ignored_ids = {"pending_manual", "pending_cancel", "pending_replace"}
+
+        for key, info in sorted(
+            self.active_orders.items(),
+            key=lambda item: Decimal(str(item[0])),
+            reverse=True,
+        ):
+            if str(info.get("side")).lower() != "sell":
+                continue
+            if self._is_extended_down_order(info):
+                continue
+
+            try:
+                price = Decimal(str(info.get("price", key))).quantize(TICK_SIZE, rounding=ROUND_DOWN)
+            except Exception:
+                try:
+                    price = Decimal(str(key)).quantize(TICK_SIZE, rounding=ROUND_DOWN)
+                except Exception:
+                    continue
+
+            # En fixed_quote solo las SELL por encima del ancla quedan por debajo
+            # del base_size. Esto evita tocar SELLs normales del grid central.
+            if price <= anchor:
+                continue
+
+            current_size = self._order_size(info)
+            if current_size >= default_size:
+                continue
+
+            order_id = str(info.get("order_id"))
+            if order_id in ignored_ids:
+                continue
+
+            cloned = self._clone_order_info(info)
+            if order_id in {"virtual", "pending_post_only"}:
+                state_only_candidates.append((key, cloned, price, current_size))
+            else:
+                real_candidates.append((key, cloned, price, current_size))
+
+        return real_candidates, state_only_candidates
+
+    def preview_resize_trailing_up_fixed_quote_to_default(self) -> Dict[str, Any]:
+        """Previsualiza qué órdenes fixed_quote se redimensionarían a base_size."""
+        with self._state_lock:
+            mode = self._normalise_trailing_up_mode(self.trailing_up_mode)
+            default_size = Decimal(str(self.base_size))
+            anchor = self._trailing_up_fixed_quote_anchor_locked()
+
+            if mode != "fixed_quote":
+                return {
+                    "enabled": False,
+                    "reason": "trailing_up no está en fixed_quote",
+                    "default_size": default_size,
+                    "anchor": anchor,
+                    "real_orders": [],
+                    "state_only_orders": [],
+                    "required_btc": Decimal("0"),
+                }
+
+            real_candidates, state_only_candidates = self._fixed_quote_resize_candidates_locked()
+            required_btc = sum(
+                (default_size - current_size for _, _, _, current_size in real_candidates),
+                Decimal("0"),
+            )
+
+            def _items(candidates: List[Tuple[str, OrderInfo, Decimal, Decimal]]) -> List[Dict[str, Any]]:
+                rows: List[Dict[str, Any]] = []
+                for key, info, price, current_size in candidates:
+                    rows.append({
+                        "price_key": key,
+                        "price": price,
+                        "side": str(info.get("side")),
+                        "order_id": str(info.get("order_id")),
+                        "current_size": current_size,
+                        "target_size": default_size,
+                        "delta": default_size - current_size,
+                    })
+                return rows
+
+            return {
+                "enabled": True,
+                "reason": None,
+                "default_size": default_size,
+                "anchor": anchor,
+                "real_orders": _items(real_candidates),
+                "state_only_orders": _items(state_only_candidates),
+                "required_btc": required_btc,
+            }
+
+    def resize_trailing_up_fixed_quote_to_default(
+        self,
+    ) -> Tuple[bool, List[LogEntry], Optional[str], Dict[str, Any]]:
+        """Redimensiona las SELL de trailing_up fixed_quote al base_size del grid.
+
+        Las órdenes reales se actualizan con api.replace_order, porque el exchange
+        cambia el venue_order_id al reemplazarlas. Las virtuales o latentes solo
+        se actualizan en el estado local, ya que no existen todavía en el exchange.
+        """
+        logs: List[LogEntry] = []
+        summary: Dict[str, Any] = {
+            "resized_real": 0,
+            "updated_state_only": 0,
+            "skipped": 0,
+            "failed": [],
+            "required_btc": Decimal("0"),
+            "available_btc": Decimal("0"),
+        }
+
+        with self._state_lock:
+            mode = self._normalise_trailing_up_mode(self.trailing_up_mode)
+            if mode != "fixed_quote":
+                return False, logs, "Resize to default solo está disponible con trailing_up=fixed_quote.", summary
+
+            default_size = Decimal(str(self.base_size))
+            real_candidates, state_only_candidates = self._fixed_quote_resize_candidates_locked()
+            required_btc = sum(
+                (default_size - current_size for _, _, _, current_size in real_candidates),
+                Decimal("0"),
+            )
+            summary["required_btc"] = required_btc
+
+        if not real_candidates and not state_only_candidates:
+            return True, logs, None, summary
+
+        if required_btc > 0:
+            balances_resp, balance_logs = get_all_balances()
+            logs.extend(balance_logs)
+            _, available_btc = _parse_balances(balances_resp)
+            summary["available_btc"] = available_btc
+
+            if available_btc < required_btc:
+                msg = (
+                    "BTC disponible insuficiente para redimensionar SELLs fixed_quote: "
+                    f"{fmt_amount(available_btc)} < {fmt_amount(required_btc)}"
+                )
+                log_event(f"[ENGINE] {msg}", "warning")
+                return False, logs, msg, summary
+
+        for key, info_snapshot, price, current_size in real_candidates:
+            old_order_id = str(info_snapshot.get("order_id"))
+            target_size = Decimal(str(self.base_size))
+
+            with self._state_lock:
+                current = self.active_orders.get(key)
+                if (
+                    current is None
+                    or str(current.get("order_id")) != old_order_id
+                    or self._order_size(current) != current_size
+                ):
+                    summary["skipped"] += 1
+                    continue
+                current["order_id"] = "pending_replace"
+                current["placed_at"] = time.time()
+
+            new_order_id, replace_logs = api_replace_order(
+                old_order_id,
+                price=price,
+                base_size=target_size,
+            )
+            logs.extend(replace_logs)
+
+            if new_order_id:
+                with self._state_lock:
+                    current = self.active_orders.get(key)
+                    if current is not None and str(current.get("order_id")) == "pending_replace":
+                        current["order_id"] = new_order_id
+                        current["size"] = target_size
+                        current["price"] = price
+                        current["placed_at"] = time.time()
+                        summary["resized_real"] += 1
+
+                log_event(
+                    f"[ENGINE] Resize fixed_quote: SELL {key} "
+                    f"{fmt_amount(current_size)} -> {fmt_amount(target_size)} "
+                    f"({old_order_id} -> {new_order_id})",
+                    "info",
+                )
+                continue
+
+            with self._state_lock:
+                current = self.active_orders.get(key)
+                if current is not None and str(current.get("order_id")) == "pending_replace":
+                    current["order_id"] = old_order_id
+                    current["size"] = current_size
+                    current["price"] = price
+                    current["placed_at"] = info_snapshot.get("placed_at", time.time())
+
+            failure = f"SELL {key} ({old_order_id})"
+            cast(List[str], summary["failed"]).append(failure)
+            log_event(
+                f"[ENGINE] Resize fixed_quote fallido en {failure}",
+                "warning",
+            )
+
+        for key, info_snapshot, price, current_size in state_only_candidates:
+            target_size = Decimal(str(self.base_size))
+            old_order_id = str(info_snapshot.get("order_id"))
+            with self._state_lock:
+                current = self.active_orders.get(key)
+                if (
+                    current is None
+                    or str(current.get("order_id")) != old_order_id
+                    or self._order_size(current) != current_size
+                ):
+                    summary["skipped"] += 1
+                    continue
+
+                current["size"] = target_size
+                current["price"] = price
+                current["placed_at"] = time.time()
+                summary["updated_state_only"] += 1
+
+            log_event(
+                f"[ENGINE] Resize fixed_quote local: SELL {key} "
+                f"{fmt_amount(current_size)} -> {fmt_amount(target_size)} ({old_order_id})",
+                "info",
+            )
+
+        changed = bool(summary["resized_real"] or summary["updated_state_only"])
+        if changed:
+            self.save_state()
+
+        failed = cast(List[str], summary["failed"])
+        if failed:
+            return False, logs, "Algunas órdenes no se pudieron redimensionar.", summary
+
+        return True, logs, None, summary
+
     # ----------------------------------------------------------
     # DETECT FILLS
     # ----------------------------------------------------------
@@ -1871,7 +2122,7 @@ class GridEngine:
                         )
                 continue  # las virtuales nunca son cancelación externa
 
-            if oid in {"pending_manual", "pending_cancel"}:
+            if oid in {"pending_manual", "pending_cancel", "pending_replace"}:
                 continue
 
             if oid == "pending_post_only":
@@ -2253,7 +2504,7 @@ class GridEngine:
                         self.levels.remove(highest)
                         highest_key = _price_key(highest)
                         removed = self.active_orders.pop(highest_key, None)
-                        if removed is not None and removed["order_id"] not in {"virtual", "pending_post_only", "pending_manual", "pending_cancel"}:
+                        if removed is not None and removed["order_id"] not in {"virtual", "pending_post_only", "pending_manual", "pending_cancel", "pending_replace"}:
                             cancel_order_id = str(removed["order_id"])
                             cancel_level_key = highest_key
 

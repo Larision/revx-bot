@@ -1219,6 +1219,9 @@ def _show_grid_levels(engine: "GridEngine") -> None:
             elif oid == "pending_manual":
                 tag = " [M]"
                 oid_str = "manual"
+            elif oid == "pending_replace":
+                tag = " [R]"
+                oid_str = "reemplazando"
             else:
                 tag = ""
                 oid_str = oid[:32]
@@ -1263,6 +1266,8 @@ def _show_active_orders(engine: "GridEngine") -> None:
             tag = " [latente]"
         elif oid == "pending_manual":
             tag = " [reservada]"
+        elif oid == "pending_replace":
+            tag = " [reemplazando]"
         else:
             tag = ""
         print(f"  {'SELL':<5}  {key:>12}  {oid}{tag}")
@@ -1277,6 +1282,8 @@ def _show_active_orders(engine: "GridEngine") -> None:
             tag = " [latente]"
         elif oid == "pending_manual":
             tag = " [reservada]"
+        elif oid == "pending_replace":
+            tag = " [reemplazando]"
         else:
             tag = ""
         print(f"  {'BUY':<5}  {key:>12}  {oid}{tag}")
@@ -1377,7 +1384,7 @@ def format_balances_live(engine: Optional["GridEngine"] = None) -> str:
 
             for info in active_orders.values():
                 order_id = str(info["order_id"])
-                if order_id in {"virtual", "pending_post_only", "pending_manual"}:
+                if order_id in {"virtual", "pending_post_only", "pending_manual", "pending_replace"}:
                     continue
                 order_size = Decimal(str(info.get("size", base_size)))
                 if info["side"] == "sell":
@@ -1576,6 +1583,8 @@ def _cancel_order_by_price(engine: "GridEngine") -> None:
             tag = " [reservada]"
         elif oid == "pending_cancel":
             tag = " [cancelando]"
+        elif oid == "pending_replace":
+            tag = " [reemplazando]"
         else:
             tag = ""
         print(f"  {str(info['side']).upper():<5}  {key:>12}  {oid}{tag}")
@@ -1599,7 +1608,7 @@ def _cancel_order_by_price(engine: "GridEngine") -> None:
     order_id = str(info["order_id"])
     side = str(info["side"]).upper()
 
-    if order_id in {"virtual", "pending_post_only", "pending_manual", "pending_cancel"}:
+    if order_id in {"virtual", "pending_post_only", "pending_manual", "pending_cancel", "pending_replace"}:
         print(f"  [!] La orden en {target_key} no se puede cancelar desde aquí ({order_id}).")
         return
 
@@ -1652,6 +1661,103 @@ def _fill_empty_levels(engine: "GridEngine") -> None:
     print("  ✓ Fill empty levels ejecutado.")
 
 
+def _resize_to_default(engine: "GridEngine") -> None:
+    """Redimensiona las SELL de trailing_up fixed_quote al base_size predeterminado."""
+    preview = engine.preview_resize_trailing_up_fixed_quote_to_default()
+
+    if not preview.get("enabled"):
+        print(f"  [!] {preview.get('reason') or 'Opción no disponible.'}")
+        return
+
+    real_orders = preview.get("real_orders", [])
+    state_only_orders = preview.get("state_only_orders", [])
+    required_btc = Decimal(str(preview.get("required_btc", "0")))
+    default_size = Decimal(str(preview.get("default_size", "0")))
+    anchor = preview.get("anchor")
+
+    if not real_orders and not state_only_orders:
+        print("  No hay SELLs fixed_quote por debajo del tamaño predeterminado.")
+        return
+
+    print("\n" + "=" * 50)
+    print("  RESIZE TO DEFAULT — TRAILING UP FIXED_QUOTE")
+    print("=" * 50)
+    print(f"  Tamaño objetivo : {fmt_amount(default_size)} BTC")
+    if anchor is not None:
+        print(f"  Anchor fixed_q. : {_price_key(Decimal(str(anchor)))} USDC")
+    print(f"  Órdenes reales  : {len(real_orders)}")
+    print(f"  Virtual/latente : {len(state_only_orders)}")
+    print(f"  BTC extra req.  : {fmt_amount(required_btc)}")
+
+    if real_orders:
+        _, available_btc, balances_ok = _read_available_balances()
+        if balances_ok:
+            print(f"  BTC disponible  : {fmt_amount(available_btc)}")
+            if available_btc < required_btc:
+                print("  [!] BTC insuficiente para redimensionar todas las órdenes reales.")
+                return
+        else:
+            print("  [!] No se pudieron comprobar balances de forma fiable.")
+            return
+
+    print("\n  Órdenes a redimensionar:")
+    print(f"  {'Tipo':<10} {'Precio':>12} {'Size actual':>14} {'Nuevo size':>14} {'Order ID'}")
+    print("  " + "-" * 76)
+
+    for row in real_orders[:25]:
+        print(
+            f"  {'REAL':<10} {str(row['price_key']):>12} "
+            f"{fmt_amount(Decimal(str(row['current_size']))):>14} "
+            f"{fmt_amount(Decimal(str(row['target_size']))):>14} "
+            f"{str(row['order_id'])[:32]}"
+        )
+
+    for row in state_only_orders[:25]:
+        order_id = str(row["order_id"])
+        label = "VIRTUAL" if order_id == "virtual" else "LATENTE"
+        print(
+            f"  {label:<10} {str(row['price_key']):>12} "
+            f"{fmt_amount(Decimal(str(row['current_size']))):>14} "
+            f"{fmt_amount(Decimal(str(row['target_size']))):>14} "
+            f"{order_id[:32]}"
+        )
+
+    total_rows = len(real_orders) + len(state_only_orders)
+    if total_rows > 50:
+        print(f"  ... y {total_rows - 50} más")
+
+    try:
+        confirm = input("\n  ¿Ejecutar resize to default? (s/n): " ).strip().lower()
+    except EOFError:
+        confirm = "n"
+
+    if not confirm.startswith("s"):
+        print("  Abortado.")
+        return
+
+    ok, logs, error_msg, summary = engine.resize_trailing_up_fixed_quote_to_default()
+    for entry in logs:
+        log_event(f"[RESIZE] {entry['msg']}", entry.get("level", "info"))
+
+    resized_real = int(summary.get("resized_real", 0) or 0)
+    updated_state_only = int(summary.get("updated_state_only", 0) or 0)
+    skipped = int(summary.get("skipped", 0) or 0)
+    failed = summary.get("failed", []) or []
+
+    if not ok:
+        print(f"  [!] {error_msg or 'No se pudo completar el resize.'}")
+        if failed:
+            print("  Fallos:")
+            for item in failed[:10]:
+                print(f"    - {item}")
+        return
+
+    print(
+        f"  ✓ Resize completado. Reales: {resized_real} | "
+        f"Virtual/latente: {updated_state_only} | Saltadas: {skipped}"
+    )
+
+
 def run_engine_menu(engine: "GridEngine", engine_thread: threading.Thread) -> None:
     """
     Submenú de monitor interactivo para una instancia de GridEngine en ejecución.
@@ -1680,6 +1786,9 @@ def run_engine_menu(engine: "GridEngine", engine_thread: threading.Thread) -> No
         print("  5. Añadir orden manual")
         print("  6. Cancelar orden por precio")
         print("  7. Fill empty levels")
+        resize_to_default_available = snapshot.get("trailing_up_mode") == "fixed_quote"
+        if resize_to_default_available:
+            print("  8. Resize to default")
         print("  v. Volver al menú principal")
         print("=" * 40)
 
@@ -1702,6 +1811,10 @@ def run_engine_menu(engine: "GridEngine", engine_thread: threading.Thread) -> No
             _cancel_order_by_price(engine)
         elif opcion == "7":
             _fill_empty_levels(engine)
+        elif opcion == "8" and resize_to_default_available:
+            _resize_to_default(engine)
+        elif opcion == "8":
+            print("  Opción no disponible: trailing up no está en fixed_quote.")
         elif opcion.lower() == "v":
             print("  Volviendo al menú principal...")
             break
