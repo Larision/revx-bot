@@ -644,6 +644,24 @@ class GridEngine:
                 metadata[meta_key] = info.get(meta_key)
         return metadata
 
+    def _metadata_for_ceiling_virtual_from_cancelled_sell(self, info: OrderInfo) -> Dict[str, Any]:
+        """Metadata segura para una SELL virtual creada al cancelar una SELL real.
+
+        No se copia metadata de trailing_down/extended, porque esta virtual actua
+        como centinela de rebote superior. Si se marca como extended, al activarse
+        entraria en la rama de subrejilla inferior y no reactivaria trailing up.
+        """
+        metadata: Dict[str, Any] = {}
+        raw_step = info.get("trailing_up_step")
+        if raw_step is not None:
+            try:
+                step = int(raw_step)
+                if step > 0:
+                    metadata["trailing_up_step"] = step
+            except Exception:
+                pass
+        return metadata
+
     def _replace_floor_virtual_after_cancel(
         self,
         canceled_price: Decimal,
@@ -678,8 +696,84 @@ class GridEngine:
 
         return removed_virtuals
 
+    def _prune_ceiling_virtual_sells_locked(self, keep_key: Optional[str] = None) -> List[str]:
+        """
+        Deja una sola SELL virtual de techo y elimina las demas.
+
+        La SELL virtual representa el siguiente centinela superior del grid. Cuando
+        trailing down cancela SELLs altos para liberar BTC, ese centinela debe
+        desplazarse al ultimo SELL cancelado para que el grid pueda enganchar un
+        rebote posterior. Debe llamarse con self._state_lock adquirido.
+        """
+        candidates: List[Tuple[Decimal, str]] = []
+        for key, info in self.active_orders.items():
+            if info.get("side") != "sell":
+                continue
+            if str(info.get("order_id")) != "virtual":
+                continue
+            try:
+                candidates.append((Decimal(key), key))
+            except Exception:
+                continue
+
+        if not candidates:
+            return []
+
+        if keep_key is None:
+            # Si no se indica una clave concreta, conserva la virtual mas cercana
+            # al grid real: la de menor precio entre las SELL virtuales existentes.
+            _, keep_key = min(candidates, key=lambda item: item[0])
+
+        keys_to_remove = {key for _, key in candidates if key != keep_key}
+        if not keys_to_remove:
+            return []
+
+        for key in keys_to_remove:
+            self.active_orders.pop(key, None)
+            self.extended_levels.pop(key, None)
+
+        self.levels = [
+            lvl for lvl in self.levels
+            if _price_key(lvl) not in keys_to_remove
+        ]
+        return sorted(keys_to_remove, key=lambda value: Decimal(value), reverse=True)
+
+    def _replace_ceiling_virtual_after_cancel(
+        self,
+        canceled_price: Decimal,
+        size: Decimal,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> List[str]:
+        """
+        Recoloca la virtual SELL de techo tras cancelar una SELL real alta.
+
+        Es el equivalente superior de _replace_floor_virtual_after_cancel: evita
+        que trailing down deje el grid sin centinela de subida tras desmontar
+        ordenes SELL para liberar BTC.
+        """
+        key = _price_key(canceled_price)
+        removed_virtuals: List[str]
+        with self._state_lock:
+            current = self.active_orders.get(key)
+            if current is not None and str(current.get("order_id")) != "virtual":
+                return []
+
+            self.active_orders[key] = cast(OrderInfo, {
+                "side": "sell",
+                "order_id": "virtual",
+                "price": canceled_price,
+                "size": size,
+                "placed_at": time.time(),
+                **(metadata or {}),
+            })
+            self.levels.append(canceled_price)
+            self.levels = sorted(set(self.levels))
+            removed_virtuals = self._prune_ceiling_virtual_sells_locked(keep_key=key)
+
+        return removed_virtuals
+
     def _remove_highest_virtual_sell_order(self) -> Optional[str]:
-        """Elimina la virtual SELL que hace de techo cuando trailing down desmonta SELLs altos."""
+        """Elimina la virtual SELL mas alta del techo."""
         with self._state_lock:
             candidates: List[Tuple[Decimal, str]] = []
             for key, info in self.active_orders.items():
@@ -897,6 +991,10 @@ class GridEngine:
             cancel_level_key, cancel_info = candidate
             cancel_order_id = str(cancel_info["order_id"])
             cancel_size = self._order_size(cancel_info)
+            try:
+                cancel_price = Decimal(cancel_level_key)
+            except Exception:
+                cancel_price = Decimal(str(cancel_info["price"]))
 
             with self._state_lock:
                 current = self.active_orders.get(cancel_level_key)
@@ -926,13 +1024,24 @@ class GridEngine:
                         ]
                         self.extended_levels.pop(cancel_level_key, None)
 
-                removed_virtual_key = self._remove_highest_virtual_sell_order()
-                if removed_virtual_key is not None:
-                    log_event(
-                        f"[ENGINE] Trailing down: virtual SELL de techo "
-                        f"{removed_virtual_key} eliminada tras cancelar SELL alto {cancel_level_key}",
-                        "info"
+                if cancel_level_key != target_key:
+                    removed_ceiling_virtuals = self._replace_ceiling_virtual_after_cancel(
+                        canceled_price=cancel_price,
+                        size=cancel_size,
+                        metadata=self._metadata_for_ceiling_virtual_from_cancelled_sell(cancel_info),
                     )
+                    log_event(
+                        f"[ENGINE] Trailing down: SELL virtual de techo movida a "
+                        f"{cancel_level_key} tras cancelar SELL alto para liberar BTC",
+                        "info",
+                    )
+                    if removed_ceiling_virtuals:
+                        log_event(
+                            f"[ENGINE] Trailing down: virtuales SELL antiguas eliminadas "
+                            f"tras mover techo a {cancel_level_key}: "
+                            + ", ".join(removed_ceiling_virtuals),
+                            "info",
+                        )
 
                 estimated_available += cancel_size
                 if estimated_available >= required:
@@ -2264,6 +2373,7 @@ class GridEngine:
 
         cancel_order_id: Optional[str] = None
         cancel_level_key: Optional[str] = None
+        cancel_level_info: Optional[OrderInfo] = None
         remove_ceiling_virtual_after_cancel = False
         orders_to_place: List[Tuple[Decimal, str, Decimal, Optional[Dict[str, Any]]]] = []
         virtual_orders_to_add: List[Tuple[str, OrderInfo]] = []
@@ -2453,11 +2563,27 @@ class GridEngine:
                 handled = True
 
             # --------------------------------------------------
-            # Primer toque del suelo principal en modo extended.
+            # Primer toque del suelo principal / BUY virtual de suelo.
+            #
+            # Una BUY virtual recreada al cancelar BUYs bajos por trailing up
+            # representa siempre el nuevo suelo operativo, aunque self.levels
+            # conserve algun nivel principal antiguo mas bajo sin orden activa.
+            # Si se exige price == lowest_principal en ese caso, la virtual se
+            # procesa como una BUY normal, no se crea la siguiente virtual por
+            # debajo y el grid puede quedarse sin cobertura al caer el precio.
             # --------------------------------------------------
-            if not handled and side == "buy" and price == lowest_principal:
+            is_recorded_floor_buy = price == lowest_principal
+            is_virtual_floor_buy = is_virtual and self.trailing_down_mode != "off"
+
+            if not handled and side == "buy" and (is_recorded_floor_buy or is_virtual_floor_buy):
                 next_sell_price = (price + base_step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
                 next_buy_price = (price - base_step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
+
+                if is_virtual and not is_recorded_floor_buy:
+                    trailing_logs.append(
+                        f"[ENGINE] Trailing down: BUY virtual {filled_key} tratada como suelo "
+                        f"aunque el suelo registrado sea {_price_key(lowest_principal)}"
+                    )
 
                 if self.trailing_down_mode == "extended":
                     extended_size = self._extended_down_order_size()
@@ -2507,6 +2633,8 @@ class GridEngine:
                         if removed is not None and removed["order_id"] not in {"virtual", "pending_post_only", "pending_manual", "pending_cancel", "pending_replace"}:
                             cancel_order_id = str(removed["order_id"])
                             cancel_level_key = highest_key
+                            cancel_level_info = self._clone_order_info(removed)
+                            remove_ceiling_virtual_after_cancel = True
 
                     trail_down_key = _price_key(trail_down_price)
                     if trail_down_key not in self.active_orders:
@@ -2733,13 +2861,28 @@ class GridEngine:
                         self.levels = [lvl for lvl in self.levels if _price_key(lvl) != cancel_level_key]
                         self.extended_levels.pop(cancel_level_key, None)
 
-                if remove_ceiling_virtual_after_cancel:
-                    removed_virtual_key = self._remove_highest_virtual_sell_order()
-                    if removed_virtual_key is not None:
+                if remove_ceiling_virtual_after_cancel and cancel_level_info is not None:
+                    try:
+                        canceled_price = Decimal(str(cancel_level_key))
+                    except Exception:
+                        canceled_price = Decimal(str(cancel_level_info["price"]))
+                    canceled_size = self._order_size(cancel_level_info)
+                    removed_ceiling_virtuals = self._replace_ceiling_virtual_after_cancel(
+                        canceled_price=canceled_price,
+                        size=canceled_size,
+                        metadata=self._metadata_for_ceiling_virtual_from_cancelled_sell(cancel_level_info),
+                    )
+                    log_event(
+                        f"[ENGINE] Trailing down: SELL virtual de techo movida a "
+                        f"{cancel_level_key} tras cancelar SELL alto por desplazamiento del grid",
+                        "info",
+                    )
+                    if removed_ceiling_virtuals:
                         log_event(
-                            f"[ENGINE] Trailing down extended: virtual SELL de techo {removed_virtual_key} "
-                            f"eliminada tras cancelar SELL alto {cancel_level_key}",
-                            "info"
+                            f"[ENGINE] Trailing down: virtuales SELL antiguas eliminadas "
+                            f"tras mover techo a {cancel_level_key}: "
+                            + ", ".join(removed_ceiling_virtuals),
+                            "info",
                         )
             else:
                 with self._state_lock:

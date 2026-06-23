@@ -65,9 +65,19 @@ class BacktestResult:
     buys: int
     sells: int
     realized_profit: Decimal
+    grid_profit: Decimal
     start_equity: Decimal
     end_equity: Decimal
+    end_usdc: Decimal
+    end_btc: Decimal
     open_orders: int
+    open_buys: int
+    open_sells: int
+    open_virtual_buys: int
+    open_virtual_sells: int
+    virtual_fills: int
+    first_trade_time: str
+    last_trade_time: str
     last_price: Decimal
     output_path: Path
 
@@ -95,7 +105,11 @@ class PaperGridEngine(GridEngine):
         )
         self.paper_usdc: Decimal = Decimal(str(saldo))
         self.paper_btc: Decimal = Decimal("0")
+        # PnL real FIFO de la cartera simulada. No usa precios virtuales.
         self.realized_profit: Decimal = Decimal("0")
+        # Profit teorico de grid basado en parejas BUY/SELL. Es una metrica separada.
+        self.grid_profit: Decimal = Decimal("0")
+        self._paper_btc_lots: list[tuple[Decimal, Decimal]] = []
         self._paper_order_index: dict[str, str] = {}
         self._paper_order_snapshot: dict[str, OrderInfo] = {}
         self._paper_last_fill: Optional[OrderInfo] = None
@@ -136,6 +150,7 @@ class PaperGridEngine(GridEngine):
 
         self.paper_usdc -= initial_btc_cost
         self.paper_btc += initial_btc
+        self._add_paper_btc_lot(center_price, initial_btc)
         self.place_initial_orders()
 
     def save_state(self) -> bool:
@@ -149,6 +164,40 @@ class PaperGridEngine(GridEngine):
 
     def _get_available_btc(self) -> Decimal:
         return self.paper_btc
+
+    def _add_paper_btc_lot(self, price: Decimal, size: Decimal) -> None:
+        """Registra BTC comprado para calcular PnL real por FIFO."""
+        lot_size = Decimal(str(size))
+        if lot_size <= 0:
+            return
+        lot_price = Decimal(str(price)).quantize(TICK_SIZE, rounding=ROUND_DOWN)
+        self._paper_btc_lots.append((lot_price, lot_size))
+
+    def _consume_paper_btc_lots(self, sell_price: Decimal, size: Decimal) -> Decimal:
+        """Consume BTC vendido por FIFO y devuelve PnL realizado real."""
+        remaining = Decimal(str(size))
+        price = Decimal(str(sell_price)).quantize(TICK_SIZE, rounding=ROUND_DOWN)
+        pnl = Decimal("0")
+
+        while remaining > 0 and self._paper_btc_lots:
+            lot_price, lot_size = self._paper_btc_lots[0]
+            used = min(lot_size, remaining)
+            pnl += (price - lot_price) * used
+            remaining -= used
+            lot_size -= used
+            if lot_size <= 0:
+                self._paper_btc_lots.pop(0)
+            else:
+                self._paper_btc_lots[0] = (lot_price, lot_size)
+
+        if remaining > 0:
+            log_event(
+                f"[BACKTEST] FIFO sin BTC suficiente para valorar SELL "
+                f"{fmt_amount(remaining)} en {_price_key(price)}; PnL parcial omitido",
+                "warning",
+            )
+
+        return pnl
 
     def place_order(
         self,
@@ -273,13 +322,16 @@ class PaperGridEngine(GridEngine):
         if order_id != "virtual":
             if side == "buy":
                 self.paper_btc += order_size
+                self._add_paper_btc_lot(price, order_size)
             elif side == "sell":
                 self.paper_usdc += price * order_size
+                self.realized_profit += self._consume_paper_btc_lots(price, order_size)
+
                 paired_buy_price = snapshot.get("paired_buy_price")
                 if paired_buy_price is not None:
-                    self.realized_profit += (price - Decimal(str(paired_buy_price))) * order_size
-                else:
-                    self.realized_profit += (price - Decimal(str(self.center_price))) * order_size
+                    self.grid_profit += (price - Decimal(str(paired_buy_price))) * order_size
+                elif self.center_price is not None:
+                    self.grid_profit += (price - Decimal(str(self.center_price))) * order_size
 
             self.fill_history.append({
                 "side": side,
@@ -297,10 +349,21 @@ class PaperGridEngine(GridEngine):
             "price": key,
             "size": fmt_amount(order_size),
             "realized_profit": fmt_amount(self.realized_profit),
+            "grid_profit": fmt_amount(self.grid_profit),
             "virtual": "yes" if order_id == "virtual" else "no",
         }
 
-    def equity(self, mark_price: Decimal) -> Decimal:
+    def final_balances(self) -> tuple[Decimal, Decimal]:
+        """Balance final real por moneda, sin valorar BTC en USDC.
+
+        Al terminar el backtest hay fondos libres y fondos reservados en
+        ordenes abiertas. Para saber con que acaba realmente la simulacion,
+        se suman ambos por moneda:
+        - USDC libre + USDC bloqueado en BUY abiertas.
+        - BTC libre + BTC bloqueado en SELL abiertas.
+
+        Las ordenes virtuales no reservan saldo real, por eso no se incluyen.
+        """
         reserved_usdc = sum(
             Decimal(str(info["price"])) * self._order_size(info)
             for info in self.active_orders.values()
@@ -311,7 +374,11 @@ class PaperGridEngine(GridEngine):
             for info in self.active_orders.values()
             if info["side"] == "sell" and info["order_id"] != "virtual"
         )
-        return self.paper_usdc + reserved_usdc + ((self.paper_btc + reserved_btc) * mark_price)
+        return self.paper_usdc + reserved_usdc, self.paper_btc + reserved_btc
+
+    def equity(self, mark_price: Decimal) -> Decimal:
+        final_usdc, final_btc = self.final_balances()
+        return final_usdc + (final_btc * mark_price)
 
 
 def _parse_date_to_ms(date_str: str, *, end_of_day: bool = False) -> int:
@@ -620,7 +687,11 @@ def _write_backtest_summary(
         for size, (above, below) in size_line_config.items():
             lines.append(f"  - size {fmt_amount(size)}: {above} arriba / {below} abajo")
 
-    lines.append(f"  {'Size':>12} {'Step':>10} {'Up':>5} {'Down':>5} {'T.Up':>8} {'T.Down':>8} {'Fills':>8} {'Profit':>12} {'PnL MTM':>12} {'CSV'}")
+    lines.append(
+        f"  {'Size':>12} {'Step':>10} {'Up':>5} {'Down':>5} "
+        f"{'T.Up':>8} {'T.Down':>8} {'Fills':>8} {'Realized':>12} "
+        f"{'GridProf':>12} {'PnL MTM':>12} {'Final USDC':>12} {'Final BTC':>14} {'CSV'}"
+    )
 
     best: Optional[tuple[Decimal, Decimal, int, int, str, str, BacktestResult, Decimal]] = None
     for size, step, levels_above, levels_below, trailing_up, trailing_down, result in results:
@@ -633,7 +704,9 @@ def _write_backtest_summary(
             f"{levels_above:>5} {levels_below:>5} "
             f"{trailing_up:>8} {trailing_down:>8} "
             f"{result.fills:>8} {_price_key(result.realized_profit):>12} "
-            f"{_price_key(pnl):>12} {result.output_path}"
+            f"{_price_key(result.grid_profit):>12} {_price_key(pnl):>12} "
+            f"{_price_key(result.end_usdc):>12} {fmt_amount(result.end_btc):>14} "
+            f"{result.output_path}"
         )
 
     if best is not None:
@@ -647,7 +720,9 @@ def _write_backtest_summary(
         lines.append(
             f"Mejor PnL MTM: size {fmt_amount(best_size)}, step {_price_key(best_step)}, "
             f"lineas {best_above}/{best_below}, trailing {best_trailing_up}/{best_trailing_down}, "
-            f"{_price_key(best_pnl)} USDC ({fmt_amount(best_pct)}%)"
+            f"{_price_key(best_pnl)} USDC ({fmt_amount(best_pct)}%) | "
+            f"balance final {_price_key(best_result.end_usdc)} USDC + {fmt_amount(best_result.end_btc)} BTC | "
+            f"realized FIFO {_price_key(best_result.realized_profit)} | grid {_price_key(best_result.grid_profit)}"
         )
 
     lines.append("")
@@ -939,8 +1014,12 @@ def prompt_backtest() -> None:
             for size, (above, below) in size_line_config.items():
                 print(f"  - size {fmt_amount(size)}: {above} arriba / {below} abajo")
 
-        print(f"\n  {'Size':>12} {'Step':>10} {'Up':>5} {'Down':>5} {'T.Up':>8} {'T.Down':>8} {'Fills':>8} {'Profit':>12} {'PnL MTM':>12} {'CSV'}")
-        print(f"  {'-' * 114}")
+        print(
+            f"\n  {'Size':>12} {'Step':>10} {'Up':>5} {'Down':>5} "
+            f"{'T.Up':>8} {'T.Down':>8} {'Fills':>8} {'Realized':>12} "
+            f"{'GridProf':>12} {'PnL MTM':>12} {'Final USDC':>12} {'Final BTC':>14} {'CSV'}"
+        )
+        print(f"  {'-' * 155}")
 
         best: Optional[tuple[Decimal, Decimal, int, int, str, str, BacktestResult, Decimal]] = None
         for size, step, levels_above, levels_below, trailing_up, trailing_down, result in results:
@@ -952,7 +1031,9 @@ def prompt_backtest() -> None:
                 f"{levels_above:>5} {levels_below:>5} "
                 f"{trailing_up:>8} {trailing_down:>8} "
                 f"{result.fills:>8} {_price_key(result.realized_profit):>12} "
-                f"{_price_key(pnl):>12} {result.output_path}"
+                f"{_price_key(result.grid_profit):>12} {_price_key(pnl):>12} "
+                f"{_price_key(result.end_usdc):>12} {fmt_amount(result.end_btc):>14} "
+                f"{result.output_path}"
             )
 
         if best is not None:
@@ -966,7 +1047,9 @@ def prompt_backtest() -> None:
                 f"\nMejor PnL MTM      : size {fmt_amount(best_size)}, step {_price_key(best_step)} "
                 f"lineas {best_above}/{best_below} "
                 f"trailing {best_trailing_up}/{best_trailing_down} "
-                f"=> {_price_key(best_pnl)} USDC ({fmt_amount(best_pct)}%)"
+                f"=> {_price_key(best_pnl)} USDC ({fmt_amount(best_pct)}%) | "
+                f"balance final {_price_key(best_result.end_usdc)} USDC + {fmt_amount(best_result.end_btc)} BTC | "
+                f"realized FIFO {_price_key(best_result.realized_profit)} | grid {_price_key(best_result.grid_profit)}"
             )
 
         _write_backtest_summary(
@@ -1105,7 +1188,7 @@ def run_grid_backtest(
     with output_path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(
             fh,
-            fieldnames=["time", "side", "price", "size", "realized_profit", "virtual", "market_price"],
+            fieldnames=["time", "side", "price", "size", "realized_profit", "grid_profit", "virtual", "market_price"],
         )
         writer.writeheader()
         writer.writerows(fills)
@@ -1113,14 +1196,70 @@ def run_grid_backtest(
     # Las virtuales son sentinels de trailing, no transacciones reales.
     real_fills = [f for f in fills if f["virtual"] == "no"]
 
+    # Balance final real por moneda: libre + reservado.
+    # No vende ni valora el BTC aqui; solo suma BTC y USDC con los que acaba la simulacion.
+    end_usdc, end_btc = engine.final_balances()
+
+    # Conversion posterior solo para PnL MTM en USDC.
+    end_equity = end_usdc + (end_btc * last_price)
+
+    runtime_snapshot = engine.get_runtime_snapshot()
+    active_orders = runtime_snapshot["active_orders"]
+    open_buys = sum(
+        1 for info in active_orders.values()
+        if info["side"] == "buy" and info["order_id"] != "virtual"
+    )
+    open_sells = sum(
+        1 for info in active_orders.values()
+        if info["side"] == "sell" and info["order_id"] != "virtual"
+    )
+    open_virtual_buys = sum(
+        1 for info in active_orders.values()
+        if info["side"] == "buy" and info["order_id"] == "virtual"
+    )
+    open_virtual_sells = sum(
+        1 for info in active_orders.values()
+        if info["side"] == "sell" and info["order_id"] == "virtual"
+    )
+    first_trade_time = _item_time(trades[0]) if trades else ""
+    last_trade_time = _item_time(trades[-1]) if trades else ""
+    virtual_fills = len(fills) - len(real_fills)
+    pnl_mtm = end_equity - saldo
+
     elapsed = time.perf_counter() - started_at
     log_event(
-        f"[BACKTEST] Fin | size={fmt_amount(size)} step={_price_key(step)} "
-        f"up={levels_above} down={levels_below} "
-        f"fills={len(real_fills)} "
-        f"realized={_price_key(engine.realized_profit)} "
-        f"pnl_mtm={_price_key(engine.equity(last_price) - saldo)} "
-        f"csv={output_path.name} elapsed={elapsed:.2f}s",
+        "\n".join([
+            "[BACKTEST] Fin",
+            (
+                f"  Config      : size={fmt_amount(size)} | step={_price_key(step)} | "
+                f"up={levels_above} | down={levels_below} | "
+                f"trailing_up={trailing_up_mode} | trailing_down={trailing_down_mode}"
+            ),
+            (
+                f"  Trades      : market_trades={len(trades)} | "
+                f"first={first_trade_time} | last={last_trade_time} | "
+                f"last_price={_price_key(last_price)}"
+            ),
+            (
+                f"  Fills       : real={len(real_fills)} | virtual={virtual_fills} | "
+                f"buy={sum(1 for f in real_fills if f['side'] == 'buy')} | "
+                f"sell={sum(1 for f in real_fills if f['side'] == 'sell')}"
+            ),
+            (
+                f"  Resultados  : realized_fifo={_price_key(engine.realized_profit)} | "
+                f"grid_profit={_price_key(engine.grid_profit)} | "
+                f"pnl_mtm={_price_key(pnl_mtm)}"
+            ),
+            (
+                f"  Balance     : final_usdc={_price_key(end_usdc)} | "
+                f"final_btc={fmt_amount(end_btc)}"
+            ),
+            (
+                f"  Abiertas    : total={len(active_orders)} | buy={open_buys} | sell={open_sells} | "
+                f"virtual_buy={open_virtual_buys} | virtual_sell={open_virtual_sells}"
+            ),
+            f"  Archivo     : csv={output_path.name} | elapsed={elapsed:.2f}s",
+        ]),
         "info",
     )
     return BacktestResult(
@@ -1132,9 +1271,19 @@ def run_grid_backtest(
         buys=sum(1 for f in real_fills if f["side"] == "buy"),
         sells=sum(1 for f in real_fills if f["side"] == "sell"),
         realized_profit=engine.realized_profit,
+        grid_profit=engine.grid_profit,
         start_equity=saldo,
-        end_equity=engine.equity(last_price),
-        open_orders=len(engine.get_runtime_snapshot()["active_orders"]),
+        end_equity=end_equity,
+        end_usdc=end_usdc,
+        end_btc=end_btc,
+        open_orders=len(active_orders),
+        open_buys=open_buys,
+        open_sells=open_sells,
+        open_virtual_buys=open_virtual_buys,
+        open_virtual_sells=open_virtual_sells,
+        virtual_fills=virtual_fills,
+        first_trade_time=first_trade_time,
+        last_trade_time=last_trade_time,
         last_price=last_price,
         output_path=output_path,
     )
