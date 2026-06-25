@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Grid Trading — Simulator v6</title>
+<title>Grid Trading — Simulator v7</title>
 <style>
 :root {
   --bg:        #0f1117;
@@ -36,6 +36,8 @@ h1{font-size:15px;font-weight:600;margin-bottom:12px;letter-spacing:.4px}
 .cfglabel{font-size:10px;color:var(--text3)}
 .cfgbar input{background:var(--bg3);border:1px solid var(--border2);color:var(--text);
   border-radius:4px;padding:3px 6px;font-family:var(--mono);font-size:12px;width:72px}
+.cfgbar input[type="checkbox"]{width:auto;accent-color:var(--blue);margin-right:4px}
+.checkrow{display:flex;align-items:center;gap:3px;color:var(--text2);font-size:10px;min-height:21px}
 .tgroup{display:flex;flex-direction:column;gap:3px}
 .trow{display:flex;gap:2px}
 .tbtn{background:var(--bg3);border:1px solid var(--border2);color:var(--text3);
@@ -44,7 +46,7 @@ h1{font-size:15px;font-weight:600;margin-bottom:12px;letter-spacing:.4px}
 .tbtn.act-off{background:#1a0a0a;border-color:#7f1d1d;color:var(--red)}
 .tbtn.act-on {background:#052e16;border-color:#166534;color:var(--green)}
 .tbtn.act-ext{background:var(--blue-bg);border-color:#1e40af;color:var(--blue)}
-.mbar{display:grid;grid-template-columns:repeat(8,1fr);gap:5px;margin-bottom:10px}
+.mbar{display:grid;grid-template-columns:repeat(auto-fit,minmax(105px,1fr));gap:5px;margin-bottom:10px}
 .mc{background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:6px 10px}
 .ml{font-size:10px;color:var(--text3);margin-bottom:2px}
 .mv{font-size:12px;font-weight:600}
@@ -74,6 +76,9 @@ button.act:hover{background:var(--border)}
 .sclabel{font-size:10px;color:var(--text3);margin-top:8px;background:var(--bg2);
   border:1px solid var(--border);border-radius:6px;padding:8px;line-height:1.7}
 .sclabel b{color:var(--text2)}
+.pnlrows{font-size:10px;color:var(--text2);line-height:1.55;margin-top:6px}
+.pnlrows .gain{color:var(--green)}
+.pnlrows .loss{color:var(--red)}
 .badge{font-size:8px;padding:1px 3px;border-radius:2px;margin-left:2px}
 .b-ext  {background:var(--blue-bg); color:var(--blue)}
 .b-floor{background:var(--yellow-bg);color:var(--yellow)}
@@ -82,16 +87,24 @@ button.act:hover{background:var(--border)}
 </style>
 </head>
 <body>
-<h1>Grid Trading · Simulator v6 <span style="font-size:10px;color:var(--text3)">— trailing off / on / extended</span></h1>
+<h1>Grid Trading · Simulator v7 <span style="font-size:10px;color:var(--text3)">— trailing off / on / extended · auto balance + PnL</span></h1>
 
 <div class="cfgbar">
   <div class="cfggroup">
+    <span class="cfglabel">Saldo bot</span>
+    <input id="cfg_balance" value="100" oninput="syncAutoLines()" style="width:82px">
+  </div>
+  <div class="cfggroup">
+    <span class="cfglabel">Auto líneas</span>
+    <label class="checkrow"><input id="cfg_auto_lines" type="checkbox" checked onchange="syncAutoLines()">por saldo</label>
+  </div>
+  <div class="cfggroup">
     <span class="cfglabel">Precio centro</span>
-    <input id="cfg_price" value="1000">
+    <input id="cfg_price" value="1000" oninput="syncAutoLines()">
   </div>
   <div class="cfggroup">
     <span class="cfglabel">Step</span>
-    <input id="cfg_step" value="20" style="width:56px">
+    <input id="cfg_step" value="20" style="width:56px" oninput="syncAutoLines()">
   </div>
   <div class="cfggroup">
     <span class="cfglabel">Líneas/lado</span>
@@ -99,7 +112,7 @@ button.act:hover{background:var(--border)}
   </div>
   <div class="cfggroup">
     <span class="cfglabel">Size</span>
-    <input id="cfg_size" value="0.01" style="width:64px">
+    <input id="cfg_size" value="0.01" style="width:64px" oninput="syncAutoLines()">
   </div>
   <div class="tgroup">
     <span class="cfglabel">Trailing UP</span>
@@ -135,6 +148,7 @@ button.act:hover{background:var(--border)}
       <button class="act" onclick="applyConfig()">Reset</button>
     </div>
     <div class="sclabel" id="sclabel">—</div>
+    <div class="sclabel" id="pnlbox">—</div>
   </div>
   <div style="flex:1"><div class="logbox" id="logbox"></div></div>
 </div>
@@ -150,29 +164,116 @@ const r5  = n => parseFloat(n.toFixed(5));
 const pk  = p => parseFloat(r2(p).toFixed(2)).toFixed(2);
 const eq  = (a,b) => Math.abs(a-b)<0.005;
 const lg  = (s,c,t) => s.log.push({c,t});
+const money = n => (Number.isFinite(n)?n:0).toFixed(2);
+const pct   = n => (Number.isFinite(n)?n:0).toFixed(2);
 
 function principalLevels(s){ return s.levels.filter(l=>!s.ext[pk(l)]); }
 function extSize(s){ return r5(s.base_size*0.5); }
+function isRealOrder(o){ return o && !["virtual"].includes(o.oid); }
+function orderReservedValue(o,mark){
+  if(!isRealOrder(o))return 0;
+  return o.side==="buy" ? o.price*o.size : mark*o.size;
+}
+function equityAt(s,mark=null){
+  const m=mark??s.mark_price??s.center_price??0;
+  let total=(s.usdc||0)+((s.btc||0)*m);
+  Object.values(s.orders||{}).forEach(o=>{ total+=orderReservedValue(o,m); });
+  return r2(total);
+}
+function pnlStats(s){
+  const eqv=equityAt(s);
+  const initial=s.initial_equity||0;
+  const pnl=r2(eqv-initial);
+  const p=initial>0?(pnl/initial)*100:0;
+  return {equity:eqv,pnl,pct:p,realized:r2(s.realized_pnl||0)};
+}
+function addLot(s,size,cost){
+  if(!Array.isArray(s.lots))s.lots=[];
+  if(size<=0)return;
+  s.lots.push({size:r5(size),cost:r2(cost)});
+}
+function consumeLotsForSell(s,size,sellPrice){
+  if(!Array.isArray(s.lots))s.lots=[];
+  let remaining=size, realized=0;
+  const next=[];
+  for(const lot of s.lots){
+    if(remaining<=1e-9){ next.push(lot); continue; }
+    const take=Math.min(lot.size,remaining);
+    realized+=(sellPrice-lot.cost)*take;
+    const left=r5(lot.size-take);
+    if(left>1e-9)next.push({size:left,cost:lot.cost});
+    remaining=r5(remaining-take);
+  }
+  if(remaining>1e-9){
+    // Fallback defensivo para estados manuales inconsistentes: coste inicial.
+    realized+=(sellPrice-(s.center_price||sellPrice))*remaining;
+  }
+  s.lots=next;
+  s.realized_pnl=r2((s.realized_pnl||0)+realized);
+  return r2(realized);
+}
+function requiredForLines(price,step,size,lines){
+  let buyQuote=0;
+  for(let i=1;i<=lines;i++){
+    const lvl=price-(i*step);
+    if(lvl<=0)return {buyQuote:Infinity,sellBase:Infinity,sellValue:Infinity,total:Infinity};
+    buyQuote+=lvl*size;
+  }
+  const sellBase=size*lines;
+  const sellValue=sellBase*price;
+  return {buyQuote:r2(buyQuote),sellBase:r5(sellBase),sellValue:r2(sellValue),total:r2(buyQuote+sellValue)};
+}
+function maxLinesForBalance(price,step,size,balance){
+  if(price<=0||step<=0||size<=0||balance<=0)return 0;
+  let lines=0;
+  for(let n=1;n<=500;n++){
+    const req=requiredForLines(price,step,size,n);
+    if(!Number.isFinite(req.total)||req.total>balance+1e-9)break;
+    lines=n;
+  }
+  return lines;
+}
+function syncAutoLines(){
+  const auto=document.getElementById("cfg_auto_lines");
+  const linesEl=document.getElementById("cfg_lines");
+  if(!auto||!linesEl)return;
+  linesEl.disabled=!!auto.checked;
+  linesEl.style.opacity=auto.checked?"0.65":"1";
+  if(!auto.checked)return;
+  const price=parseFloat(document.getElementById("cfg_price").value)||0;
+  const step =parseFloat(document.getElementById("cfg_step").value)||0;
+  const size =parseFloat(document.getElementById("cfg_size").value)||0;
+  const balance=parseFloat(document.getElementById("cfg_balance").value)||0;
+  linesEl.value=maxLinesForBalance(price,step,size,balance);
+}
+function recordPnl(s){
+  const st=pnlStats(s);
+  if(!Array.isArray(s.pnl_history))s.pnl_history=[];
+  s.pnl_history.push({n:s.fc,price:s.mark_price,equity:st.equity,pnl:st.pnl,pct:st.pct,realized:st.realized});
+  const cls=st.pnl>=0?"+":"";
+  lg(s,st.pnl>=0?"ok":"err",`  PNL #${s.fc}: equity=${money(st.equity)} pnl=${cls}${money(st.pnl)} (${cls}${pct(st.pct)}%) realized=${st.realized>=0?"+":""}${money(st.realized)} mark=${pk(s.mark_price)}`);
+}
 
 // engine: trailing_up_min_factor=0.50, reduction_per_level=0.025
 function tuFactor(n){ return Math.max(0.50, 1-0.025*n); }
 function tuSize(s,n){ return r5(s.base_size*tuFactor(n)); }
 function tuStepFrom(o){ return (o.trailing_up_step!=null&&o.trailing_up_step>0)?o.trailing_up_step:0; }
-function tuFixedQuote(s){ return r2(s.anchor_high*s.base_size); }
-function tuFixedQuoteSize(s,price){ return r5(Math.min(s.base_size, tuFixedQuote(s)/price)); }
 function currentFixedQuoteAnchor(s){
-  const pl=principalLevels(s);
-  if(!pl.length)return s.anchor_high;
-  const candidates=pl.filter(lvl=>{
-    const o=s.orders[pk(lvl)];
-    return !(o&&o.side==="sell"&&o.oid==="virtual");
-  });
-  return r2(Math.max(...(candidates.length?candidates:pl)));
+  const levels=[...new Set(s.levels)].sort((a,b)=>a-b);
+  if(!levels.length)return r2(s.center_price??s.anchor_high);
+  const mid=Math.floor(levels.length/2);
+  if(levels.length%2===1)return r2(levels[mid]);
+  return r2((levels[mid-1]+levels[mid])/2);
 }
+function tuFixedQuote(s){ return r2((s.fixed_anchor??currentFixedQuoteAnchor(s))*s.base_size); }
+function tuFixedQuoteSize(s,price){ return r5(Math.min(s.base_size, tuFixedQuote(s)/price)); }
 
 // ── state factory ─────────────────────────────────────────────────────────────
 function mkS(cfg={}){
   const price=cfg.price??1000, step=cfg.step??20, lines=cfg.lines??5, size=cfg.size??0.01;
+  const balance=cfg.balance??100;
+  const req=requiredForLines(price,step,size,lines);
+  const freeUsdc=r2(balance-req.total);
   const levels=[]; for(let i=-lines;i<=lines;i++) levels.push(r2(price+i*step));
   const orders={};
   levels.forEach(lvl=>{
@@ -180,35 +281,68 @@ function mkS(cfg={}){
     if(lvl<price) orders[k]={side:"buy", oid:`r${k}`,price:lvl,size,extended:false,gs:null,ps:null,trailing_up_step:null};
     if(lvl>price) orders[k]={side:"sell",oid:`r${k}`,price:lvl,size,extended:false,gs:null,ps:null,trailing_up_step:null};
   });
-  return{
-    base_step:step,base_size:size,
+  const s={
+    center_price:price,mark_price:price,levels_below:lines,levels_above:lines,
+    base_step:step,base_size:size,max_levels:(lines*2)+2,
+    bot_balance:balance,initial_equity:balance,initial_required:req,
     trailing_up:CFG_UP,trailing_down:CFG_DN,
     drops:0,up_steps:0,fc:0,si:0,
     levels,ext:Object.create(null),orders,
     anchor_high:r2(price+lines*step),
-    usdc:5.00,btc:0.00,
+    fixed_anchor:CFG_UP==="fixed_quote"?price:null,
+    usdc:freeUsdc,btc:0.00,realized_pnl:0,lots:req.sellBase>0?[{size:req.sellBase,cost:price}]:[],pnl_history:[],
     log:[
-      {c:"fill",t:`INIT | price=${price} step=${step} size=${size}`},
+      {c:"fill",t:`INIT | balance=${money(balance)} price=${price} step=${step} size=${size} lines=${lines}`},
+      {c:"",    t:`capital inicial: BUY reservado=${money(req.buyQuote)} | BTC SELL reservado=${req.sellBase.toFixed(5)} (${money(req.sellValue)}) | USDC libre=${money(freeUsdc)}`},
       {c:"",    t:`trailing_up=${CFG_UP}  trailing_down=${CFG_DN}`},
       {c:"",    t:" "},
     ],
   };
+  if(freeUsdc<0)lg(s,"warn",`  ! Saldo insuficiente para ${lines} líneas/lado: faltan ${money(Math.abs(freeUsdc))} USDC-equivalentes`);
+  return s;
 }
 function cp(s){ return{...s,levels:[...s.levels],ext:{...s.ext},
-  orders:JSON.parse(JSON.stringify(s.orders)),log:[...s.log]}; }
+  orders:JSON.parse(JSON.stringify(s.orders)),log:[...s.log],
+  lots:Array.isArray(s.lots)?JSON.parse(JSON.stringify(s.lots)):[],
+  pnl_history:Array.isArray(s.pnl_history)?JSON.parse(JSON.stringify(s.pnl_history)):[]}; }
 
 // ── UI actions ────────────────────────────────────────────────────────────────
 function setTrailing(dir,val){
-  const prevUp=CFG_UP;
+  const prevUp=CFG_UP, prevDn=CFG_DN;
   if(dir==="up") CFG_UP=val; else CFG_DN=val;
   if(S){
     S.trailing_up=CFG_UP; S.trailing_down=CFG_DN;
-    if(dir==="up"&&val==="fixed_quote"&&prevUp!=="fixed_quote"){
-      S.anchor_high=currentFixedQuoteAnchor(S);
-      lg(S,"info",`  ⚙ trailing_up=fixed_quote anchor=${pk(S.anchor_high)} quote=${tuFixedQuote(S).toFixed(2)}`);
+
+    if(CFG_UP!=="extended")S.up_steps=0;
+    if(CFG_DN!=="extended")S.drops=0;
+
+    if(CFG_UP==="fixed_quote"){
+      const currentAnchor=currentFixedQuoteAnchor(S);
+      const storedAnchor=S.fixed_anchor??currentAnchor;
+      const relock=prevUp!=="fixed_quote" || S.fixed_anchor==null || !eq(storedAnchor,currentAnchor);
+      if(relock)S.fixed_anchor=currentAnchor;
+      lg(S,"info",`  ⚙ trailing_up=fixed_quote anchor=${pk(S.fixed_anchor)} quote=${tuFixedQuote(S).toFixed(2)}`);
     }else{
-      lg(S,"info",`  ⚙ trailing_${dir}=${val} (cambio en caliente — mirrors engine.set_trailing)`);
+      S.fixed_anchor=null;
+      if(dir==="up")lg(S,"info",`  ⚙ trailing_up=${CFG_UP} (cambio en caliente — mirrors engine.set_trailing)`);
     }
+
+    const removed=[];
+    Object.entries({...S.orders}).forEach(([k,o])=>{
+      if(o.oid!=="virtual")return;
+      if(CFG_UP==="off"&&o.side==="sell"){
+        delete S.orders[k]; delete S.ext[k];
+        S.levels=S.levels.filter(l=>!eq(l,parseFloat(k)));
+        removed.push(`SELL ${k}`);
+      }else if(CFG_DN==="off"&&o.side==="buy"){
+        delete S.orders[k]; delete S.ext[k];
+        S.levels=S.levels.filter(l=>!eq(l,parseFloat(k)));
+        removed.push(`BUY ${k}`);
+      }
+    });
+    if(dir==="dn")lg(S,"info",`  ⚙ trailing_down=${CFG_DN} (cambio en caliente — mirrors engine.set_trailing)`);
+    if(removed.length)lg(S,"warn",`  ~ virtuales eliminadas por trailing OFF: ${removed.sort().join(", ")}`);
+    if(prevUp!==CFG_UP||prevDn!==CFG_DN)S.levels=[...new Set(S.levels)].sort((a,b)=>a-b);
   }
   renderButtons(); if(S) render();
 }
@@ -224,24 +358,78 @@ function renderButtons(){
 }
 
 function applyConfig(){
+  syncAutoLines();
   const price=parseFloat(document.getElementById("cfg_price").value);
   const step =parseFloat(document.getElementById("cfg_step").value);
   const lines=parseInt(document.getElementById("cfg_lines").value);
   const size =parseFloat(document.getElementById("cfg_size").value);
+  const balance=parseFloat(document.getElementById("cfg_balance").value);
   history=[];
-  S=mkS({price,step,lines,size});
+  S=mkS({price,step,lines,size,balance});
   render();
 }
 
 // ── order helpers ─────────────────────────────────────────────────────────────
-function removeHighestVSell(s){
+function pruneFloorVirtualBuys(s,keepKey=null){
+  const vb=Object.entries(s.orders)
+    .filter(([,o])=>o.side==="buy"&&o.oid==="virtual")
+    .sort(([a],[b])=>parseFloat(a)-parseFloat(b));
+  if(!vb.length)return [];
+  if(keepKey==null)keepKey=vb[vb.length-1][0];
+  const removed=[];
+  vb.forEach(([k])=>{
+    if(k===keepKey)return;
+    delete s.orders[k]; delete s.ext[k];
+    s.levels=s.levels.filter(l=>!eq(l,parseFloat(k)));
+    removed.push(k);
+  });
+  return removed.sort((a,b)=>parseFloat(a)-parseFloat(b));
+}
+function pruneCeilingVirtualSells(s,keepKey=null){
   const vs=Object.entries(s.orders)
     .filter(([,o])=>o.side==="sell"&&o.oid==="virtual")
-    .sort(([a],[b])=>parseFloat(b)-parseFloat(a));
-  if(!vs.length)return null;
-  const[k]=vs[0]; delete s.orders[k];
-  s.levels=s.levels.filter(l=>!eq(l,parseFloat(k)));
-  lg(s,"warn",`  ~ vSELL techo ${k} eliminada`); return k;
+    .sort(([a],[b])=>parseFloat(a)-parseFloat(b));
+  if(!vs.length)return [];
+  if(keepKey==null)keepKey=vs[0][0];
+  const removed=[];
+  vs.forEach(([k])=>{
+    if(k===keepKey)return;
+    delete s.orders[k]; delete s.ext[k];
+    s.levels=s.levels.filter(l=>!eq(l,parseFloat(k)));
+    removed.push(k);
+  });
+  return removed.sort((a,b)=>parseFloat(b)-parseFloat(a));
+}
+function replaceFloorVirtualAfterCancel(s,canceledPrice,size,meta={}){
+  const k=pk(canceledPrice);
+  const cur=s.orders[k];
+  if(cur&&cur.oid!=="virtual")return [];
+  s.orders[k]={
+    side:"buy",oid:"virtual",price:r2(canceledPrice),size,
+    extended:!!meta.extended,gs:meta.gs??null,ps:meta.ps??null,
+    trailing_up_step:meta.trailing_up_step??null
+  };
+  if(!s.levels.find(l=>eq(l,canceledPrice)))s.levels.push(r2(canceledPrice));
+  const removed=pruneFloorVirtualBuys(s,k);
+  lg(s,"info",`  v BUY suelo movida a ${k} tras cancelar BUY`);
+  if(removed.length)lg(s,"warn",`  ~ vBUY antiguas eliminadas: ${removed.join(", ")}`);
+  return removed;
+}
+function replaceCeilingVirtualAfterCancel(s,canceledPrice,size,meta={}){
+  const k=pk(canceledPrice);
+  const cur=s.orders[k];
+  if(cur&&cur.oid!=="virtual")return [];
+  s.orders[k]={
+    side:"sell",oid:"virtual",price:r2(canceledPrice),size,
+    extended:false,gs:null,ps:null,
+    trailing_up_step:meta.trailing_up_step??null
+  };
+  delete s.ext[k];
+  if(!s.levels.find(l=>eq(l,canceledPrice)))s.levels.push(r2(canceledPrice));
+  const removed=pruneCeilingVirtualSells(s,k);
+  lg(s,"info",`  v SELL techo movida a ${k} tras cancelar SELL`);
+  if(removed.length)lg(s,"warn",`  ~ vSELL antiguas eliminadas: ${removed.join(", ")}`);
+  return removed;
 }
 function markExt(s,price,gs){
   const k=pk(price); s.ext[k]=gs;
@@ -254,8 +442,8 @@ function releaseBtc(s,tkey,req){
   if(est>=req-1e-6)return true;
   while(est<req-1e-6){
     const c=Object.entries(s.orders)
-      .filter(([,o])=>o.side==="sell"&&!o.extended&&
-        !["virtual","pending_post_only","pending_manual","pending_cancel"].includes(o.oid))
+      .filter(([,o])=>o.side==="sell"&&
+        !["virtual","pending_post_only","pending_manual","pending_cancel","pending_replace"].includes(o.oid))
       .sort(([a],[b])=>parseFloat(b)-parseFloat(a));
     if(!c.length){
       if(s.btc>est)est=s.btc;
@@ -267,7 +455,7 @@ function releaseBtc(s,tkey,req){
     s.btc=r5(s.btc+co.size); delete s.orders[ck]; delete s.ext[ck];
     s.levels=s.levels.filter(l=>!eq(l,parseFloat(ck)));
     lg(s,"err",`  x CANCEL SELL@${ck} sz=${co.size.toFixed(5)} +BTC est=${est.toFixed(5)}`);
-    removeHighestVSell(s);
+    if(ck!==tkey)replaceCeilingVirtualAfterCancel(s,parseFloat(ck),co.size,{trailing_up_step:tuStepFrom(co)||null});
     if(est>=req-1e-6){lg(s,"info",`  ✓ BTC liberado (${n} cancel)`);return true;}
   }
   return true;
@@ -282,7 +470,7 @@ function releaseUsdc(s,bp,bsz){
   while(est<req-1e-4){
     const c=Object.entries(s.orders)
       .filter(([k,o])=>o.side==="buy"&&
-        !["virtual","pending_post_only","pending_manual","pending_cancel"].includes(o.oid)&&
+        !["virtual","pending_post_only","pending_manual","pending_cancel","pending_replace"].includes(o.oid)&&
         !excl.has(k))
       .sort(([a],[b])=>parseFloat(a)-parseFloat(b));
     if(!c.length){
@@ -296,13 +484,8 @@ function releaseUsdc(s,bp,bsz){
     s.usdc=r2(s.usdc+rel); est+=rel; n++;
     delete s.orders[ck]; delete s.ext[ck];
     s.levels=s.levels.filter(l=>!eq(l,parseFloat(ck)));
-    if(n===1){
-      const vb=Object.entries(s.orders)
-        .filter(([,o])=>o.side==="buy"&&o.oid==="virtual")
-        .sort(([a],[b])=>parseFloat(a)-parseFloat(b));
-      if(vb.length){const[vk]=vb[0];delete s.orders[vk];s.levels=s.levels.filter(l=>!eq(l,parseFloat(vk)));lg(s,"warn",`  ~ vBUY suelo ${vk} eliminada`);}
-    }
     lg(s,"err",`  x CANCEL BUY@${ck} +${rel.toFixed(4)} USDC est=${est.toFixed(4)}`);
+    replaceFloorVirtualAfterCancel(s,parseFloat(ck),co.size,{extended:co.extended,gs:co.gs,ps:co.ps,trailing_up_step:tuStepFrom(co)||null});
     excl.add(ck);
     if(est>=req-1e-4){lg(s,"info",`  ✓ USDC liberado (${n} cancel)`);return true;}
   }
@@ -346,11 +529,21 @@ function fill(key){
   const bs   =s.base_step;
   const td   =s.trailing_down;
   const tu   =s.trailing_up;
+  s.mark_price=o.price;
 
   lg(s,"fill",`── FILL #${s.fc}: ${o.side.toUpperCase()}@${key} [${isV?"V":"R"}]${isExt?"[EXT]":""} sz=${o.size.toFixed(5)}  tu=${tu} td=${td}`);
   if(!isV){
-    if(o.side==="buy"){s.btc=r5(s.btc+o.size);lg(s,"ok",`  BTC  +${o.size.toFixed(5)} → ${s.btc.toFixed(5)}`);}
-    else{const u=r2(o.price*o.size);s.usdc=r2(s.usdc+u);lg(s,"ok",`  USDC +${u.toFixed(4)} → ${s.usdc.toFixed(4)}`);}
+    if(o.side==="buy"){
+      s.btc=r5(s.btc+o.size);
+      addLot(s,o.size,o.price);
+      lg(s,"ok",`  BTC  +${o.size.toFixed(5)} → ${s.btc.toFixed(5)} | lot cost=${pk(o.price)}`);
+    }
+    else{
+      const u=r2(o.price*o.size);
+      const rp=consumeLotsForSell(s,o.size,o.price);
+      s.usdc=r2(s.usdc+u);
+      lg(s,"ok",`  USDC +${u.toFixed(4)} → ${s.usdc.toFixed(4)} | realized ${rp>=0?"+":""}${money(rp)}`);
+    }
   }else{lg(s,"info","  Virtual activado (sin trade real)");}
 
   // counter updates (ALL non-extended fills, before dispatch)
@@ -387,21 +580,21 @@ function fill(key){
 
     if(isV){
       if(td==="extended"){
-        const ns=parseFloat((gs*1.1).toFixed(2)),nbp=r2(o.price-ns);
-        s.drops++; markExt(s,nbp,ns);
-        lg(s,"fill",`  drop#${s.drops} step ${r2(gs)}→${r2(ns)} next@${pk(nbp)}`);
+        const nbp=r2(o.price-gs);
+        s.drops++; markExt(s,nbp,gs);
+        lg(s,"fill",`  drop#${s.drops} step ${r2(gs)} next@${pk(nbp)}`);
         const es=extSize(s);
         if(!releaseBtc(s,pk(sp),es))lg(s,"warn",`  ! SELL@${pk(sp)} omitido: BTC`);
         else placeOrd(s,sp,"sell",es,true,gs,o.price);
-        addVirt(s,nbp,"buy",es,true,ns,o.price);
+        addVirt(s,nbp,"buy",es,true,gs,o.price);
       }else if(td==="on"){
         const nbp=r2(o.price-gs); markExt(s,nbp,gs);
-        placeOrd(s,sp,"sell",o.size,true,gs,o.price);
+        if(!releaseBtc(s,pk(sp),o.size))lg(s,"warn",`  ! SELL@${pk(sp)} omitido: BTC`);
+        else placeOrd(s,sp,"sell",o.size,true,gs,o.price);
         addVirt(s,nbp,"buy",o.size,true,gs,o.price);
         lg(s,"fill",`  td=on: SELL@${pk(sp)} + vBUY@${pk(nbp)} (mismo step)`);
       }else{
-        placeOrd(s,sp,"sell",o.size,true,gs,o.price);
-        lg(s,"fill",`  td=off: SELL@${pk(sp)} sólo`);
+        lg(s,"fill",`  td=off: virtual BUY extended activada, no se extiende`);
       }
     }else{
       placeOrd(s,sp,"sell",o.size,true,gs,o.price);
@@ -413,34 +606,40 @@ function fill(key){
   if(!handled&&o.side==="buy"){
     const pl=principalLevels(s);
     const lo=pl.length?Math.min(...pl):Math.min(...s.levels);
-    if(eq(o.price,lo)){
+    const isRecordedFloorBuy=eq(o.price,lo);
+    const isVirtualFloorBuy=isV&&td!=="off";
+    if(isRecordedFloorBuy||isVirtualFloorBuy){
+      if(isV&&!isRecordedFloorBuy)lg(s,"fill",`  BUY virtual ${key} tratada como suelo operativo aunque suelo registrado=${pk(lo)}`);
       const sp=r2(o.price+bs),bp=r2(o.price-bs);
       if(td==="extended"){
         markExt(s,bp,bs);
-        placeOrd(s,sp,"sell",s.base_size,false);
+        if(isV&&!releaseBtc(s,pk(sp),o.size))lg(s,"warn",`  ! SELL@${pk(sp)} omitido: BTC`);
+        else placeOrd(s,sp,"sell",o.size,false);
         addVirt(s,bp,"buy",extSize(s),true,bs,o.price);
-        lg(s,"fill",`  td=ext iniciado: SELL@${pk(sp)} + vBUY@${pk(bp)} gs=${bs}`);
+        lg(s,"fill",`  td=ext iniciado: SELL@${pk(sp)} sz=${o.size.toFixed(5)} + vBUY@${pk(bp)} gs=${bs}`);
       }else if(td==="on"){
-        // virtual BUY not extended; remove highest level if overflow (max_levels cap)
-        const maxLv=principalLevels(s).length+2;
         s.levels.push(bp);
         const all=[...new Set(s.levels)].sort((a,b)=>a-b);
-        if(all.filter(l=>!s.ext[pk(l)]).length>maxLv){
-          const h=Math.max(...all.filter(l=>!s.ext[pk(l)]));
+        if(all.length>(s.max_levels??all.length)){
+          const h=Math.max(...all);
           const hk=pk(h);
           const rm=s.orders[hk];
-          if(rm&&!["virtual","pending_post_only","pending_manual","pending_cancel"].includes(rm.oid)){
+          const shouldMoveCeiling=rm&&!["virtual","pending_post_only","pending_manual","pending_cancel","pending_replace"].includes(rm.oid);
+          if(shouldMoveCeiling){
             s.btc=r5(s.btc+rm.size);
             lg(s,"err",`  x CANCEL SELL@${hk} (max_levels) +${rm.size.toFixed(5)} BTC`);
           }
           delete s.orders[hk]; delete s.ext[hk];
           s.levels=s.levels.filter(l=>!eq(l,h));
+          if(shouldMoveCeiling)replaceCeilingVirtualAfterCancel(s,h,rm.size,{trailing_up_step:tuStepFrom(rm)||null});
         }
-        placeOrd(s,sp,"sell",o.size,false);
+        if(isV&&!releaseBtc(s,pk(sp),o.size))lg(s,"warn",`  ! SELL@${pk(sp)} omitido: BTC`);
+        else placeOrd(s,sp,"sell",o.size,false);
         addVirt(s,bp,"buy",o.size,false);
         lg(s,"fill",`  td=on: SELL@${pk(sp)} + vBUY@${pk(bp)}`);
       }else{
-        placeOrd(s,sp,"sell",o.size,false);
+        if(isV&&!releaseBtc(s,pk(sp),o.size))lg(s,"warn",`  ! SELL@${pk(sp)} omitido: BTC`);
+        else placeOrd(s,sp,"sell",o.size,false);
         lg(s,"fill",`  td=off: SELL@${pk(sp)} sin extensión`);
       }
       handled=true;
@@ -455,7 +654,7 @@ function fill(key){
       const bp=r2(o.price-bs),tp=r2(o.price+bs),tpk=pk(tp);
 
       if(tu==="extended"){
-        const bsz=tuSize(s,cur);
+        const bsz=o.size;
         let placed=false;
         if(!isV){
           placed=placeOrd(s,bp,"buy",bsz,false,null,null,cur||null);
@@ -472,7 +671,7 @@ function fill(key){
         lg(s,"fill",`  tu=ext: BUY@${pk(bp)} sz=${bsz.toFixed(5)} placed=${placed} step=${cur}`);
 
       }else if(tu==="fixed_quote"){
-        const bsz=isV?tuFixedQuoteSize(s,bp):o.size;
+        const bsz=o.size;
         let placed=false;
         if(!isV){placed=placeOrd(s,bp,"buy",bsz,false);}
         else{
@@ -502,7 +701,8 @@ function fill(key){
         lg(s,"fill",`  tu=on: BUY@${pk(bp)} placed=${placed}`);
 
       }else{
-        placeOrd(s,bp,"buy",o.size,false);
+        if(isV&&!releaseUsdc(s,bp,o.size))lg(s,"warn",`  ! BUY@${pk(bp)} omitido: USDC`);
+        else placeOrd(s,bp,"buy",o.size,false);
         lg(s,"fill",`  tu=off: BUY@${pk(bp)} sin extensión`);
       }
       handled=true;
@@ -511,16 +711,19 @@ function fill(key){
 
   // ── BUY intermedio → SELL arriba ─────────────────────────────────────────
   if(!handled&&o.side==="buy"){
-    placeOrd(s,r2(o.price+bs),"sell",o.size,false,null,null,o.trailing_up_step??null);
+    const sp=r2(o.price+bs);
+    if(isV&&!releaseBtc(s,pk(sp),o.size))lg(s,"warn",`  ! SELL@${pk(sp)} omitido: BTC`);
+    else placeOrd(s,sp,"sell",o.size,false,null,null,o.trailing_up_step??null);
     lg(s,"","  BUY intermedio → SELL arriba"); handled=true;
   }
 
   // ── SELL intermedio → BUY abajo ──────────────────────────────────────────
   if(!handled&&o.side==="sell"){
     const nbp=r2(o.price-bs);
-    const nsz=(tu==="fixed_quote"&&o.price>=s.anchor_high)?tuFixedQuoteSize(s,nbp):o.size;
+    const nsz=o.size;
     const tmeta=(tu==="extended")?(o.trailing_up_step??null):null;
-    placeOrd(s,nbp,"buy",nsz,false,null,null,tmeta);
+    if(isV&&!releaseUsdc(s,nbp,nsz))lg(s,"warn",`  ! BUY@${pk(nbp)} omitido: USDC`);
+    else placeOrd(s,nbp,"buy",nsz,false,null,null,tmeta);
     lg(s,"","  SELL intermedio → BUY abajo"); handled=true;
   }
 
@@ -528,6 +731,7 @@ function fill(key){
   const ek=Object.keys(s.ext).sort((a,b)=>parseFloat(a)-parseFloat(b));
   lg(s,"",`  ▸ drops=${s.drops} up_steps=${s.up_steps} usdc=${s.usdc.toFixed(4)} btc=${s.btc.toFixed(5)}`);
   if(ek.length)lg(s,"",`    ext={${ek.map(k=>`${k}:${r2(s.ext[k])}`).join(", ")}}`);
+  recordPnl(s);
   s.si=(s.si||0)+1;
   S=s; render();
 }
@@ -567,8 +771,13 @@ function render(){
 
   const mb=document.getElementById("mbar"); mb.innerHTML="";
   const tuc=tuSize(S,S.up_steps).toFixed(5);
-  [["base_step",S.base_step],["ext_size",extSize(S).toFixed(5)],["drops",S.drops],
-   ["up_steps",S.up_steps],["tu_size",tuc],["tu_quote",tuFixedQuote(S).toFixed(2)],["USDC libre",S.usdc.toFixed(4)],["BTC libre",S.btc.toFixed(5)]]
+  const st=pnlStats(S);
+  const req=S.initial_required||requiredForLines(S.center_price,S.base_step,S.base_size,S.levels_below);
+  [["saldo",money(S.initial_equity)],["líneas/lado",S.levels_below],["capital usado",money(req.total)],
+   ["equity",money(st.equity)],["PnL",`${st.pnl>=0?"+":""}${money(st.pnl)}`],["PnL %",`${st.pnl>=0?"+":""}${pct(st.pct)}%`],["Realizado",`${st.realized>=0?"+":""}${money(st.realized)}`],
+   ["base_step",S.base_step],["ext_size",extSize(S).toFixed(5)],["drops",S.drops],
+   ["up_steps",S.up_steps],["tu_size",tuc],["tu_quote",tuFixedQuote(S).toFixed(2)],
+   ["USDC libre",S.usdc.toFixed(4)],["BTC libre",S.btc.toFixed(5)]]
     .forEach(([l,v])=>{
       const d=document.createElement("div");d.className="mc";
       d.innerHTML=`<div class="ml">${l}</div><div class="mv">${v}</div>`;
@@ -581,6 +790,11 @@ function render(){
   document.getElementById("sclabel").innerHTML=sc
     ?`Paso ${si+1}/${STEPS.length}:<br><b>${sc[0]}</b>`
     :free?`<b>Modo libre</b> — guión de pasos requiere EXT/EXT`:"✓ Escenario completado";
+
+  const ph=Array.isArray(S.pnl_history)?S.pnl_history.slice(-8).reverse():[];
+  const pst=pnlStats(S);
+  document.getElementById("pnlbox").innerHTML=`<b>Registro PnL</b><br>mark=${pk(S.mark_price??S.center_price)} equity=${money(pst.equity)} pnl=${pst.pnl>=0?"+":""}${money(pst.pnl)} (${pst.pnl>=0?"+":""}${pct(pst.pct)}%) realizado=${pst.realized>=0?"+":""}${money(pst.realized)}`+
+    (ph.length?`<div class="pnlrows">${ph.map(x=>`#${x.n} @${pk(x.price)} · eq=${money(x.equity)} · <span class="${x.pnl>=0?"gain":"loss"}">${x.pnl>=0?"+":""}${money(x.pnl)} (${x.pnl>=0?"+":""}${pct(x.pct)}%)</span> · real=${x.realized>=0?"+":""}${money(x.realized)}`).join("<br>")}</div>`:`<div class="pnlrows">Sin fills todavía.</div>`);
 
   const ls=[...new Set(S.levels)].sort((a,b)=>b-a);
   const lo=ls.length?ls[ls.length-1]:null,hi=ls.length?ls[0]:null;
@@ -613,7 +827,15 @@ function render(){
   lb.scrollTop=lb.scrollHeight;
 }
 
-S=mkS(); render();
+syncAutoLines();
+S=mkS({
+  price:parseFloat(document.getElementById("cfg_price").value)||1000,
+  step:parseFloat(document.getElementById("cfg_step").value)||20,
+  size:parseFloat(document.getElementById("cfg_size").value)||0.01,
+  balance:parseFloat(document.getElementById("cfg_balance").value)||100,
+  lines:parseInt(document.getElementById("cfg_lines").value)||0,
+});
+render();
 </script>
 </body>
 </html>
