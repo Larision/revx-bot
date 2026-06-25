@@ -2575,6 +2575,12 @@ class GridEngine:
             is_recorded_floor_buy = price == lowest_principal
             is_virtual_floor_buy = is_virtual and self.trailing_down_mode != "off"
 
+            trailing_up_mode_for_ceiling = self._normalise_trailing_up_mode(
+                getattr(self, "trailing_up_mode", self.trailing_up_enabled)
+            )
+            is_recorded_ceiling_sell = price == highest
+            is_virtual_ceiling_sell = is_virtual and trailing_up_mode_for_ceiling != "off"
+
             if not handled and side == "buy" and (is_recorded_floor_buy or is_virtual_floor_buy):
                 next_sell_price = (price + base_step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
                 next_buy_price = (price - base_step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
@@ -2662,10 +2668,14 @@ class GridEngine:
 
                 handled = True
 
-            elif not handled and side == "sell" and price == highest:
-                trailing_up_mode = self._normalise_trailing_up_mode(
-                    getattr(self, "trailing_up_mode", self.trailing_up_enabled)
-                )
+            elif not handled and side == "sell" and (is_recorded_ceiling_sell or is_virtual_ceiling_sell):
+                trailing_up_mode = trailing_up_mode_for_ceiling
+
+                if is_virtual and not is_recorded_ceiling_sell:
+                    trailing_logs.append(
+                        f"[ENGINE] Trailing up: SELL virtual {filled_key} tratada como techo "
+                        f"aunque el techo registrado sea {_price_key(highest)}"
+                    )
                 extended_trailing_up = trailing_up_mode == "extended"
                 fixed_quote_trailing_up = trailing_up_mode == "fixed_quote"
                 current_trailing_up_step = (
