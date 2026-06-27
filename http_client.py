@@ -85,8 +85,8 @@ def send_request(
         headers = {}
         if method.upper() == "POST":
             headers["Content-Type"] = "application/json"
-        if method.upper() == "GET":
-            headers["Accept"] = "application/json"
+        if method.upper() == "PUT":
+            headers["Content-Type"] = "application/json"
 
         headers.update({
             "X-Revx-Timestamp": timestamp,
@@ -100,6 +100,8 @@ def send_request(
             return SESSION.delete(url, headers=headers, timeout=10)
         if method.upper() == "POST":
             return SESSION.post(url, headers=headers, timeout=10, data=body_str)
+        if method.upper() == "PUT":
+            return SESSION.put(url, headers=headers, timeout=10, data=body_str)
 
         raise ValueError(f"Método HTTP no soportado: {method}")
 
