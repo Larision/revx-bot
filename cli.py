@@ -2,7 +2,6 @@ from __future__ import annotations
 import csv
 import json
 import signal
-import msvcrt
 import threading
 import time
 from pathlib import Path
@@ -52,30 +51,87 @@ class InputCancelled(Exception):
 def input_with_esc(prompt: str) -> str:
     """
     Función de input personalizada que permite cancelar con ESC.
+
+    - En Windows usa msvcrt.
+    - En Linux/macOS usa termios + tty + select.
+    - Si no hay terminal interactiva, cae a input() normal.
     """
+    import platform
+    import select
+    import sys
+
+    if platform.system().lower() == "windows":
+        import msvcrt
+
+        print(prompt, end='', flush=True)
+        buffer = ''
+        while True:
+            if msvcrt.kbhit():
+                ch = msvcrt.getch()
+                if ch == b'\x1b':  # ESC key
+                    print()
+                    raise InputCancelled("Entrada cancelada con ESC")
+                elif ch in (b'\r', b'\n'):  # Enter
+                    print()
+                    return buffer
+                elif ch == b'\x08':  # Backspace
+                    if buffer:
+                        buffer = buffer[:-1]
+                        print('\b \b', end='', flush=True)
+                else:
+                    try:
+                        char = ch.decode('utf-8')
+                    except UnicodeDecodeError:
+                        pass  # ignore invalid chars
+                    else:
+                        buffer += char
+                        print(char, end='', flush=True)
+            time.sleep(0.01)
+
+    if not sys.stdin.isatty():
+        try:
+            return input(prompt)
+        except EOFError as exc:
+            raise InputCancelled("Entrada cancelada") from exc
+
+    try:
+        import termios
+        import tty
+    except ImportError:
+        try:
+            return input(prompt)
+        except EOFError as exc:
+            raise InputCancelled("Entrada cancelada") from exc
+
     print(prompt, end='', flush=True)
     buffer = ''
-    while True:
-        if msvcrt.kbhit():
-            ch = msvcrt.getch()
-            if ch == b'\x1b':  # ESC key
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+
+    try:
+        tty.setcbreak(fd)
+        while True:
+            readable, _, _ = select.select([sys.stdin], [], [], 0.05)
+            if not readable:
+                continue
+
+            ch = sys.stdin.read(1)
+            if ch == '\x1b':
                 print()
-                raise InputCancelled("Backtest cancelado con ESC")
-            elif ch == b'\r':  # Enter
+                raise InputCancelled("Entrada cancelada con ESC")
+            if ch in ('\r', '\n'):
                 print()
                 return buffer
-            elif ch == b'\x08':  # Backspace
+            if ch in ('\x08', '\x7f'):
                 if buffer:
                     buffer = buffer[:-1]
                     print('\b \b', end='', flush=True)
-            else:
-                try:
-                    char = ch.decode('utf-8')
-                    buffer += char
-                    print(char, end='', flush=True)
-                except UnicodeDecodeError:
-                    pass  # ignore invalid chars
-        time.sleep(0.01)
+                continue
+
+            buffer += ch
+            print(ch, end='', flush=True)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 # =========================================================
 # ====================== MANUAL ORDER =====================
@@ -171,10 +227,8 @@ def _parse_date_to_ms(date_str: str, end_of_day: bool = False) -> int:
     return int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
 
 def check_esc():
-    if msvcrt.kbhit():
-        ch = msvcrt.getch()
-        if ch == b'\x1b':
-            raise InputCancelled("Operación cancelada con ESC")
+    if _esc_pressed():
+        raise InputCancelled("Operación cancelada con ESC")
 
 # =========================================================
 # ====================== MENU EXPORTAR ====================
