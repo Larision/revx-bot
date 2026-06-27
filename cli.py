@@ -2,6 +2,7 @@ from __future__ import annotations
 import csv
 import json
 import signal
+import msvcrt
 import threading
 import time
 from pathlib import Path
@@ -44,6 +45,37 @@ from api import (
     place_order,
 )
 
+class InputCancelled(Exception):
+    """Cancelación controlada de inputs desde la CLI."""
+    pass
+
+def input_with_esc(prompt: str) -> str:
+    """
+    Función de input personalizada que permite cancelar con ESC.
+    """
+    print(prompt, end='', flush=True)
+    buffer = ''
+    while True:
+        if msvcrt.kbhit():
+            ch = msvcrt.getch()
+            if ch == b'\x1b':  # ESC key
+                print()
+                raise InputCancelled("Backtest cancelado con ESC")
+            elif ch == b'\r':  # Enter
+                print()
+                return buffer
+            elif ch == b'\x08':  # Backspace
+                if buffer:
+                    buffer = buffer[:-1]
+                    print('\b \b', end='', flush=True)
+            else:
+                try:
+                    char = ch.decode('utf-8')
+                    buffer += char
+                    print(char, end='', flush=True)
+                except UnicodeDecodeError:
+                    pass  # ignore invalid chars
+        time.sleep(0.01)
 
 # =========================================================
 # ====================== MANUAL ORDER =====================
@@ -90,6 +122,9 @@ def manual_order() -> Tuple[Optional[str], Optional[Decimal], Optional[Decimal]]
 
     return None, None, None
 
+# =========================================================
+# ========================= HELPERS =======================
+# =========================================================
 
 def _epoch_ms_to_iso(ms: object) -> str:
     """
@@ -135,6 +170,15 @@ def _parse_date_to_ms(date_str: str, end_of_day: bool = False) -> int:
         dt = dt.replace(hour=0, minute=0, second=0, microsecond=0)
     return int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
 
+def check_esc():
+    if msvcrt.kbhit():
+        ch = msvcrt.getch()
+        if ch == b'\x1b':
+            raise InputCancelled("Operación cancelada con ESC")
+
+# =========================================================
+# ====================== MENU EXPORTAR ====================
+# =========================================================
 
 def menu_exportar_datos():
     """
@@ -168,27 +212,32 @@ def exportar_datos_mercado():
     """
     print("\n=== Obtener histórico de mercado (trades públicos) ===")
 
-    symbol = input(f"Symbol [{SYMBOL}]: ").strip() or SYMBOL
+    try:
+        symbol = input_with_esc(f"Symbol [{SYMBOL}]: ").strip() or SYMBOL
 
-    # Fechas de inicio y fin
-    while True:
-        start_str = input("Fecha inicio (YYYYMMDD): ").strip()
-        try:
-            since = _parse_date_to_ms(start_str)
-            break
-        except ValueError:
-            print("Formato inválido. Usa YYYYMMDD")
+        # Fechas de inicio y fin
+        while True:
+            start_str = input_with_esc("Fecha inicio (YYYYMMDD): ").strip()
+            try:
+                since = _parse_date_to_ms(start_str)
+                break
+            except ValueError:
+                print("Formato inválido. Usa YYYYMMDD")
 
-    while True:
-        end_str = input("Fecha fin (YYYYMMDD) [hoy]: ").strip()
-        if not end_str:
-            until = int(time.time() * 1000)
-            break
-        try:
-            until = _parse_date_to_ms(end_str, end_of_day=True)
-            break
-        except ValueError:
-            print("Formato inválido. Usa YYYYMMDD")
+        while True:
+            end_str = input_with_esc("Fecha fin (YYYYMMDD) [hoy]: ").strip()
+            if not end_str:
+                until = int(time.time() * 1000)
+                break
+            try:
+                until = _parse_date_to_ms(end_str, end_of_day=True)
+                break
+            except ValueError:
+                print("Formato inválido. Usa YYYYMMDD")
+
+    except InputCancelled:
+        print("\nOperación cancelada.")
+        return
 
     if since > until:
         print("La fecha de inicio no puede ser mayor que la fecha de fin.")
@@ -202,6 +251,8 @@ def exportar_datos_mercado():
 
     # Descargar por ventanas de 7 días
     while window_start <= until:
+        check_esc()   # Permite cancelar la operación con ESC
+
         window_end = min(window_start + WINDOW_MS - 1, until)
         print(f"\n--- Descargando ventana ---")
         print(f"Desde: {datetime.fromtimestamp(window_start/1000)}")
@@ -225,6 +276,8 @@ def exportar_datos_mercado():
             data = response.get("data", [])
             if isinstance(data, list):
                 for row in data:
+                    check_esc()   # Permite cancelar la operación con ESC
+
                     tid = row.get("tid")
                     if tid and tid in seen_ids:
                         continue
@@ -272,36 +325,41 @@ def exportar_datos_candles():
     print("\n=== Obtener y exportar histórico de candles ===")
     print("\n=== Maximo intervalo permitido = 50000 candles (ej: 1 mes con 1 min) ===")
 
-    symbol = input(f"Symbol [{SYMBOL}]: ").strip() or SYMBOL
+    try:
+        symbol = input_with_esc(f"Symbol [{SYMBOL}]: ").strip() or SYMBOL
 
-    while True:
-        interval = input(
-            "Intervalo de candles? [1, 5, 15, 30, 60, 240, 1440, 2880, 5760, 10080, 20160, 40320]: "
-        ).strip()
-        try:
-            interval = int(interval)
-            break
-        except ValueError:
-            print("Intervalo inválido.")
+        while True:
+            interval = input_with_esc(
+                "Intervalo de candles? [1, 5, 15, 30, 60, 240, 1440, 2880, 5760, 10080, 20160, 40320]: "
+            ).strip()
+            try:
+                interval = int(interval)
+                break
+            except ValueError:
+                print("Intervalo inválido.")
 
-    while True:
-        start_str = input("Fecha inicio (YYYYMMDD): ").strip()
-        try:
-            since = _parse_date_to_ms(start_str)
-            break
-        except ValueError:
-            print("Formato inválido. Usa YYYYMMDD (ej: 20260415)")
+        while True:
+            start_str = input_with_esc("Fecha inicio (YYYYMMDD): ").strip()
+            try:
+                since = _parse_date_to_ms(start_str)
+                break
+            except ValueError:
+                print("Formato inválido. Usa YYYYMMDD (ej: 20260415)")
 
-    while True:
-        end_str = input("Fecha fin (YYYYMMDD) [hoy]: ").strip()
-        if not end_str:
-            until = int(time.time() * 1000)
-            break
-        try:
-            until = _parse_date_to_ms(end_str, end_of_day=True)
-            break
-        except ValueError:
-            print("Formato inválido. Usa YYYYMMDD (ej: 20260415)")
+        while True:
+            end_str = input_with_esc("Fecha fin (YYYYMMDD) [hoy]: ").strip()
+            if not end_str:
+                until = int(time.time() * 1000)
+                break
+            try:
+                until = _parse_date_to_ms(end_str, end_of_day=True)
+                break
+            except ValueError:
+                print("Formato inválido. Usa YYYYMMDD (ej: 20260415)")
+
+    except InputCancelled:
+        print("\nExportación cancelada por el usuario.")
+        return
 
     if since > until:
         print("La fecha de inicio no puede ser mayor que la fecha de fin.")
@@ -354,27 +412,32 @@ def exportar_datos_transacciones():
     """
     print("\n=== Obtener histórico de transacciones personal(fills) ===")
 
-    symbol = input(f"Symbol [{SYMBOL}]: ").strip() or SYMBOL
+    try:
+        symbol = input_with_esc(f"Symbol [{SYMBOL}]: ").strip() or SYMBOL
 
-    # Fechas de inicio y fin
-    while True:
-        start_str = input("Fecha inicio (YYYYMMDD): ").strip()
-        try:
-            since = _parse_date_to_ms(start_str)
-            break
-        except ValueError:
-            print("Formato inválido. Usa YYYYMMDD")
+        # Fechas de inicio y fin
+        while True:
+            start_str = input_with_esc("Fecha inicio (YYYYMMDD): ").strip()
+            try:
+                since = _parse_date_to_ms(start_str)
+                break
+            except ValueError:
+                print("Formato inválido. Usa YYYYMMDD")
 
-    while True:
-        end_str = input("Fecha fin (YYYYMMDD) [hoy]: ").strip()
-        if not end_str:
-            until = int(time.time() * 1000)
-            break
-        try:
-            until = _parse_date_to_ms(end_str, end_of_day=True)
-            break
-        except ValueError:
-            print("Formato inválido. Usa YYYYMMDD")
+        while True:
+            end_str = input_with_esc("Fecha fin (YYYYMMDD) [hoy]: ").strip()
+            if not end_str:
+                until = int(time.time() * 1000)
+                break
+            try:
+                until = _parse_date_to_ms(end_str, end_of_day=True)
+                break
+            except ValueError:
+                print("Formato inválido. Usa YYYYMMDD")
+
+    except InputCancelled:
+        print("\nOperación cancelada.")
+        return
 
     if since > until:
         print("La fecha de inicio no puede ser mayor que la fecha de fin.")
@@ -388,6 +451,8 @@ def exportar_datos_transacciones():
 
     # Descargar por ventanas de 7 días
     while window_start <= until:
+        check_esc()  # Permite cancelar la operación con ESC
+
         window_end = min(window_start + WINDOW_MS - 1, until)
         print(f"\n--- Descargando ventana ---")
         print(f"Desde: {datetime.fromtimestamp(window_start/1000)}")
@@ -411,6 +476,7 @@ def exportar_datos_transacciones():
             data = response.get("data", [])
             if isinstance(data, list):
                 for row in data:
+                    check_esc()  # Permite cancelar la operación con ESC
                     tid = row.get("tid")
                     if tid and tid in seen_ids:
                         continue
@@ -1513,29 +1579,34 @@ def _add_manual_order(engine: "GridEngine") -> None:
     Función interactiva para colocar una orden manual y registrarla en las órdenes activas del motor.
     Reserva el nivel antes de enviar para evitar condiciones de carrera.
     """
-    while True:
-        try:
-            price_val = Decimal(input("  Precio: ").strip())
-            break
-        except Exception:
-            print("  Precio inválido.")
+    try:
+        while True:
+            try:
+                price_val = Decimal(input_with_esc("  Precio: ").strip())
+                break
+            except Exception:
+                print("  Precio inválido.")
 
-    key = _price_key(price_val)
+        key = _price_key(price_val)
 
-    while True:
-        side = input("  Lado (buy/sell): ").strip().lower()
-        if side in ("buy", "sell"):
-            break
-        print("  Lado inválido. Debe ser buy o sell.")
+        while True:
+            side = input_with_esc("  Lado (buy/sell): ").strip().lower()
+            if side in ("buy", "sell"):
+                break
+            print("  Lado inválido. Debe ser buy o sell.")
 
-    default_size = engine.get_runtime_snapshot()["base_size"]
-    while True:
-        try:
-            bs_input = input(f"  Tamaño [{fmt_amount(default_size)}]: ").strip()
-            base_size = Decimal(bs_input) if bs_input else default_size
-            break
-        except Exception:
-            print("  Tamaño inválido.")
+        default_size = engine.get_runtime_snapshot()["base_size"]
+        while True:
+            try:
+                bs_input = input_with_esc(f"  Tamaño [{fmt_amount(default_size)}]: ").strip()
+                base_size = Decimal(bs_input) if bs_input else default_size
+                break
+            except Exception:
+                print("  Tamaño inválido.")
+
+    except InputCancelled:
+        print("  Entrada cancelada.")
+        return
 
     confirm = input(f"  Colocar {side.upper()} en {key} tamaño {fmt_amount(base_size)}? (s/n): ").strip().lower()
     if not confirm.startswith("s"):
@@ -2150,123 +2221,128 @@ def run_cli() -> None:
         elif opcion.lower() == "c":
             print("\n=== Configuración manual ===")
 
-            new_levels_below = input(f"Niveles por debajo del precio inicial [{grid_levels_below}]: ")
-            if new_levels_below.strip():
-                try:
-                    grid_levels_below = int(new_levels_below)
-                except ValueError:
-                    log_event("[ERROR] Valor de niveles abajo inválido, conservando el anterior.", "error")
+            try:
+                new_levels_below = input_with_esc(f"Niveles por debajo del precio inicial [{grid_levels_below}]: ")
+                if new_levels_below.strip():
+                    try:
+                        grid_levels_below = int(new_levels_below)
+                    except ValueError:
+                        log_event("[ERROR] Valor de niveles abajo inválido, conservando el anterior.", "error")
 
-            new_levels_above = input(f"Niveles por encima del precio inicial [{grid_levels_above}]: ")
-            if new_levels_above.strip():
-                try:
-                    grid_levels_above = int(new_levels_above)
-                except ValueError:
-                    log_event("[ERROR] Valor de niveles arriba inválido, conservando el anterior.", "error")
+                new_levels_above = input_with_esc(f"Niveles por encima del precio inicial [{grid_levels_above}]: ")
+                if new_levels_above.strip():
+                    try:
+                        grid_levels_above = int(new_levels_above)
+                    except ValueError:
+                        log_event("[ERROR] Valor de niveles arriba inválido, conservando el anterior.", "error")
 
-            new_bs = input(f"Base size por defecto [{fmt_amount(base_size_default)}]: ")
-            if new_bs.strip():
-                try:
-                    base_size_default = Decimal(new_bs)
-                except Exception:
-                    log_event("[ERROR] Valor de base size inválido, conservando el anterior.", "error")
+                new_bs = input_with_esc(f"Base size por defecto [{fmt_amount(base_size_default)}]: ")
+                if new_bs.strip():
+                    try:
+                        base_size_default = Decimal(new_bs)
+                    except Exception:
+                        log_event("[ERROR] Valor de base size inválido, conservando el anterior.", "error")
 
-            new_step_percent = input(f"Step percent por defecto [{fmt_amount(step_percent_default)}]: ")
-            if new_step_percent.strip():
-                try:
-                    step_percent_default = Decimal(new_step_percent)
-                except Exception:
-                    log_event("[ERROR] Valor de step percent inválido, conservando el anterior.", "error")
+                new_step_percent = input_with_esc(f"Step percent por defecto [{fmt_amount(step_percent_default)}]: ")
+                if new_step_percent.strip():
+                    try:
+                        step_percent_default = Decimal(new_step_percent)
+                    except Exception:
+                        log_event("[ERROR] Valor de step percent inválido, conservando el anterior.", "error")
 
-            new_trailing_up = input(f"Trailing up (off/on/extended/fixed_quote) [{trailing_up_default}]: ").strip().lower()
-            if new_trailing_up and new_trailing_up in {"quote", "quote_fijo", "fixed-quote", "fixedquote"}:
-                new_trailing_up = "fixed_quote"
-            if new_trailing_up and new_trailing_up in ("off", "on", "extended", "fixed_quote"):
-                trailing_up_default = new_trailing_up
-            elif new_trailing_up:
-                log_event("[ERROR] Valor de trailing up inválido (debe ser off, on, extended o fixed_quote), conservando el anterior.", "error")
+                new_trailing_up = input_with_esc(f"Trailing up (off/on/extended/fixed_quote) [{trailing_up_default}]: ").strip().lower()
+                if new_trailing_up and new_trailing_up in {"quote", "quote_fijo", "fixed-quote", "fixedquote"}:
+                    new_trailing_up = "fixed_quote"
+                if new_trailing_up and new_trailing_up in ("off", "on", "extended", "fixed_quote"):
+                    trailing_up_default = new_trailing_up
+                elif new_trailing_up:
+                    log_event("[ERROR] Valor de trailing up inválido (debe ser off, on, extended o fixed_quote), conservando el anterior.", "error")
 
-            new_trailing_down = input(f"Trailing down (off/on/extended) [{trailing_down_default}]: ").strip().lower()
-            if new_trailing_down and new_trailing_down in ("off", "on", "extended"):
-                trailing_down_default = new_trailing_down
-            elif new_trailing_down:
-                log_event("[ERROR] Valor de trailing down inválido (debe ser off, on o extended), conservando el anterior.", "error")
+                new_trailing_down = input_with_esc(f"Trailing down (off/on/extended) [{trailing_down_default}]: ").strip().lower()
+                if new_trailing_down and new_trailing_down in ("off", "on", "extended"):
+                    trailing_down_default = new_trailing_down
+                elif new_trailing_down:
+                    log_event("[ERROR] Valor de trailing down inválido (debe ser off, on o extended), conservando el anterior.", "error")
 
-            available_usdc, _, balances_ok = _read_available_balances()
-            if balances_ok:
-                print(f"USDC disponible actual: {_fmt_usdc_value(available_usdc)}")
-            else:
-                print("USDC disponible actual: no disponible")
+                available_usdc, _, balances_ok = _read_available_balances()
+                if balances_ok:
+                    print(f"USDC disponible actual: {_fmt_usdc_value(available_usdc)}")
+                else:
+                    print("USDC disponible actual: no disponible")
 
-            new_usdc_reserve = input(
-                f"Cuanto USDC quieres reservar como colchón de seguridad: [{_fmt_usdc_value(reserve_usdc_default)}]: "
-            ).strip().lower()
+                new_usdc_reserve = input_with_esc(
+                    f"Cuanto USDC quieres reservar como colchón de seguridad: [{_fmt_usdc_value(reserve_usdc_default)}]: "
+                ).strip().lower()
 
-            if new_usdc_reserve:
-                try:
-                    reserve_usdc_default = Decimal(new_usdc_reserve)
-                    if reserve_usdc_default < 0:
-                        raise ValueError("el colchón de seguridad no puede ser negativo")
-                    if balances_ok and reserve_usdc_default > available_usdc:
-                        raise ValueError(
-                            f"el colchón de seguridad asignado ({_fmt_usdc_value(reserve_usdc_default)}) "
-                            f"supera el USDC disponible ({_fmt_usdc_value(available_usdc)})"
-                        )
-                    log_event(f"Colchón de seguridad actualizado a {_fmt_usdc_value(reserve_usdc_default)} USDC", "info")
-                except Exception as exc:
-                    log_event(f"[ERROR] Valor de colchón de seguridad inválido: {exc}. Conservando el anterior ({_fmt_usdc_value(reserve_usdc_default)}).", "error")
-                    reserve_usdc_default = reserve_usdc_default
-
-            budget_default_text = (
-                _fmt_usdc_value(bot_usdc_budget_default)
-                if bot_usdc_budget_default > 0
-                else "0"
-            )
-            new_budget = input(
-                f"Saldo USDC total a emplear por el bot [{budget_default_text}] "
-                "(0 = sin límite explícito): "
-            ).strip().lower()
-
-            if new_budget:
-                try:
-                    if new_budget in {"max", "todo", "all"}:
-                        if not balances_ok:
-                            raise ValueError("no se pudo leer USDC disponible")
-                        parsed_budget = max(Decimal("0"), available_usdc - reserve_usdc_default)
-                    else:
-                        parsed_budget = Decimal(new_budget)
-
-                    if parsed_budget < 0:
-                        raise ValueError("el saldo no puede ser negativo")
-                    
-                    if balances_ok:
-                        max_budget = max(Decimal("0"), available_usdc - reserve_usdc_default)
-                        if parsed_budget > max_budget:
+                if new_usdc_reserve:
+                    try:
+                        reserve_usdc_default = Decimal(new_usdc_reserve)
+                        if reserve_usdc_default < 0:
+                            raise ValueError("el colchón de seguridad no puede ser negativo")
+                        if balances_ok and reserve_usdc_default > available_usdc:
                             raise ValueError(
-                                f"el saldo asignado ({_fmt_usdc_value(parsed_budget)}) "
-                                f"supera el USDC disponible ({_fmt_usdc_value(max_budget)})"
+                                f"el colchón de seguridad asignado ({_fmt_usdc_value(reserve_usdc_default)}) "
+                                f"supera el USDC disponible ({_fmt_usdc_value(available_usdc)})"
                             )
-                    bot_usdc_budget_default = parsed_budget
+                        log_event(f"Colchón de seguridad actualizado a {_fmt_usdc_value(reserve_usdc_default)} USDC", "info")
+                    except Exception as exc:
+                        log_event(f"[ERROR] Valor de colchón de seguridad inválido: {exc}. Conservando el anterior ({_fmt_usdc_value(reserve_usdc_default)}).", "error")
+                        reserve_usdc_default = reserve_usdc_default
 
-                except Exception as exc:
-                    log_event(f"[ERROR] Valor de saldo asignado inválido: {exc}. Conservando el anterior.", "error")
-            
-            elif balances_ok:
-                bot_usdc_budget_default = max(Decimal("0"), available_usdc - reserve_usdc_default)
-                log_event(f"Saldo asignado actualizado a {_fmt_usdc_value(bot_usdc_budget_default)} USDC (ajustado automáticamente según el colchón de seguridad)", "info")
+                budget_default_text = (
+                    _fmt_usdc_value(bot_usdc_budget_default)
+                    if bot_usdc_budget_default > 0
+                    else "0"
+                )
+                new_budget = input_with_esc(
+                    f"Saldo USDC total a emplear por el bot [{budget_default_text}] "
+                    "(0 = sin límite explícito): "
+                ).strip().lower()
 
-            # Guardar la configuración
-            save_grid_config(
-                grid_levels_below,
-                grid_levels_above,
-                str(base_size_default),
-                str(step_percent_default),
-                trailing_up_default,
-                trailing_down_default,
-                str(reserve_usdc_default),
-                str(bot_usdc_budget_default),
-            )
-            print("✓ Configuración guardada como predeterminada.")
+                if new_budget:
+                    try:
+                        if new_budget in {"max", "todo", "all"}:
+                            if not balances_ok:
+                                raise ValueError("no se pudo leer USDC disponible")
+                            parsed_budget = max(Decimal("0"), available_usdc - reserve_usdc_default)
+                        else:
+                            parsed_budget = Decimal(new_budget)
+
+                        if parsed_budget < 0:
+                            raise ValueError("el saldo no puede ser negativo")
+                        
+                        if balances_ok:
+                            max_budget = max(Decimal("0"), available_usdc - reserve_usdc_default)
+                            if parsed_budget > max_budget:
+                                raise ValueError(
+                                    f"el saldo asignado ({_fmt_usdc_value(parsed_budget)}) "
+                                    f"supera el USDC disponible ({_fmt_usdc_value(max_budget)})"
+                                )
+                        bot_usdc_budget_default = parsed_budget
+
+                    except Exception as exc:
+                        log_event(f"[ERROR] Valor de saldo asignado inválido: {exc}. Conservando el anterior.", "error")
+        
+                elif balances_ok:
+                    bot_usdc_budget_default = max(Decimal("0"), available_usdc - reserve_usdc_default)
+                    log_event(f"Saldo asignado actualizado a {_fmt_usdc_value(bot_usdc_budget_default)} USDC (ajustado automáticamente según el colchón de seguridad)", "info")
+
+                # Guardar la configuración
+                save_grid_config(
+                    grid_levels_below,
+                    grid_levels_above,
+                    str(base_size_default),
+                    str(step_percent_default),
+                    trailing_up_default,
+                    trailing_down_default,
+                    str(reserve_usdc_default),
+                    str(bot_usdc_budget_default),
+                )
+                print("✓ Configuración guardada como predeterminada.")
+
+            except InputCancelled:
+                print("Entrada cancelada. Configuración no guardada.")
+                return
 
         # --------------------------------------------------
         # 0.Salir

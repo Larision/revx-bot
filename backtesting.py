@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import csv
 import time
-import msvcrt
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
@@ -11,7 +10,7 @@ from pathlib import Path
 from typing import Any, Optional, Sequence, cast
 
 from api import _price_key, fmt_amount, get_historic_market_trades, get_candles
-from cli import _epoch_ms_to_iso
+from cli import _epoch_ms_to_iso, input_with_esc
 from config import SYMBOL, TICK_SIZE, WINDOW_MS
 from engine import GridEngine
 from logger import log_event
@@ -24,36 +23,6 @@ BACKTEST_OUTPUT_DIR = Path("backtesting")
 class BacktestCancelled(Exception):
     """Cancelación controlada del backtest desde la CLI."""
     pass
-
-
-def input_with_esc(prompt: str) -> str:
-    """
-    Función de input personalizada que permite cancelar con ESC.
-    """
-    print(prompt, end='', flush=True)
-    buffer = ''
-    while True:
-        if msvcrt.kbhit():
-            ch = msvcrt.getch()
-            if ch == b'\x1b':  # ESC key
-                print()
-                raise BacktestCancelled("Backtest cancelado con ESC")
-            elif ch == b'\r':  # Enter
-                print()
-                return buffer
-            elif ch == b'\x08':  # Backspace
-                if buffer:
-                    buffer = buffer[:-1]
-                    print('\b \b', end='', flush=True)
-            else:
-                try:
-                    char = ch.decode('utf-8')
-                    buffer += char
-                    print(char, end='', flush=True)
-                except UnicodeDecodeError:
-                    pass  # ignore invalid chars
-        time.sleep(0.01)
-
 
 @dataclass
 class BacktestResult:
