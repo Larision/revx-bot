@@ -71,22 +71,23 @@ def input_with_esc(prompt: str) -> str:
                 if ch == b'\x1b':  # ESC key
                     print()
                     raise InputCancelled("Entrada cancelada con ESC")
-                elif ch in (b'\r', b'\n'):  # Enter
+                if ch in (b'\r', b'\n'):  # Enter
                     print()
                     return buffer
-                elif ch == b'\x08':  # Backspace
+                if ch == b'\x08':  # Backspace
                     if buffer:
                         buffer = buffer[:-1]
                         print('\b \b', end='', flush=True)
-                else:
-                    try:
-                        char = ch.decode('utf-8')
-                    except UnicodeDecodeError:
-                        pass  # ignore invalid chars
-                    else:
-                        buffer += char
-                        print(char, end='', flush=True)
+                    continue
+                try:
+                    char = ch.decode('utf-8')
+                except UnicodeDecodeError:
+                    continue  # ignore invalid chars
+                buffer += char
+                print(char, end='', flush=True)
             time.sleep(0.01)
+
+        return buffer
 
     if not sys.stdin.isatty():
         try:
@@ -103,15 +104,20 @@ def input_with_esc(prompt: str) -> str:
         except EOFError as exc:
             raise InputCancelled("Entrada cancelada") from exc
 
+    # Tipado explícito para que Pylance no marque los miembros POSIX como inexistentes.
+    termios_mod: Any = termios
+    tty_mod: Any = tty
+    select_mod: Any = select
+
     print(prompt, end='', flush=True)
     buffer = ''
     fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
+    old_settings = termios_mod.tcgetattr(fd)
 
     try:
-        tty.setcbreak(fd)
+        tty_mod.setcbreak(fd)
         while True:
-            readable, _, _ = select.select([sys.stdin], [], [], 0.05)
+            readable, _, _ = select_mod.select([sys.stdin], [], [], 0.05)
             if not readable:
                 continue
 
@@ -131,7 +137,7 @@ def input_with_esc(prompt: str) -> str:
             buffer += ch
             print(ch, end='', flush=True)
     finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        termios_mod.tcsetattr(fd, termios_mod.TCSADRAIN, old_settings)
 
 # =========================================================
 # ====================== MANUAL ORDER =====================
@@ -874,11 +880,14 @@ def _esc_pressed() -> bool:
     except ImportError:
         return False
 
+    termios_mod = cast(Any, termios)
+    tty_mod = cast(Any, tty)
+
     fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
+    old_settings = termios_mod.tcgetattr(fd)
 
     try:
-        tty.setcbreak(fd)
+        tty_mod.setcbreak(fd)
         readable, _, _ = select.select([sys.stdin], [], [], 0)
 
         if not readable:
@@ -887,7 +896,7 @@ def _esc_pressed() -> bool:
         return sys.stdin.read(1) == "\x1b"
 
     finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        termios_mod.tcsetattr(fd, termios_mod.TCSADRAIN, old_settings)
 
 
 def _decimal_from_order_data(
