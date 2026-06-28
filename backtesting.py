@@ -745,6 +745,7 @@ def prompt_backtest() -> None:
 
         today = datetime.utcnow().date()
         start_default = (today - timedelta(days=29)).strftime("%Y%m%d")
+        start_limit = "20251014"
         end_default = today.strftime("%Y%m%d")
 
         def ask_decimal(label: str, default: str) -> Decimal:
@@ -785,9 +786,22 @@ def prompt_backtest() -> None:
 
                 print("Valor invalido. Introduce uno o varios numeros separados por comas.")
 
-        def ask_date(label: str, default: str) -> str:
-            raw = input_with_esc(f"{label} [{default}]: ").strip()
-            return raw or default
+        def ask_date(label: str, default: str, min_date: str | None = None) -> str:
+            while True:
+                raw = input_with_esc(f"{label} [{default}]: ").strip()
+                value = raw or default
+
+                try:
+                    datetime.strptime(value, "%Y%m%d")
+                except ValueError:
+                    print("Fecha inválida. Usa el formato YYYYMMDD.")
+                    continue
+
+                if min_date and value < min_date:
+                    print(f"La fecha no puede ser anterior a {min_date} (apertura del exchange).")
+                    continue
+
+                return value
 
         def _normalize_trailing_alias(value: str) -> str:
             normalized = value.strip().lower()
@@ -835,7 +849,7 @@ def prompt_backtest() -> None:
                     continue
                 return value
 
-        start_date = ask_date("Fecha inicio (YYYYMMDD)", start_default)
+        start_date = ask_date("Fecha inicio (YYYYMMDD)", start_default, min_date=start_limit,)
         suggested_initial_price = _default_initial_price_from_date(start_date, Decimal(default_price))
         end_date = ask_date("Fecha final (YYYYMMDD)", end_default)
 
