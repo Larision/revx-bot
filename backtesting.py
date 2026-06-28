@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Optional, Sequence, cast
 
 from api import _price_key, fmt_amount, get_historic_market_trades, get_candles
-from cli import _epoch_ms_to_iso, input_with_esc
+from cli import _epoch_ms_to_iso, input_with_esc, check_esc, _esc_pressed
 from config import SYMBOL, TICK_SIZE, WINDOW_MS
 from engine import GridEngine
 from logger import log_event
@@ -21,7 +21,7 @@ BACKTEST_OUTPUT_DIR = Path("backtesting")
 
 
 class BacktestCancelled(Exception):
-    """Cancelación controlada del backtest desde la CLI."""
+    """Backtest cancelado por el usuario."""
     pass
 
 @dataclass
@@ -1179,6 +1179,8 @@ def run_grid_backtest(
     previous_price = center
 
     for trade in trades:
+        check_esc()  # Permite cancelar el backtest con ESC.
+
         trade_price = _trade_price(trade)
         last_price = trade_price
 
