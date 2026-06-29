@@ -8,7 +8,7 @@ from urllib3.util.retry import Retry
 
 from config import BASE_URL
 from types_ import LogEntry
-from logger import log_event
+from logger import log_event, log_file
 from auth import API_KEY, sign_request
 
 
@@ -50,7 +50,7 @@ def _update_server_offset(response_body: Any) -> None:
     local_ts   = int(time.time() * 1000)
     new_offset = int(server_ts) - local_ts
     if abs(new_offset - _server_offset) >= OFFSET_UPDATE_THRESHOLD:
-        log_event(
+        log_file(
             f"[HTTP] Server offset actualizado: {_server_offset:+d}ms -> {new_offset:+d}ms",
             "info"
         )
