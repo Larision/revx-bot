@@ -1810,21 +1810,40 @@ def _fill_empty_levels(engine: "GridEngine") -> None:
 
 
 def _resize_to_default(engine: "GridEngine") -> None:
-    """Redimensiona las SELL de trailing_up fixed_quote al base_size predeterminado."""
+    """Redimensiona ordenes de trailing_up fixed_quote al base_size predeterminado."""
     preview = engine.preview_resize_trailing_up_fixed_quote_to_default()
 
     if not preview.get("enabled"):
         print(f"  [!] {preview.get('reason') or 'Opción no disponible.'}")
         return
 
-    real_orders = preview.get("real_orders", [])
-    state_only_orders = preview.get("state_only_orders", [])
-    required_btc = Decimal(str(preview.get("required_btc", "0")))
-    default_size = Decimal(str(preview.get("default_size", "0")))
+    real_orders = cast(list[dict[str, Any]], preview.get("real_orders", []) or [])
+    state_only_orders = cast(list[dict[str, Any]], preview.get("state_only_orders", []) or [])
+    required_btc = Decimal(str(preview.get("required_btc", "0") or "0"))
+    required_usdc = Decimal(str(preview.get("required_usdc", "0") or "0"))
+    default_size = Decimal(str(preview.get("default_size", "0") or "0"))
     anchor = preview.get("anchor")
 
+    # Compatibilidad con engines intermedios: si required_usdc no viene en
+    # preview, lo inferimos desde las BUY reales incluidas en la lista.
+    if required_usdc <= 0:
+        for row in real_orders:
+            if str(row.get("side", "")).lower() != "buy":
+                continue
+            try:
+                price = Decimal(str(row.get("price", row.get("price_key", "0"))))
+                delta = Decimal(str(row.get("delta", "0")))
+                if delta <= 0:
+                    current_size = Decimal(str(row.get("current_size", "0")))
+                    target_size = Decimal(str(row.get("target_size", default_size)))
+                    delta = target_size - current_size
+                if price > 0 and delta > 0:
+                    required_usdc += price * delta
+            except Exception:
+                continue
+
     if not real_orders and not state_only_orders:
-        print("  No hay SELLs fixed_quote por debajo del tamaño predeterminado.")
+        print("  No hay ordenes fixed_quote por debajo del tamaño predeterminado.")
         return
 
     print("\n" + "=" * 50)
@@ -1833,46 +1852,86 @@ def _resize_to_default(engine: "GridEngine") -> None:
     print(f"  Tamaño objetivo : {fmt_amount(default_size)} BTC")
     if anchor is not None:
         print(f"  Anchor fixed_q. : {_price_key(Decimal(str(anchor)))} USDC")
-    print(f"  Órdenes reales  : {len(real_orders)}")
+    print(f"  Ordenes reales  : {len(real_orders)}")
     print(f"  Virtual/latente : {len(state_only_orders)}")
     print(f"  BTC extra req.  : {fmt_amount(required_btc)}")
+    print(f"  USDC extra req. : {_fmt_usdc_value(required_usdc)}")
 
     if real_orders:
-        _, available_btc, balances_ok = _read_available_balances()
+        available_usdc, available_btc, balances_ok = _read_available_balances()
         if balances_ok:
             print(f"  BTC disponible  : {fmt_amount(available_btc)}")
+            print(f"  USDC disponible : {_fmt_usdc_value(available_usdc)}")
+
             if available_btc < required_btc:
-                print("  [!] BTC insuficiente para redimensionar todas las órdenes reales.")
+                print("  [!] BTC insuficiente para redimensionar todas las SELL reales.")
+                return
+
+            if available_usdc < required_usdc:
+                print("  [!] USDC insuficiente para redimensionar todas las BUY reales.")
                 return
         else:
             print("  [!] No se pudieron comprobar balances de forma fiable.")
             return
 
-    print("\n  Órdenes a redimensionar:")
-    print(f"  {'Tipo':<10} {'Precio':>12} {'Size actual':>14} {'Nuevo size':>14} {'Order ID'}")
-    print("  " + "-" * 76)
+    def _row_side(row: dict[str, Any]) -> str:
+        side = str(row.get("side", "?")).upper()
+        return side if side in {"BUY", "SELL"} else "?"
 
-    for row in real_orders[:25]:
+    def _row_price(row: dict[str, Any]) -> Decimal:
+        return Decimal(str(row.get("price", row.get("price_key", "0"))))
+
+    def _row_delta(row: dict[str, Any]) -> Decimal:
+        try:
+            delta = Decimal(str(row.get("delta", "0")))
+            if delta > 0:
+                return delta
+        except Exception:
+            pass
+
+        current_size = Decimal(str(row.get("current_size", "0")))
+        target_size = Decimal(str(row.get("target_size", default_size)))
+        return target_size - current_size
+
+    def _row_extra(row: dict[str, Any]) -> str:
+        side = _row_side(row)
+        delta = _row_delta(row)
+        if side == "BUY":
+            return f"{_fmt_usdc_value(_row_price(row) * delta)} USDC"
+        if side == "SELL":
+            return f"{fmt_amount(delta)} BTC"
+        return "-"
+
+    def _print_resize_row(label: str, row: dict[str, Any]) -> None:
         print(
-            f"  {'REAL':<10} {str(row['price_key']):>12} "
+            f"  {label:<10} {_row_side(row):<5} {str(row['price_key']):>12} "
             f"{fmt_amount(Decimal(str(row['current_size']))):>14} "
             f"{fmt_amount(Decimal(str(row['target_size']))):>14} "
+            f"{_row_extra(row):>18} "
             f"{str(row['order_id'])[:32]}"
         )
+
+    print("\n  Ordenes a redimensionar:")
+    print(
+        f"  {'Tipo':<10} {'Side':<5} {'Precio':>12} "
+        f"{'Size actual':>14} {'Nuevo size':>14} {'Extra':>18} {'Order ID'}"
+    )
+    print("  " + "-" * 102)
+
+    shown = 0
+    for row in real_orders[:25]:
+        _print_resize_row("REAL", row)
+        shown += 1
 
     for row in state_only_orders[:25]:
         order_id = str(row["order_id"])
         label = "VIRTUAL" if order_id == "virtual" else "LATENTE"
-        print(
-            f"  {label:<10} {str(row['price_key']):>12} "
-            f"{fmt_amount(Decimal(str(row['current_size']))):>14} "
-            f"{fmt_amount(Decimal(str(row['target_size']))):>14} "
-            f"{order_id[:32]}"
-        )
+        _print_resize_row(label, row)
+        shown += 1
 
     total_rows = len(real_orders) + len(state_only_orders)
-    if total_rows > 50:
-        print(f"  ... y {total_rows - 50} más")
+    if total_rows > shown:
+        print(f"  ... y {total_rows - shown} mas")
 
     try:
         confirm = input("\n  ¿Ejecutar resize to default? (s/n): " ).strip().lower()
@@ -1904,7 +1963,6 @@ def _resize_to_default(engine: "GridEngine") -> None:
         f"  ✓ Resize completado. Reales: {resized_real} | "
         f"Virtual/latente: {updated_state_only} | Saltadas: {skipped}"
     )
-
 
 def run_engine_menu(engine: "GridEngine", engine_thread: threading.Thread) -> None:
     """
