@@ -1902,10 +1902,11 @@ class GridEngine:
         List[Tuple[str, OrderInfo, Decimal, Decimal]],
         List[Tuple[str, OrderInfo, Decimal, Decimal]],
     ]:
-        """Detecta SELLs de trailing_up fixed_quote que pueden volver a base_size.
+        """Detecta ordenes trailing_up fixed_quote que pueden volver a base_size.
 
         Retorna dos listas con tuplas (price_key, snapshot_info, price, current_size):
-        - reales: requieren replace_order y BTC disponible para el incremento.
+        - reales: requieren replace_order y saldo disponible para el incremento.
+          SELL requiere BTC extra; BUY requiere USDC extra.
         - state_only: virtuales/latentes que solo existen en el estado local.
         """
         default_size = Decimal(str(self.base_size))
@@ -1925,7 +1926,8 @@ class GridEngine:
             key=lambda item: Decimal(str(item[0])),
             reverse=True,
         ):
-            if str(info.get("side")).lower() != "sell":
+            side = str(info.get("side")).lower()
+            if side not in {"sell", "buy"}:
                 continue
             if self._is_extended_down_order(info):
                 continue
@@ -1938,8 +1940,10 @@ class GridEngine:
                 except Exception:
                     continue
 
-            # En fixed_quote solo las SELL por encima del ancla quedan por debajo
-            # del base_size. Esto evita tocar SELLs normales del grid central.
+            # En fixed_quote, cualquier orden por encima del ancla puede quedar
+            # por debajo del base_size: tanto SELLs superiores como BUYs pareja
+            # creados durante el trailing up. Los niveles en/ancla o por debajo
+            # ya deben estar capados a base_size y no se tocan.
             if price <= anchor:
                 continue
 
@@ -1960,7 +1964,7 @@ class GridEngine:
         return real_candidates, state_only_candidates
 
     def preview_resize_trailing_up_fixed_quote_to_default(self) -> Dict[str, Any]:
-        """Previsualiza qué órdenes fixed_quote se redimensionarían a base_size."""
+        """Previsualiza que ordenes fixed_quote se redimensionarian a base_size."""
         with self._state_lock:
             mode = self._normalise_trailing_up_mode(self.trailing_up_mode)
             default_size = Decimal(str(self.base_size))
@@ -1975,25 +1979,42 @@ class GridEngine:
                     "real_orders": [],
                     "state_only_orders": [],
                     "required_btc": Decimal("0"),
+                    "required_usdc": Decimal("0"),
                 }
 
             real_candidates, state_only_candidates = self._fixed_quote_resize_candidates_locked()
             required_btc = sum(
-                (default_size - current_size for _, _, _, current_size in real_candidates),
+                (
+                    default_size - current_size
+                    for _, info, _, current_size in real_candidates
+                    if str(info.get("side")).lower() == "sell"
+                ),
+                Decimal("0"),
+            )
+            required_usdc = sum(
+                (
+                    (default_size - current_size) * price
+                    for _, info, price, current_size in real_candidates
+                    if str(info.get("side")).lower() == "buy"
+                ),
                 Decimal("0"),
             )
 
             def _items(candidates: List[Tuple[str, OrderInfo, Decimal, Decimal]]) -> List[Dict[str, Any]]:
                 rows: List[Dict[str, Any]] = []
                 for key, info, price, current_size in candidates:
+                    side = str(info.get("side")).lower()
+                    delta = default_size - current_size
                     rows.append({
                         "price_key": key,
                         "price": price,
-                        "side": str(info.get("side")),
+                        "side": side,
                         "order_id": str(info.get("order_id")),
                         "current_size": current_size,
                         "target_size": default_size,
-                        "delta": default_size - current_size,
+                        "delta": delta,
+                        "required_btc_delta": delta if side == "sell" else Decimal("0"),
+                        "required_usdc_delta": (delta * price) if side == "buy" else Decimal("0"),
                     })
                 return rows
 
@@ -2005,16 +2026,21 @@ class GridEngine:
                 "real_orders": _items(real_candidates),
                 "state_only_orders": _items(state_only_candidates),
                 "required_btc": required_btc,
+                "required_usdc": required_usdc,
             }
 
     def resize_trailing_up_fixed_quote_to_default(
         self,
     ) -> Tuple[bool, List[LogEntry], Optional[str], Dict[str, Any]]:
-        """Redimensiona las SELL de trailing_up fixed_quote al base_size del grid.
+        """Redimensiona las ordenes trailing_up fixed_quote al base_size del grid.
 
-        Las órdenes reales se actualizan con api.replace_order, porque el exchange
+        Las ordenes reales se actualizan con api.replace_order, porque el exchange
         cambia el venue_order_id al reemplazarlas. Las virtuales o latentes solo
-        se actualizan en el estado local, ya que no existen todavía en el exchange.
+        se actualizan en el estado local, ya que no existen todavia en el exchange.
+
+        Para el incremento de tamaño:
+        - SELL requiere BTC disponible.
+        - BUY requiere USDC disponible por el coste extra de la orden.
         """
         logs: List[LogEntry] = []
         summary: Dict[str, Any] = {
@@ -2024,6 +2050,8 @@ class GridEngine:
             "failed": [],
             "required_btc": Decimal("0"),
             "available_btc": Decimal("0"),
+            "required_usdc": Decimal("0"),
+            "available_usdc": Decimal("0"),
         }
 
         with self._state_lock:
@@ -2034,30 +2062,59 @@ class GridEngine:
             default_size = Decimal(str(self.base_size))
             real_candidates, state_only_candidates = self._fixed_quote_resize_candidates_locked()
             required_btc = sum(
-                (default_size - current_size for _, _, _, current_size in real_candidates),
+                (
+                    default_size - current_size
+                    for _, info, _, current_size in real_candidates
+                    if str(info.get("side")).lower() == "sell"
+                ),
+                Decimal("0"),
+            )
+            required_usdc = sum(
+                (
+                    (default_size - current_size) * price
+                    for _, info, price, current_size in real_candidates
+                    if str(info.get("side")).lower() == "buy"
+                ),
                 Decimal("0"),
             )
             summary["required_btc"] = required_btc
+            summary["required_usdc"] = required_usdc
 
         if not real_candidates and not state_only_candidates:
             return True, logs, None, summary
 
-        if required_btc > 0:
+        if required_btc > 0 or required_usdc > 0:
             balances_resp, balance_logs = get_all_balances()
             logs.extend(balance_logs)
-            _, available_btc = _parse_balances(balances_resp)
-            summary["available_btc"] = available_btc
+            usdc_balance, available_btc = _parse_balances(balances_resp)
+            available_usdc = usdc_balance - self.reserve_usdc
+            if available_usdc < 0:
+                available_usdc = Decimal("0")
 
+            summary["available_btc"] = available_btc
+            summary["available_usdc"] = available_usdc
+
+            insufficient_parts: List[str] = []
             if available_btc < required_btc:
+                insufficient_parts.append(
+                    f"BTC {fmt_amount(available_btc)} < {fmt_amount(required_btc)}"
+                )
+            if available_usdc < required_usdc:
+                insufficient_parts.append(
+                    f"USDC {_price_key(available_usdc)} < {_price_key(required_usdc)}"
+                )
+
+            if insufficient_parts:
                 msg = (
-                    "BTC disponible insuficiente para redimensionar SELLs fixed_quote: "
-                    f"{fmt_amount(available_btc)} < {fmt_amount(required_btc)}"
+                    "Saldo disponible insuficiente para redimensionar fixed_quote: "
+                    + " | ".join(insufficient_parts)
                 )
                 log_event(f"[ENGINE] {msg}", "warning")
                 return False, logs, msg, summary
 
         for key, info_snapshot, price, current_size in real_candidates:
             old_order_id = str(info_snapshot.get("order_id"))
+            side_label = str(info_snapshot.get("side")).upper()
             target_size = Decimal(str(self.base_size))
 
             with self._state_lock:
@@ -2090,7 +2147,7 @@ class GridEngine:
                         summary["resized_real"] += 1
 
                 log_event(
-                    f"[ENGINE] Resize fixed_quote: SELL {key} "
+                    f"[ENGINE] Resize fixed_quote: {side_label} {key} "
                     f"{fmt_amount(current_size)} -> {fmt_amount(target_size)} "
                     f"({old_order_id} -> {new_order_id})",
                     "info",
@@ -2105,7 +2162,7 @@ class GridEngine:
                     current["price"] = price
                     current["placed_at"] = info_snapshot.get("placed_at", time.time())
 
-            failure = f"SELL {key} ({old_order_id})"
+            failure = f"{side_label} {key} ({old_order_id})"
             cast(List[str], summary["failed"]).append(failure)
             log_event(
                 f"[ENGINE] Resize fixed_quote fallido en {failure}",
@@ -2115,6 +2172,7 @@ class GridEngine:
         for key, info_snapshot, price, current_size in state_only_candidates:
             target_size = Decimal(str(self.base_size))
             old_order_id = str(info_snapshot.get("order_id"))
+            side_label = str(info_snapshot.get("side")).upper()
             with self._state_lock:
                 current = self.active_orders.get(key)
                 if (
@@ -2131,7 +2189,7 @@ class GridEngine:
                 summary["updated_state_only"] += 1
 
             log_event(
-                f"[ENGINE] Resize fixed_quote local: SELL {key} "
+                f"[ENGINE] Resize fixed_quote local: {side_label} {key} "
                 f"{fmt_amount(current_size)} -> {fmt_amount(target_size)} ({old_order_id})",
                 "info",
             )
