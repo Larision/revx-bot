@@ -1651,6 +1651,57 @@ def _show_balances_live(engine: Optional["GridEngine"] = None) -> None:
     print("\n" + "\n".join(f"  {line}" if line else "" for line in summary.splitlines()) + "\n")
 
 
+def _calculate_auto_grid_config(
+    current_price: Decimal,
+    total_usdc: Decimal,
+    reserve_percent: Decimal,
+    total_lines: int,
+    range_usdc: Decimal,
+) -> Tuple[int, int, Decimal, Decimal, Decimal, Decimal]:
+    """Calcula niveles, size, step percent, reserva y saldo usable para un preset automatico."""
+    if current_price <= 0:
+        raise ValueError("el precio actual debe ser mayor que cero")
+    if total_usdc <= 0:
+        raise ValueError("el saldo USDC debe ser mayor que cero")
+    if total_lines <= 0 or total_lines % 2 != 0:
+        raise ValueError("las lineas del grid deben ser un numero par mayor que cero")
+    if range_usdc <= 0:
+        raise ValueError("el rango debe ser mayor que cero")
+
+    levels_below = total_lines // 2
+    levels_above = total_lines // 2
+    reserve_usdc = (total_usdc * reserve_percent).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+    bot_usdc_budget = total_usdc - reserve_usdc
+    if bot_usdc_budget <= 0:
+        raise ValueError("el saldo usable queda a cero tras aplicar la reserva")
+
+    step_value = (range_usdc / Decimal(levels_below)).quantize(TICK_SIZE, rounding=ROUND_DOWN)
+    if step_value <= 0:
+        raise ValueError("el step calculado queda a cero")
+
+    buy_prices = [
+        (current_price - (Decimal(i) * step_value)).quantize(TICK_SIZE, rounding=ROUND_DOWN)
+        for i in range(1, levels_below + 1)
+    ]
+    buy_prices = [price for price in buy_prices if price > 0]
+    if len(buy_prices) != levels_below:
+        raise ValueError("el rango elegido genera niveles BUY a precio cero o negativo")
+
+    per_size_value = sum(buy_prices, Decimal("0")) + (current_price * Decimal(levels_above))
+    if per_size_value <= 0:
+        raise ValueError("no se pudo calcular el size automatico")
+
+    base_size = (bot_usdc_budget / per_size_value).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+    if base_size <= 0:
+        raise ValueError("el size calculado queda a cero")
+
+    step_percent = (step_value / current_price).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+    if step_percent <= 0:
+        raise ValueError("el step percent calculado queda a cero")
+
+    return levels_below, levels_above, base_size, step_percent, reserve_usdc, bot_usdc_budget
+
+
 def _add_manual_order(engine: "GridEngine") -> None:
     """
     Función interactiva para colocar una orden manual y registrarla en las órdenes activas del motor.
@@ -2057,7 +2108,7 @@ def show_menu(engine_running: bool = False) -> str:
     print("8. Detener engine")
     print("9. Backtesting")
     print("10. Fiscal FIFO")
-    print("c. Configuración manual")
+    print("c. Configuración global")
     print("0. Salir")
     print("=" * 40)
     return input("Selecciona una opción: ").strip().lower()
@@ -2351,116 +2402,205 @@ def run_cli() -> None:
             menu_tax_fifo(engine if engine_running else None)
 
         # --------------------------------------------------
-        # c.Configuración manual
+        # c.Configuración global
         # --------------------------------------------------
         elif opcion.lower() == "c":
-            print("\n=== Configuración manual ===")
+            print("\n=== Configuración global ===")
 
             try:
-                new_levels_below = input_with_esc(f"Niveles por debajo del precio inicial [{grid_levels_below}]: ")
-                if new_levels_below.strip():
-                    try:
-                        grid_levels_below = int(new_levels_below)
-                    except ValueError:
-                        log_event("[ERROR] Valor de niveles abajo inválido, conservando el anterior.", "error")
+                config_mode = input_with_esc("¿Deseas usar una configuración automática o manual? (a/m): ").strip().lower()
 
-                new_levels_above = input_with_esc(f"Niveles por encima del precio inicial [{grid_levels_above}]: ")
-                if new_levels_above.strip():
-                    try:
-                        grid_levels_above = int(new_levels_above)
-                    except ValueError:
-                        log_event("[ERROR] Valor de niveles arriba inválido, conservando el anterior.", "error")
+                if config_mode in {"a", "auto", "automatica", "automática"}:
+                    preset = input_with_esc("Tipo de configuración automática (agresiva/relajada)(a/r): ").strip().lower()
+                    if preset in {"a", "agresiva", "aggressive"}:
+                        reserve_percent = Decimal("0.05")
+                        total_lines = 20
+                        range_usdc = Decimal("1500")
+                        preset_name = "agresiva"
+                    elif preset in {"r", "relajada", "relaxed"}:
+                        reserve_percent = Decimal("0.08")
+                        total_lines = 30
+                        range_usdc = Decimal("2500")
+                        preset_name = "relajada"
+                    else:
+                        log_event("[ERROR] Configuración automática inválida. Usa agresiva o relajada.", "error")
+                        continue
 
-                new_bs = input_with_esc(f"Base size por defecto [{fmt_amount(base_size_default)}]: ")
-                if new_bs.strip():
-                    try:
-                        base_size_default = Decimal(new_bs)
-                    except Exception:
-                        log_event("[ERROR] Valor de base size inválido, conservando el anterior.", "error")
-
-                new_step_percent = input_with_esc(f"Step percent por defecto [{fmt_amount(step_percent_default)}]: ")
-                if new_step_percent.strip():
-                    try:
-                        step_percent_default = Decimal(new_step_percent)
-                    except Exception:
-                        log_event("[ERROR] Valor de step percent inválido, conservando el anterior.", "error")
-
-                new_trailing_up = input_with_esc(f"Trailing up (off/on/extended/fixed_quote) [{trailing_up_default}]: ").strip().lower()
-                if new_trailing_up and new_trailing_up in {"quote", "quote_fijo", "fixed-quote", "fixedquote"}:
-                    new_trailing_up = "fixed_quote"
-                if new_trailing_up and new_trailing_up in ("off", "on", "extended", "fixed_quote"):
-                    trailing_up_default = new_trailing_up
-                elif new_trailing_up:
-                    log_event("[ERROR] Valor de trailing up inválido (debe ser off, on, extended o fixed_quote), conservando el anterior.", "error")
-
-                new_trailing_down = input_with_esc(f"Trailing down (off/on/extended) [{trailing_down_default}]: ").strip().lower()
-                if new_trailing_down and new_trailing_down in ("off", "on", "extended"):
-                    trailing_down_default = new_trailing_down
-                elif new_trailing_down:
-                    log_event("[ERROR] Valor de trailing down inválido (debe ser off, on o extended), conservando el anterior.", "error")
-
-                available_usdc, _, balances_ok = _read_available_balances()
-                if balances_ok:
-                    print(f"USDC disponible actual: {_fmt_usdc_value(available_usdc)}")
-                else:
-                    print("USDC disponible actual: no disponible")
-
-                new_usdc_reserve = input_with_esc(
-                    f"Cuanto USDC quieres reservar como colchón de seguridad: [{_fmt_usdc_value(reserve_usdc_default)}]: "
-                ).strip().lower()
-
-                if new_usdc_reserve:
-                    try:
-                        reserve_usdc_default = Decimal(new_usdc_reserve)
-                        if reserve_usdc_default < 0:
-                            raise ValueError("el colchón de seguridad no puede ser negativo")
-                        if balances_ok and reserve_usdc_default > available_usdc:
-                            raise ValueError(
-                                f"el colchón de seguridad asignado ({_fmt_usdc_value(reserve_usdc_default)}) "
-                                f"supera el USDC disponible ({_fmt_usdc_value(available_usdc)})"
+                    total_usdc_raw = input_with_esc("¿Cuánto USDC quieres utilizar en total?: ").strip().lower()
+                    available_usdc = Decimal("0")
+                    balances_ok = False
+                    if total_usdc_raw in {"max", "todo", "all"}:
+                        available_usdc, _, balances_ok = _read_available_balances()
+                        if not balances_ok:
+                            log_event("[ERROR] No se pudo leer USDC disponible para usar el máximo.", "error")
+                            continue
+                        total_usdc = available_usdc
+                    else:
+                        try:
+                            total_usdc = Decimal(total_usdc_raw)
+                        except Exception:
+                            log_event("[ERROR] Valor de USDC inválido.", "error")
+                            continue
+                        available_usdc, _, balances_ok = _read_available_balances()
+                        if balances_ok and total_usdc > available_usdc:
+                            log_event(
+                                f"[ERROR] El USDC indicado ({_fmt_usdc_value(total_usdc)}) "
+                                f"supera el disponible ({_fmt_usdc_value(available_usdc)}).",
+                                "error",
                             )
-                        log_event(f"Colchón de seguridad actualizado a {_fmt_usdc_value(reserve_usdc_default)} USDC", "info")
-                    except Exception as exc:
-                        log_event(f"[ERROR] Valor de colchón de seguridad inválido: {exc}. Conservando el anterior ({_fmt_usdc_value(reserve_usdc_default)}).", "error")
-                        reserve_usdc_default = reserve_usdc_default
+                            continue
 
-                budget_default_text = (
-                    _fmt_usdc_value(bot_usdc_budget_default)
-                    if bot_usdc_budget_default > 0
-                    else "0"
-                )
-                new_budget = input_with_esc(
-                    f"Saldo USDC total a emplear por el bot [{budget_default_text}] "
-                    "(0 = sin límite explícito): "
-                ).strip().lower()
+                    current_price, price_logs = get_current_price()
+                    for l in price_logs:
+                        log_event(f"[LOG] {l['msg']}", l.get("level", "info"))
+                    if current_price is None:
+                        log_event("[ERROR] No se pudo leer el precio actual para calcular la configuración automática.", "error")
+                        continue
 
-                if new_budget:
                     try:
-                        if new_budget in {"max", "todo", "all"}:
-                            if not balances_ok:
-                                raise ValueError("no se pudo leer USDC disponible")
-                            parsed_budget = max(Decimal("0"), available_usdc - reserve_usdc_default)
-                        else:
-                            parsed_budget = Decimal(new_budget)
-
-                        if parsed_budget < 0:
-                            raise ValueError("el saldo no puede ser negativo")
-                        
-                        if balances_ok:
-                            max_budget = max(Decimal("0"), available_usdc - reserve_usdc_default)
-                            if parsed_budget > max_budget:
-                                raise ValueError(
-                                    f"el saldo asignado ({_fmt_usdc_value(parsed_budget)}) "
-                                    f"supera el USDC disponible ({_fmt_usdc_value(max_budget)})"
-                                )
-                        bot_usdc_budget_default = parsed_budget
-
+                        (
+                            grid_levels_below,
+                            grid_levels_above,
+                            base_size_default,
+                            step_percent_default,
+                            reserve_usdc_default,
+                            bot_usdc_budget_default,
+                        ) = _calculate_auto_grid_config(
+                            current_price=current_price,
+                            total_usdc=total_usdc,
+                            reserve_percent=reserve_percent,
+                            total_lines=total_lines,
+                            range_usdc=range_usdc,
+                        )
                     except Exception as exc:
-                        log_event(f"[ERROR] Valor de saldo asignado inválido: {exc}. Conservando el anterior.", "error")
-        
-                elif balances_ok:
-                    bot_usdc_budget_default = max(Decimal("0"), available_usdc - reserve_usdc_default)
-                    log_event(f"Saldo asignado actualizado a {_fmt_usdc_value(bot_usdc_budget_default)} USDC (ajustado automáticamente según el colchón de seguridad)", "info")
+                        log_event(f"[ERROR] No se pudo calcular la configuración automática: {exc}", "error")
+                        continue
+
+                    trailing_up_default = "fixed_quote"
+                    trailing_down_default = "off"
+
+                    print("\nResumen automático:")
+                    print(f"  Preset          : {preset_name}")
+                    print(f"  Precio actual   : {_price_key(current_price)} USDC")
+                    print(f"  Niveles abajo   : {grid_levels_below}")
+                    print(f"  Niveles arriba  : {grid_levels_above}")
+                    print(f"  Total líneas    : {grid_levels_below + grid_levels_above}")
+                    print(f"  Base size       : {fmt_amount(base_size_default)} BTC")
+                    print(f"  Step percent    : {fmt_amount(step_percent_default)}")
+                    print(f"  Reserva USDC    : {_fmt_usdc_value(reserve_usdc_default)} USDC")
+                    print(f"  Saldo bot       : {_fmt_usdc_value(bot_usdc_budget_default)} USDC")
+                    print("  Trailing up     : fixed_quote")
+                    print("  Trailing down   : off")
+
+                elif config_mode in {"m", "manual"}:
+                    new_levels_below = input_with_esc(f"Niveles por debajo del precio inicial [{grid_levels_below}]: ")
+                    if new_levels_below.strip():
+                        try:
+                            grid_levels_below = int(new_levels_below)
+                        except ValueError:
+                            log_event("[ERROR] Valor de niveles abajo inválido, conservando el anterior.", "error")
+
+                    new_levels_above = input_with_esc(f"Niveles por encima del precio inicial [{grid_levels_above}]: ")
+                    if new_levels_above.strip():
+                        try:
+                            grid_levels_above = int(new_levels_above)
+                        except ValueError:
+                            log_event("[ERROR] Valor de niveles arriba inválido, conservando el anterior.", "error")
+
+                    new_bs = input_with_esc(f"Base size por defecto [{fmt_amount(base_size_default)}]: ")
+                    if new_bs.strip():
+                        try:
+                            base_size_default = Decimal(new_bs)
+                        except Exception:
+                            log_event("[ERROR] Valor de base size inválido, conservando el anterior.", "error")
+
+                    new_step_percent = input_with_esc(f"Step percent por defecto [{fmt_amount(step_percent_default)}]: ")
+                    if new_step_percent.strip():
+                        try:
+                            step_percent_default = Decimal(new_step_percent)
+                        except Exception:
+                            log_event("[ERROR] Valor de step percent inválido, conservando el anterior.", "error")
+
+                    new_trailing_up = input_with_esc(f"Trailing up (off/on/extended/fixed_quote) [{trailing_up_default}]: ").strip().lower()
+                    if new_trailing_up and new_trailing_up in {"quote", "quote_fijo", "fixed-quote", "fixedquote"}:
+                        new_trailing_up = "fixed_quote"
+                    if new_trailing_up and new_trailing_up in ("off", "on", "extended", "fixed_quote"):
+                        trailing_up_default = new_trailing_up
+                    elif new_trailing_up:
+                        log_event("[ERROR] Valor de trailing up inválido (debe ser off, on, extended o fixed_quote), conservando el anterior.", "error")
+
+                    new_trailing_down = input_with_esc(f"Trailing down (off/on/extended) [{trailing_down_default}]: ").strip().lower()
+                    if new_trailing_down and new_trailing_down in ("off", "on", "extended"):
+                        trailing_down_default = new_trailing_down
+                    elif new_trailing_down:
+                        log_event("[ERROR] Valor de trailing down inválido (debe ser off, on o extended), conservando el anterior.", "error")
+
+                    available_usdc, _, balances_ok = _read_available_balances()
+                    if balances_ok:
+                        print(f"USDC disponible actual: {_fmt_usdc_value(available_usdc)}")
+                    else:
+                        print("USDC disponible actual: no disponible")
+
+                    new_usdc_reserve = input_with_esc(
+                        f"Cuanto USDC quieres reservar como colchón de seguridad: [{_fmt_usdc_value(reserve_usdc_default)}]: "
+                    ).strip().lower()
+
+                    if new_usdc_reserve:
+                        try:
+                            reserve_usdc_default = Decimal(new_usdc_reserve)
+                            if reserve_usdc_default < 0:
+                                raise ValueError("el colchón de seguridad no puede ser negativo")
+                            if balances_ok and reserve_usdc_default > available_usdc:
+                                raise ValueError(
+                                    f"el colchón de seguridad asignado ({_fmt_usdc_value(reserve_usdc_default)}) "
+                                    f"supera el USDC disponible ({_fmt_usdc_value(available_usdc)})"
+                                )
+                            log_event(f"Colchón de seguridad actualizado a {_fmt_usdc_value(reserve_usdc_default)} USDC", "info")
+                        except Exception as exc:
+                            log_event(f"[ERROR] Valor de colchón de seguridad inválido: {exc}. Conservando el anterior ({_fmt_usdc_value(reserve_usdc_default)}).", "error")
+                            reserve_usdc_default = reserve_usdc_default
+
+                    budget_default_text = (
+                        _fmt_usdc_value(bot_usdc_budget_default)
+                        if bot_usdc_budget_default > 0
+                        else "0"
+                    )
+                    new_budget = input_with_esc(
+                        f"Saldo USDC total a emplear por el bot [{budget_default_text}] "
+                        "(0 = sin límite explícito): "
+                    ).strip().lower()
+
+                    if new_budget:
+                        try:
+                            if new_budget in {"max", "todo", "all"}:
+                                if not balances_ok:
+                                    raise ValueError("no se pudo leer USDC disponible")
+                                parsed_budget = max(Decimal("0"), available_usdc - reserve_usdc_default)
+                            else:
+                                parsed_budget = Decimal(new_budget)
+
+                            if parsed_budget < 0:
+                                raise ValueError("el saldo no puede ser negativo")
+
+                            if balances_ok:
+                                max_budget = max(Decimal("0"), available_usdc - reserve_usdc_default)
+                                if parsed_budget > max_budget:
+                                    raise ValueError(
+                                        f"el saldo asignado ({_fmt_usdc_value(parsed_budget)}) "
+                                        f"supera el USDC disponible ({_fmt_usdc_value(max_budget)})"
+                                    )
+                            bot_usdc_budget_default = parsed_budget
+
+                        except Exception as exc:
+                            log_event(f"[ERROR] Valor de saldo asignado inválido: {exc}. Conservando el anterior.", "error")
+
+                    elif balances_ok:
+                        bot_usdc_budget_default = max(Decimal("0"), available_usdc - reserve_usdc_default)
+                        log_event(f"Saldo asignado actualizado a {_fmt_usdc_value(bot_usdc_budget_default)} USDC (ajustado automáticamente según el colchón de seguridad)", "info")
+
+                else:
+                    log_event("[ERROR] Opción inválida. Usa automática o manual.", "error")
+                    continue
 
                 # Guardar la configuración
                 save_grid_config(
