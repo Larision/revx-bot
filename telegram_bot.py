@@ -9,6 +9,9 @@ Comandos disponibles:
   /config    — muestra la configuración guardada del grid
   /set_config — cambia un valor de configuración guardada
   /trailings — muestra o configura trailing up/down
+  /price     — precio actual aunque el engine no este activo
+  /fill_empty — repuebla niveles vacios del grid activo
+  /resize_to_default — redimensiona fixed_quote a base_size
   /analyze   — resumen de fills emparejados y beneficio estimado
   /taxstatus — resumen FIFO fiscal
   /taxlots   — lotes FIFO abiertos
@@ -18,6 +21,7 @@ Comandos disponibles:
   /taxreport — exporta CSV/JSON fiscales
   /start_engine  — previsualiza y arranca el engine con confirmación
   /stop      — detiene el engine (requiere confirmación)
+  /cancel_all — cancela todas las ordenes si el engine esta parado
   /add_order — añade una orden manual (guiado por pasos)
   /cancel    — cancela una orden por precio (requiere confirmación)
   /confirm   — confirma una acción pendiente
@@ -52,7 +56,14 @@ from telegram.ext import (
     filters,
 )
 
-from api import _parse_balances, _price_key, fmt_amount, get_all_balances, get_current_price
+from api import (
+    _parse_balances,
+    _price_key,
+    cancel_all_orders,
+    fmt_amount,
+    get_all_balances,
+    get_current_price,
+)
 from cli import format_balances_live
 from config import (
     DEFAULT_BASE_SIZE,
@@ -669,6 +680,7 @@ def _build_help_text() -> str:
         "🤖 *GRID BOT — AYUDA*",
         "",
         "*Estado y monitorización*",
+        "`/price` - precio actual aunque el engine no este corriendo",
         "`/status` — estado del engine, precio, órdenes, fills y trailings",
         "`/grid` — niveles del grid y órdenes registradas",
         "`/balance` — saldos disponibles y fondos comprometidos en el grid",
@@ -686,8 +698,12 @@ def _build_help_text() -> str:
         "`/start_engine recover` — recupera estado previo si existe",
         "`/start_engine fresh` — ignora estado previo y arranca desde cero",
         "`/stop` — detiene el engine; conserva órdenes del exchange",
+        "`/stop cancel_orders` - detiene el engine y cancela todas las ordenes",
+        "`/cancel_all` - cancela todas las ordenes si el engine esta parado",
         "`/add_order` — añade una orden manual guiada por pasos",
         "`/cancel` — cancela una orden real por precio con confirmación",
+        "`/fill_empty` - repuebla niveles vacios del grid activo",
+        "`/resize_to_default` - redimensiona fixed_quote a base_size",
         "`/confirm` — confirma una acción pendiente",
         "`/abort` — cancela una acción pendiente",
         "",
@@ -714,6 +730,30 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await message.reply_text(_build_help_text(), parse_mode="Markdown")
+
+
+async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Muestra el precio actual aunque el engine no este corriendo."""
+    del context
+    if not _authorized(update):
+        return
+
+    message = _get_message(update)
+    if message is None:
+        return
+
+    current_price, logs = get_current_price()
+    for log_item in logs:
+        log_event(f"[TELEGRAM] {log_item['msg']}", log_item.get("level", "info"))
+
+    if current_price is None:
+        await message.reply_text(f"No se pudo leer precio actual de {SYMBOL}.")
+        return
+
+    await message.reply_text(
+        f"*{SYMBOL}*\nPrecio actual: `{_price_key(current_price)} USDC`",
+        parse_mode="Markdown",
+    )
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1081,7 +1121,45 @@ async def cmd_start_engine(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         },
     )
 
-async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def _format_resize_preview(preview: dict[str, Any]) -> str:
+    """Construye un resumen corto del resize fixed_quote pendiente."""
+    real_orders = cast(list[dict[str, Any]], preview.get("real_orders", []) or [])
+    state_only_orders = cast(list[dict[str, Any]], preview.get("state_only_orders", []) or [])
+    required_btc = Decimal(str(preview.get("required_btc", "0") or "0"))
+    required_usdc = Decimal(str(preview.get("required_usdc", "0") or "0"))
+    default_size = Decimal(str(preview.get("default_size", "0") or "0"))
+    anchor = preview.get("anchor")
+
+    lines = [
+        "*RESIZE TO DEFAULT*",
+        "```",
+        f"Target size : {fmt_amount(default_size)} BTC",
+        f"Reales      : {len(real_orders)}",
+        f"Virtuales   : {len(state_only_orders)}",
+        f"BTC extra   : {fmt_amount(required_btc)}",
+        f"USDC extra  : {_price_key(required_usdc)}",
+    ]
+    if anchor is not None:
+        lines.append(f"Anchor      : {_price_key(Decimal(str(anchor)))}")
+
+    rows = real_orders + state_only_orders
+    if rows:
+        lines.extend(["", "Ordenes:"])
+        for row in rows[:12]:
+            order_id = str(row.get("order_id", ""))
+            label = "REAL" if order_id not in {"virtual", "pending_post_only"} else "STATE"
+            side = str(row.get("side", "?")).upper()
+            price_key = str(row.get("price_key", row.get("price", "?")))
+            current_size = fmt_amount(Decimal(str(row.get("current_size", "0"))))
+            lines.append(f"{label:<5} {side:<4} {price_key:>12} {current_size}")
+        if len(rows) > 12:
+            lines.append(f"... y {len(rows) - 12} mas")
+
+    lines.extend(["```", "Responde /confirm para ejecutar o /abort para cancelar."])
+    return "\n".join(lines)
+
+
+async def cmd_fill_empty(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     del context
     if not _authorized(update):
         return
@@ -1091,16 +1169,120 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if not _engine_running():
-        await message.reply_text("⚪ El engine no está corriendo.")
+        await message.reply_text("El engine no esta corriendo.")
         return
 
-    _state.pending_confirm = ("stop", {})
+    eng = _get_engine()
+    if eng is None:
+        await message.reply_text("Engine no disponible.")
+        return
+
+    current_price, logs = get_current_price()
+    for log_item in logs:
+        log_event(f"[TELEGRAM] {log_item['msg']}", log_item.get("level", "info"))
+
+    if current_price is None:
+        current_price = cast(Optional[Decimal], eng.get_runtime_snapshot().get("current_price"))
+
+    if current_price is None:
+        await message.reply_text("No se pudo obtener precio actual para fill_empty.")
+        return
+
+    _state.pending_confirm = ("fill_empty", {"current_price": current_price})
     await message.reply_text(
-        "⚠️ ¿Detener el engine?\n"
-        "Responde /confirm para confirmar o /abort para cancelar.\n\n"
-        "Las órdenes se conservarán en el exchange."
+        "*FILL EMPTY LEVELS*\n"
+        f"Precio usado: `{_price_key(current_price)} USDC`\n\n"
+        "Responde /confirm para ejecutar o /abort para cancelar.",
+        parse_mode="Markdown",
     )
 
+
+async def cmd_resize_to_default(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    del context
+    if not _authorized(update):
+        return
+
+    message = _get_message(update)
+    if message is None:
+        return
+
+    if not _engine_running():
+        await message.reply_text("El engine no esta corriendo.")
+        return
+
+    eng = _get_engine()
+    if eng is None:
+        await message.reply_text("Engine no disponible.")
+        return
+
+    preview = eng.preview_resize_trailing_up_fixed_quote_to_default()
+    if not preview.get("enabled"):
+        await message.reply_text(str(preview.get("reason") or "Opcion no disponible."))
+        return
+
+    real_orders = preview.get("real_orders", []) or []
+    state_only_orders = preview.get("state_only_orders", []) or []
+    if not real_orders and not state_only_orders:
+        await message.reply_text("No hay ordenes fixed_quote por debajo del tamano predeterminado.")
+        return
+
+    _state.pending_confirm = ("resize_to_default", {})
+    await message.reply_text(_format_resize_preview(preview), parse_mode="Markdown")
+
+
+async def cmd_cancel_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    del context
+    if not _authorized(update):
+        return
+
+    message = _get_message(update)
+    if message is None:
+        return
+
+    if _engine_running():
+        await message.reply_text(
+            "El engine esta corriendo. Usa `/stop cancel_orders` para detener y cancelar todo.",
+            parse_mode="Markdown",
+        )
+        return
+
+    _state.pending_confirm = ("cancel_all", {})
+    await message.reply_text(
+        "ATENCION: esto cancelara TODAS las ordenes abiertas.\n"
+        "Responde /confirm para ejecutar o /abort para cancelar."
+    )
+
+
+async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        return
+
+    message = _get_message(update)
+    if message is None:
+        return
+
+    if not _engine_running():
+        await message.reply_text("El engine no esta corriendo.")
+        return
+
+    args = [arg.strip().lower() for arg in (context.args or [])]
+    cancel_orders = bool(args and args[0] in {"cancel_orders", "cancel", "cancelar", "all", "todo"})
+    if args and not cancel_orders:
+        await message.reply_text(
+            "Uso:\n"
+            "`/stop`\n"
+            "`/stop cancel_orders`",
+            parse_mode="Markdown",
+        )
+        return
+
+    _state.pending_confirm = ("stop", {"cancel_orders": cancel_orders})
+    order_text = "Se cancelaran todas las ordenes." if cancel_orders else "Las ordenes se conservaran en el exchange."
+    await message.reply_text(
+        "Detener el engine?\n"
+        "Responde /confirm para confirmar o /abort para cancelar.\n\n"
+        f"{order_text}"
+    )
 
 async def cmd_add_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     del context
@@ -1222,18 +1404,86 @@ async def cmd_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         engine = _get_engine()
         thread = _get_engine_thread()
         if engine is None or thread is None:
-            await message.reply_text("⚪ Engine no disponible.")
+            await message.reply_text("Engine no disponible.")
             return
 
-        await message.reply_text("🛑 Deteniendo engine...")
+        cancel_orders = bool(kwargs.get("cancel_orders", False))
+        await message.reply_text("Deteniendo engine...")
         engine.stop()
         thread.join(timeout=10)
         _state.engine = None
         _state.engine_thread = None
+
+        if cancel_orders:
+            response, logs = cancel_all_orders()
+            for log_item in logs:
+                log_event(f"[TELEGRAM] {log_item['msg']}", log_item.get("level", "info"))
+            if isinstance(response, dict) and response.get("error"):
+                await message.reply_text("Engine detenido, pero no se pudieron cancelar todas las ordenes.")
+                return
+            engine.clear_state()
+            log_event("[TELEGRAM] Engine detenido y ordenes canceladas via Telegram.", "info")
+            await message.reply_text("Engine detenido. Todas las ordenes canceladas.")
+            return
+
         log_event("[TELEGRAM] Engine detenido via Telegram.", "info")
-        await message.reply_text("✅ Engine detenido. Órdenes conservadas.")
+        await message.reply_text("Engine detenido. Ordenes conservadas.")
         return
 
+    if action == "fill_empty":
+        eng = _get_engine()
+        if eng is None or not _engine_running():
+            await message.reply_text("Engine no disponible.")
+            return
+
+        current_price = Decimal(str(kwargs["current_price"]))
+        eng.fill_empty_levels(current_price)
+        eng.save_state()
+        log_event(f"[TELEGRAM] Fill empty levels ejecutado en {_price_key(current_price)}.", "info")
+        await message.reply_text(
+            f"Fill empty levels ejecutado con precio `{_price_key(current_price)}`.",
+            parse_mode="Markdown",
+        )
+        return
+
+    if action == "resize_to_default":
+        eng = _get_engine()
+        if eng is None or not _engine_running():
+            await message.reply_text("Engine no disponible.")
+            return
+
+        ok, logs, error_msg, summary = eng.resize_trailing_up_fixed_quote_to_default()
+        for log_item in logs:
+            log_event(f"[TELEGRAM] {log_item['msg']}", log_item.get("level", "info"))
+
+        if not ok:
+            await message.reply_text(error_msg or "No se pudo completar el resize.")
+            return
+
+        await message.reply_text(
+            "Resize completado.\n"
+            f"Reales: {summary.get('resized_real', 0)} | "
+            f"Virtual/latente: {summary.get('updated_state_only', 0)} | "
+            f"Saltadas: {summary.get('skipped', 0)}"
+        )
+        return
+
+    if action == "cancel_all":
+        if _engine_running():
+            await message.reply_text("El engine esta corriendo. Usa /stop cancel_orders.")
+            return
+
+        response, logs = cancel_all_orders()
+        for log_item in logs:
+            log_event(f"[TELEGRAM] {log_item['msg']}", log_item.get("level", "info"))
+
+        if isinstance(response, dict) and response.get("error"):
+            await message.reply_text("No se pudieron cancelar todas las ordenes.")
+            return
+
+        log_event("[TELEGRAM] Todas las ordenes canceladas via Telegram.", "info")
+        await message.reply_text("Todas las ordenes canceladas.")
+        return
     if action == "cancel_order":
         key = str(kwargs["key"])
         order_id = str(kwargs["order_id"])
@@ -1692,6 +1942,7 @@ def start_telegram_bot() -> None:
         _app = app
 
         app.add_handler(CommandHandler("help", cmd_help))
+        app.add_handler(CommandHandler("price", cmd_price))
         app.add_handler(CommandHandler("status", cmd_status))
         app.add_handler(CommandHandler("grid", cmd_grid))
         app.add_handler(CommandHandler("balance", cmd_balance))
@@ -1700,8 +1951,11 @@ def start_telegram_bot() -> None:
         app.add_handler(CommandHandler("trailings", cmd_trailings))
         app.add_handler(CommandHandler("start_engine", cmd_start_engine))
         app.add_handler(CommandHandler("stop", cmd_stop))
+        app.add_handler(CommandHandler("cancel_all", cmd_cancel_all))
         app.add_handler(CommandHandler("add_order", cmd_add_order))
         app.add_handler(CommandHandler("cancel", cmd_cancel))
+        app.add_handler(CommandHandler("fill_empty", cmd_fill_empty))
+        app.add_handler(CommandHandler("resize_to_default", cmd_resize_to_default))
         app.add_handler(CommandHandler("confirm", cmd_confirm))
         app.add_handler(CommandHandler("abort", cmd_abort))
         app.add_handler(CommandHandler("analyze", cmd_analyze))
