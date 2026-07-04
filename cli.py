@@ -783,7 +783,7 @@ def choose_initial_grid_price() -> Optional[Decimal]:
     try:
         ticker_resp, _ = get_ticker()
     except Exception as exc:
-        log_event(f"[ERROR] No se pudo consultar get_ticker_price(): {exc}", "error")
+        log_event(f"No se pudo consultar get_ticker_price(): {exc}", "error")
         ticker_resp = None
 
     bid: Optional[Decimal] = None
@@ -810,7 +810,7 @@ def choose_initial_grid_price() -> Optional[Decimal]:
         print("  [WARN] No se pudo leer bid/ask/mid. Usando precio actual como fallback.")
         default_price, _ = get_current_price()
         if default_price is None:
-            print("  [ERROR] No se pudo obtener ningún precio inicial.")
+            print("  No se pudo obtener ningún precio inicial.")
             return None
         print(f"  Precio actual: {_price_key(default_price)} USDC (predeterminado)")
 
@@ -1198,7 +1198,7 @@ def show_grid_preview(
 
     initial_price = choose_initial_grid_price()
     if initial_price is None:
-        _lp("  [ERROR] No se pudo determinar el precio inicial.", "error")
+        _lp("  No se pudo determinar el precio inicial.", "error")
         _lp("=" * 50)
         return False, None
 
@@ -2324,7 +2324,7 @@ def run_cli() -> None:
             try:
                 engine.initialize(recover_state=recover_state)
             except Exception as exc:
-                log_event(f"[ERROR] No se pudo inicializar el motor: {exc}", "error")
+                log_event(f"No se pudo inicializar el motor: {exc}", "error")
                 continue
 
             engine_thread = threading.Thread(
@@ -2423,7 +2423,7 @@ def run_cli() -> None:
                         range_usdc = Decimal("2500")
                         preset_name = "relajada"
                     else:
-                        log_event("[ERROR] Configuración automática inválida. Usa agresiva o relajada.", "error")
+                        log_event("Configuración automática inválida. Usa agresiva o relajada.", "error")
                         continue
 
                     total_usdc_raw = input_with_esc("¿Cuánto USDC quieres utilizar en total?: ").strip().lower()
@@ -2432,19 +2432,19 @@ def run_cli() -> None:
                     if total_usdc_raw in {"max", "todo", "all"}:
                         available_usdc, _, balances_ok = _read_available_balances()
                         if not balances_ok:
-                            log_event("[ERROR] No se pudo leer USDC disponible para usar el máximo.", "error")
+                            log_event("No se pudo leer USDC disponible para usar el máximo.", "error")
                             continue
                         total_usdc = available_usdc
                     else:
                         try:
                             total_usdc = Decimal(total_usdc_raw)
                         except Exception:
-                            log_event("[ERROR] Valor de USDC inválido.", "error")
+                            log_event("Valor de USDC inválido.", "error")
                             continue
                         available_usdc, _, balances_ok = _read_available_balances()
                         if balances_ok and total_usdc > available_usdc:
                             log_event(
-                                f"[ERROR] El USDC indicado ({_fmt_usdc_value(total_usdc)}) "
+                                f"El USDC indicado ({_fmt_usdc_value(total_usdc)}) "
                                 f"supera el disponible ({_fmt_usdc_value(available_usdc)}).",
                                 "error",
                             )
@@ -2454,7 +2454,7 @@ def run_cli() -> None:
                     for l in price_logs:
                         log_event(f"[LOG] {l['msg']}", l.get("level", "info"))
                     if current_price is None:
-                        log_event("[ERROR] No se pudo leer el precio actual para calcular la configuración automática.", "error")
+                        log_event("No se pudo leer el precio actual para calcular la configuración automática.", "error")
                         continue
 
                     try:
@@ -2473,7 +2473,7 @@ def run_cli() -> None:
                             range_usdc=range_usdc,
                         )
                     except Exception as exc:
-                        log_event(f"[ERROR] No se pudo calcular la configuración automática: {exc}", "error")
+                        log_event(f"No se pudo calcular la configuración automática: {exc}", "error")
                         continue
 
                     trailing_up_default = "fixed_quote"
@@ -2527,7 +2527,7 @@ def run_cli() -> None:
                                     f"supera el USDC disponible ({_fmt_usdc_value(available_usdc)})"
                                 )
                         except Exception as exc:
-                            log_event(f"[ERROR] Valor de saldo inválido: {exc}. Conservando el anterior.", "error")
+                            log_event(f"Valor de saldo inválido: {exc}. Conservando el anterior.", "error")
                             total_usdc_default = bot_usdc_budget_default + reserve_usdc_default
 
                     new_usdc_reserve = input_with_esc(
@@ -2546,12 +2546,12 @@ def run_cli() -> None:
                                 )
                             log_event(f"Colchón de seguridad actualizado a {_fmt_usdc_value(reserve_usdc_default)} USDC", "info")
                         except Exception as exc:
-                            log_event(f"[ERROR] Valor de colchón de seguridad inválido: {exc}. Conservando el anterior ({_fmt_usdc_value(reserve_usdc_default)}).", "error")
+                            log_event(f"Valor de colchón de seguridad inválido: {exc}. Conservando el anterior ({_fmt_usdc_value(reserve_usdc_default)}).", "error")
                             reserve_usdc_default = reserve_usdc_default
 
                     if reserve_usdc_default > total_usdc_default:
                         log_event(
-                            f"[ERROR] El USDC reservado ({_fmt_usdc_value(reserve_usdc_default)}) "
+                            f"El USDC reservado ({_fmt_usdc_value(reserve_usdc_default)}) "
                             f"supera el saldo total indicado ({_fmt_usdc_value(total_usdc_default)}).",
                             "error",
                         )
@@ -2567,7 +2567,7 @@ def run_cli() -> None:
                                 raise ValueError("el size debe ser mayor que cero")
                             base_size_default = parsed_base_size
                         except Exception as exc:
-                            log_event(f"[ERROR] Valor de size inválido: {exc}. Conservando el anterior.", "error")
+                            log_event(f"Valor de size inválido: {exc}. Conservando el anterior.", "error")
 
                     current_price, price_logs = get_current_price()
                     for l in price_logs:
@@ -2599,7 +2599,7 @@ def run_cli() -> None:
                             grid_levels_below = total_lines // 2
                             grid_levels_above = total_lines - grid_levels_below
                         except Exception as exc:
-                            log_event(f"[ERROR] Valor de líneas inválido: {exc}. Conservando el anterior.", "error")
+                            log_event(f"Valor de líneas inválido: {exc}. Conservando el anterior.", "error")
 
                     while True:
                         new_step_percent = input_with_esc(f"Step percent por defecto [{fmt_amount(step_percent_default)}]: ")
@@ -2623,7 +2623,7 @@ def run_cli() -> None:
                                 break
                             log_event("Step percent no confirmado; vuelve a introducirlo.", "info")
                         except Exception as exc:
-                            log_event(f"[ERROR] Valor de step percent inválido: {exc}.", "error")
+                            log_event(f"Valor de step percent inválido: {exc}.", "error")
                             if current_price is None:
                                 break
 
@@ -2633,16 +2633,16 @@ def run_cli() -> None:
                     if new_trailing_up and new_trailing_up in ("off", "on", "extended", "fixed_quote"):
                         trailing_up_default = new_trailing_up
                     elif new_trailing_up:
-                        log_event("[ERROR] Valor de trailing up inválido (debe ser off, on, extended o fixed_quote), conservando el anterior.", "error")
+                        log_event("Valor de trailing up inválido (debe ser off, on, extended o fixed_quote), conservando el anterior.", "error")
 
                     new_trailing_down = input_with_esc(f"Trailing down (off/on/extended) [{trailing_down_default}]: ").strip().lower()
                     if new_trailing_down and new_trailing_down in ("off", "on", "extended"):
                         trailing_down_default = new_trailing_down
                     elif new_trailing_down:
-                        log_event("[ERROR] Valor de trailing down inválido (debe ser off, on o extended), conservando el anterior.", "error")
+                        log_event("Valor de trailing down inválido (debe ser off, on o extended), conservando el anterior.", "error")
 
                 else:
-                    log_event("[ERROR] Opción inválida. Usa automática o manual.", "error")
+                    log_event("Opción inválida. Usa automática o manual.", "error")
                     continue
 
                 # Guardar la configuración

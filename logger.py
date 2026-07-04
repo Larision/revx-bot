@@ -90,6 +90,14 @@ file_logger.propagate = False
 #  Funciones de logging
 # ============================
 
+def _strip_duplicate_level_prefix(message: str, level: str) -> str:
+    """Evita mensajes como [ERROR] [ERROR] cuando el texto ya trae el nivel."""
+    level_prefix = f"[{level.upper()}]"
+    if message.startswith(level_prefix):
+        return message[len(level_prefix):].lstrip()
+    return message
+
+
 def log_event(
     message: str,
     level: str = "info",
@@ -99,9 +107,10 @@ def log_event(
     Logger unificado. Escribe en consola y fichero.
     Si se pasa collector, añade además una entrada estructurada.
     """
-    getattr(logger, level)(message)
+    normalized_message = _strip_duplicate_level_prefix(message, level)
+    getattr(logger, level)(normalized_message)
     if collector is not None:
-        collector.append({"level": level, "msg": message})
+        collector.append({"level": level, "msg": normalized_message})
 
 
 def log_file(message: str, level: str = "info") -> None:
