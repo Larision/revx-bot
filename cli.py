@@ -2493,53 +2493,42 @@ def run_cli() -> None:
                     print("  Trailing down   : off")
 
                 elif config_mode in {"m", "manual"}:
-                    new_levels_below = input_with_esc(f"Niveles por debajo del precio inicial [{grid_levels_below}]: ")
-                    if new_levels_below.strip():
-                        try:
-                            grid_levels_below = int(new_levels_below)
-                        except ValueError:
-                            log_event("[ERROR] Valor de niveles abajo inválido, conservando el anterior.", "error")
-
-                    new_levels_above = input_with_esc(f"Niveles por encima del precio inicial [{grid_levels_above}]: ")
-                    if new_levels_above.strip():
-                        try:
-                            grid_levels_above = int(new_levels_above)
-                        except ValueError:
-                            log_event("[ERROR] Valor de niveles arriba inválido, conservando el anterior.", "error")
-
-                    new_bs = input_with_esc(f"Base size por defecto [{fmt_amount(base_size_default)}]: ")
-                    if new_bs.strip():
-                        try:
-                            base_size_default = Decimal(new_bs)
-                        except Exception:
-                            log_event("[ERROR] Valor de base size inválido, conservando el anterior.", "error")
-
-                    new_step_percent = input_with_esc(f"Step percent por defecto [{fmt_amount(step_percent_default)}]: ")
-                    if new_step_percent.strip():
-                        try:
-                            step_percent_default = Decimal(new_step_percent)
-                        except Exception:
-                            log_event("[ERROR] Valor de step percent inválido, conservando el anterior.", "error")
-
-                    new_trailing_up = input_with_esc(f"Trailing up (off/on/extended/fixed_quote) [{trailing_up_default}]: ").strip().lower()
-                    if new_trailing_up and new_trailing_up in {"quote", "quote_fijo", "fixed-quote", "fixedquote"}:
-                        new_trailing_up = "fixed_quote"
-                    if new_trailing_up and new_trailing_up in ("off", "on", "extended", "fixed_quote"):
-                        trailing_up_default = new_trailing_up
-                    elif new_trailing_up:
-                        log_event("[ERROR] Valor de trailing up inválido (debe ser off, on, extended o fixed_quote), conservando el anterior.", "error")
-
-                    new_trailing_down = input_with_esc(f"Trailing down (off/on/extended) [{trailing_down_default}]: ").strip().lower()
-                    if new_trailing_down and new_trailing_down in ("off", "on", "extended"):
-                        trailing_down_default = new_trailing_down
-                    elif new_trailing_down:
-                        log_event("[ERROR] Valor de trailing down inválido (debe ser off, on o extended), conservando el anterior.", "error")
-
                     available_usdc, _, balances_ok = _read_available_balances()
                     if balances_ok:
                         print(f"USDC disponible actual: {_fmt_usdc_value(available_usdc)}")
                     else:
                         print("USDC disponible actual: no disponible")
+
+                    total_usdc_default = bot_usdc_budget_default + reserve_usdc_default
+                    total_usdc_text = (
+                        _fmt_usdc_value(total_usdc_default)
+                        if total_usdc_default > 0
+                        else "0"
+                    )
+                    new_total_usdc = input_with_esc(
+                        f"Saldo USDC total que quieres emplear [{total_usdc_text}] "
+                        "(max/todo = disponible): "
+                    ).strip().lower()
+
+                    if new_total_usdc:
+                        try:
+                            if new_total_usdc in {"max", "todo", "all"}:
+                                if not balances_ok:
+                                    raise ValueError("no se pudo leer USDC disponible")
+                                total_usdc_default = available_usdc
+                            else:
+                                total_usdc_default = Decimal(new_total_usdc)
+
+                            if total_usdc_default < 0:
+                                raise ValueError("el saldo no puede ser negativo")
+                            if balances_ok and total_usdc_default > available_usdc:
+                                raise ValueError(
+                                    f"el saldo indicado ({_fmt_usdc_value(total_usdc_default)}) "
+                                    f"supera el USDC disponible ({_fmt_usdc_value(available_usdc)})"
+                                )
+                        except Exception as exc:
+                            log_event(f"[ERROR] Valor de saldo inválido: {exc}. Conservando el anterior.", "error")
+                            total_usdc_default = bot_usdc_budget_default + reserve_usdc_default
 
                     new_usdc_reserve = input_with_esc(
                         f"Cuanto USDC quieres reservar como colchón de seguridad: [{_fmt_usdc_value(reserve_usdc_default)}]: "
@@ -2560,43 +2549,97 @@ def run_cli() -> None:
                             log_event(f"[ERROR] Valor de colchón de seguridad inválido: {exc}. Conservando el anterior ({_fmt_usdc_value(reserve_usdc_default)}).", "error")
                             reserve_usdc_default = reserve_usdc_default
 
-                    budget_default_text = (
-                        _fmt_usdc_value(bot_usdc_budget_default)
-                        if bot_usdc_budget_default > 0
-                        else "0"
-                    )
-                    new_budget = input_with_esc(
-                        f"Saldo USDC total a emplear por el bot [{budget_default_text}] "
-                        "(0 = sin límite explícito): "
-                    ).strip().lower()
+                    if reserve_usdc_default > total_usdc_default:
+                        log_event(
+                            f"[ERROR] El USDC reservado ({_fmt_usdc_value(reserve_usdc_default)}) "
+                            f"supera el saldo total indicado ({_fmt_usdc_value(total_usdc_default)}).",
+                            "error",
+                        )
+                        continue
+                    bot_usdc_budget_default = total_usdc_default - reserve_usdc_default
+                    log_event(f"Saldo asignado al bot: {_fmt_usdc_value(bot_usdc_budget_default)} USDC", "info")
 
-                    if new_budget:
+                    new_bs = input_with_esc(f"Size por orden [{fmt_amount(base_size_default)}]: ")
+                    if new_bs.strip():
                         try:
-                            if new_budget in {"max", "todo", "all"}:
-                                if not balances_ok:
-                                    raise ValueError("no se pudo leer USDC disponible")
-                                parsed_budget = max(Decimal("0"), available_usdc - reserve_usdc_default)
-                            else:
-                                parsed_budget = Decimal(new_budget)
-
-                            if parsed_budget < 0:
-                                raise ValueError("el saldo no puede ser negativo")
-
-                            if balances_ok:
-                                max_budget = max(Decimal("0"), available_usdc - reserve_usdc_default)
-                                if parsed_budget > max_budget:
-                                    raise ValueError(
-                                        f"el saldo asignado ({_fmt_usdc_value(parsed_budget)}) "
-                                        f"supera el USDC disponible ({_fmt_usdc_value(max_budget)})"
-                                    )
-                            bot_usdc_budget_default = parsed_budget
-
+                            parsed_base_size = Decimal(new_bs)
+                            if parsed_base_size <= 0:
+                                raise ValueError("el size debe ser mayor que cero")
+                            base_size_default = parsed_base_size
                         except Exception as exc:
-                            log_event(f"[ERROR] Valor de saldo asignado inválido: {exc}. Conservando el anterior.", "error")
+                            log_event(f"[ERROR] Valor de size inválido: {exc}. Conservando el anterior.", "error")
 
-                    elif balances_ok:
-                        bot_usdc_budget_default = max(Decimal("0"), available_usdc - reserve_usdc_default)
-                        log_event(f"Saldo asignado actualizado a {_fmt_usdc_value(bot_usdc_budget_default)} USDC (ajustado automáticamente según el colchón de seguridad)", "info")
+                    current_price, price_logs = get_current_price()
+                    for l in price_logs:
+                        log_event(f"[LOG] {l['msg']}", l.get("level", "info"))
+
+                    max_lines: Optional[int] = None
+                    if current_price is not None and base_size_default > 0:
+                        line_value = base_size_default * current_price
+                        if line_value > 0:
+                            max_lines = int(bot_usdc_budget_default // line_value)
+                            print(
+                                f"Máximo aproximado de líneas con este saldo y size: {max_lines} "
+                                f"(precio actual {_price_key(current_price)} USDC)."
+                            )
+                    else:
+                        print("Máximo de líneas: no disponible porque no se pudo leer el precio actual.")
+
+                    current_total_lines = grid_levels_below + grid_levels_above
+                    new_total_lines = input_with_esc(f"Líneas totales del grid [{current_total_lines}]: ").strip()
+                    if new_total_lines:
+                        try:
+                            total_lines = int(new_total_lines)
+                            if total_lines <= 0:
+                                raise ValueError("las líneas deben ser mayores que cero")
+                            if max_lines is not None and total_lines > max_lines:
+                                raise ValueError(
+                                    f"las líneas indicadas ({total_lines}) superan el máximo aproximado ({max_lines})"
+                                )
+                            grid_levels_below = total_lines // 2
+                            grid_levels_above = total_lines - grid_levels_below
+                        except Exception as exc:
+                            log_event(f"[ERROR] Valor de líneas inválido: {exc}. Conservando el anterior.", "error")
+
+                    while True:
+                        new_step_percent = input_with_esc(f"Step percent por defecto [{fmt_amount(step_percent_default)}]: ")
+                        try:
+                            parsed_step_percent = (
+                                Decimal(new_step_percent)
+                                if new_step_percent.strip()
+                                else step_percent_default
+                            )
+                            if parsed_step_percent <= 0:
+                                raise ValueError("el step percent debe ser mayor que cero")
+                            if current_price is None:
+                                raise ValueError("no se pudo leer el precio actual para calcular el step")
+                            step_value = (current_price * parsed_step_percent).quantize(TICK_SIZE, rounding=ROUND_DOWN)
+                            confirm_step = input_with_esc(
+                                f"El step sería de {_price_key(step_value)} USDC "
+                                f"({fmt_amount(parsed_step_percent * Decimal('100'))}%). Confirmar? (s/n): "
+                            ).strip().lower()
+                            if confirm_step.startswith("s"):
+                                step_percent_default = parsed_step_percent
+                                break
+                            log_event("Step percent no confirmado; vuelve a introducirlo.", "info")
+                        except Exception as exc:
+                            log_event(f"[ERROR] Valor de step percent inválido: {exc}.", "error")
+                            if current_price is None:
+                                break
+
+                    new_trailing_up = input_with_esc(f"Trailing up (off/on/extended/fixed_quote) [{trailing_up_default}]: ").strip().lower()
+                    if new_trailing_up and new_trailing_up in {"quote", "quote_fijo", "fixed-quote", "fixedquote"}:
+                        new_trailing_up = "fixed_quote"
+                    if new_trailing_up and new_trailing_up in ("off", "on", "extended", "fixed_quote"):
+                        trailing_up_default = new_trailing_up
+                    elif new_trailing_up:
+                        log_event("[ERROR] Valor de trailing up inválido (debe ser off, on, extended o fixed_quote), conservando el anterior.", "error")
+
+                    new_trailing_down = input_with_esc(f"Trailing down (off/on/extended) [{trailing_down_default}]: ").strip().lower()
+                    if new_trailing_down and new_trailing_down in ("off", "on", "extended"):
+                        trailing_down_default = new_trailing_down
+                    elif new_trailing_down:
+                        log_event("[ERROR] Valor de trailing down inválido (debe ser off, on o extended), conservando el anterior.", "error")
 
                 else:
                     log_event("[ERROR] Opción inválida. Usa automática o manual.", "error")
