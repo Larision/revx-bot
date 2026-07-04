@@ -2617,7 +2617,7 @@ def run_cli() -> None:
 
             except InputCancelled:
                 print("Entrada cancelada. Configuración no guardada.")
-                return
+                continue
 
         # --------------------------------------------------
         # 0.Salir
