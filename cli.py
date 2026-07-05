@@ -1933,9 +1933,7 @@ def _resize_to_default(engine: "GridEngine") -> None:
         print("  Abortado.")
         return
 
-    ok, logs, error_msg, summary = engine.resize_trailing_up_fixed_quote_to_default()
-    for entry in logs:
-        log_event(f"[RESIZE] {entry['msg']}", entry.get("level", "info"))
+    ok, _logs, error_msg, summary = engine.resize_trailing_up_fixed_quote_to_default()
 
     resized_real = int(summary.get("resized_real", 0) or 0)
     updated_state_only = int(summary.get("updated_state_only", 0) or 0)
