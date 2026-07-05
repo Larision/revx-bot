@@ -690,8 +690,8 @@ class TrailingPolicyMixin:
         Libera USDC para un BUY creado por activación de SELL virtual.
 
         Cancela BUYs reales desde la parte más baja de la rejilla, sean principales
-        o extended. No cancela SELLs porque no liberan USDC. Se detiene cuando el
-        saldo real o el saldo estimado liberado cubre el BUY objetivo. Si
+        o extended. No usa USDC disponible libre: el BUY objetivo debe quedar
+        cubierto por USDC liberado mediante cancelaciones. Si
         max_cancellations es None, no usa un límite fijo: el tope natural son los
         BUYs reales cancelables disponibles.
         """
@@ -700,31 +700,23 @@ class TrailingPolicyMixin:
         excluded_keys: set[str] = {target_key}
         cancellations = 0
 
-        estimated_available = self._get_available_usdc()
-        if estimated_available >= required:
-            return True
+        released_usdc = Decimal("0")
 
-        while estimated_available < required:
+        while released_usdc < required:
             if max_cancellations is not None and cancellations >= max_cancellations:
                 log_event(
                     f"[ENGINE] Trailing up: USDC insuficiente para BUY {target_key} "
                     f"tras {cancellations} cancelaciones "
-                    f"({_price_key(estimated_available)} < {_price_key(required)})",
+                    f"({_price_key(released_usdc)} liberado < {_price_key(required)})",
                     "warning"
                 )
                 return False
 
             candidate = self._find_lowest_real_buy_order(exclude_keys=excluded_keys)
             if candidate is None:
-                refreshed_available = self._get_available_usdc()
-                if refreshed_available > estimated_available:
-                    estimated_available = refreshed_available
-                if estimated_available >= required:
-                    return True
-
                 log_event(
                     f"[ENGINE] Trailing up: no hay BUY real cancelable para liberar USDC "
-                    f"({_price_key(estimated_available)} < {_price_key(required)})",
+                    f"({_price_key(released_usdc)} liberado < {_price_key(required)})",
                     "warning"
                 )
                 return False
@@ -781,8 +773,8 @@ class TrailingPolicyMixin:
                         "info",
                     )
 
-                estimated_available += estimated_release
-                if estimated_available >= required:
+                released_usdc += estimated_release
+                if released_usdc >= required:
                     log_event(
                         f"[ENGINE] Trailing up: saldo estimado liberado con BUY {cancel_level_key}; "
                         f"_place_order_safe esperará si el exchange aún no actualizó el disponible",
@@ -792,9 +784,6 @@ class TrailingPolicyMixin:
 
                 if retry_delay > 0:
                     time.sleep(retry_delay)
-                    refreshed_available = self._get_available_usdc()
-                    if refreshed_available > estimated_available:
-                        estimated_available = refreshed_available
                 continue
 
             with self._state_lock:

@@ -264,6 +264,21 @@ class GridEngine(TrailingPolicyMixin):
         available = usdc_balance - self.reserve_usdc
         return available if available > 0 else Decimal('0')
 
+    def set_reserve_usdc(self, reserve_usdc: Decimal) -> None:
+        """Actualiza la reserva USDC en caliente."""
+        new_reserve = Decimal(str(reserve_usdc))
+        if new_reserve < 0:
+            raise ValueError("reserve_usdc no puede ser negativo")
+
+        with self._state_lock:
+            self.reserve_usdc = new_reserve
+
+        log_event(
+            f"[ENGINE] Reserva USDC actualizada -> {_price_key(new_reserve)} USDC",
+            "info",
+        )
+        self.save_state()
+
     def _get_available_btc(self) -> Decimal:
         """Calcula BTC disponible para nuevas ordenes SELL."""
         balances_resp, _ = get_all_balances()
@@ -332,6 +347,7 @@ class GridEngine(TrailingPolicyMixin):
             "levels_above": self.levels_above,
             "step_percent": str(self.step_percent),
             "base_size": str(self.base_size),
+            "reserve_usdc": str(self.reserve_usdc),
             "trailing_up_mode": self.trailing_up_mode,
             "trailing_up_enabled": self.trailing_up_enabled,
             "trailing_up_steps": self._trailing_up_ext_steps,
@@ -384,6 +400,7 @@ class GridEngine(TrailingPolicyMixin):
                 "last_fill_side": self.last_fill_side,
                 "last_fill_price": self.last_fill_price,
                 "base_size": self.base_size,
+                "reserve_usdc": self.reserve_usdc,
                 "trailing_up_mode": self.trailing_up_mode,
                 "trailing_up_enabled": self.trailing_up_enabled,
                 "trailing_up_steps": self._trailing_up_ext_steps,
@@ -526,6 +543,7 @@ class GridEngine(TrailingPolicyMixin):
             steps_each_side = raw_steps or max(levels_below, levels_above)
             step_percent = Decimal(raw["step_percent"])
             base_size = Decimal(raw["base_size"])
+            reserve_usdc = Decimal(str(raw.get("reserve_usdc", self.reserve_usdc)))
             center_price = Decimal(raw["center_price"]) if raw.get("center_price") else None
             step = Decimal(raw["step"]) if raw.get("step") else None
             base_step = Decimal(raw["base_step"]) if raw.get("base_step") else step
@@ -651,6 +669,7 @@ class GridEngine(TrailingPolicyMixin):
                 self.steps_each_side = steps_each_side
                 self.step_percent = step_percent
                 self.base_size = base_size
+                self.reserve_usdc = reserve_usdc if reserve_usdc >= 0 else MIN_USDC_RESERVE
                 self.center_price = center_price
                 self.step = step
                 self.base_step = base_step

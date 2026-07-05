@@ -1160,6 +1160,57 @@ def _place_initial_btc_buy_order(quantity: Decimal, limit_price: Decimal) -> boo
         time.sleep(poll_interval)
 
 
+def _calculate_auto_grid_config(
+    current_price: Decimal,
+    total_usdc: Decimal,
+    reserve_percent: Decimal,
+    total_lines: int,
+    range_usdc: Decimal,
+) -> Tuple[int, int, Decimal, Decimal, Decimal, Decimal]:
+    """Calcula niveles, size, step percent, reserva y saldo usable para un preset automatico."""
+    if current_price <= 0:
+        raise ValueError("el precio actual debe ser mayor que cero")
+    if total_usdc <= 0:
+        raise ValueError("el saldo USDC debe ser mayor que cero")
+    if total_lines <= 0 or total_lines % 2 != 0:
+        raise ValueError("las lineas del grid deben ser un numero par mayor que cero")
+    if range_usdc <= 0:
+        raise ValueError("el rango debe ser mayor que cero")
+
+    levels_below = total_lines // 2
+    levels_above = total_lines // 2
+    reserve_usdc = (total_usdc * reserve_percent).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+    bot_usdc_budget = total_usdc - reserve_usdc
+    if bot_usdc_budget <= 0:
+        raise ValueError("el saldo usable queda a cero tras aplicar la reserva")
+
+    step_value = (range_usdc / Decimal(levels_below)).quantize(TICK_SIZE, rounding=ROUND_DOWN)
+    if step_value <= 0:
+        raise ValueError("el step calculado queda a cero")
+
+    buy_prices = [
+        (current_price - (Decimal(i) * step_value)).quantize(TICK_SIZE, rounding=ROUND_DOWN)
+        for i in range(1, levels_below + 1)
+    ]
+    buy_prices = [price for price in buy_prices if price > 0]
+    if len(buy_prices) != levels_below:
+        raise ValueError("el rango elegido genera niveles BUY a precio cero o negativo")
+
+    per_size_value = sum(buy_prices, Decimal("0")) + (current_price * Decimal(levels_above))
+    if per_size_value <= 0:
+        raise ValueError("no se pudo calcular el size automatico")
+
+    base_size = (bot_usdc_budget / per_size_value).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+    if base_size <= 0:
+        raise ValueError("el size calculado queda a cero")
+
+    step_percent = (step_value / current_price).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+    if step_percent <= 0:
+        raise ValueError("el step percent calculado queda a cero")
+
+    return levels_below, levels_above, base_size, step_percent, reserve_usdc, bot_usdc_budget
+
+
 def show_grid_preview(
     levels_below: int,
     levels_above: int,
@@ -1435,66 +1486,6 @@ def _show_active_orders(engine: "GridEngine") -> None:
     print(f"  Total: {len(sells)} SELL  |  {len(buys)} BUY")
 
 
-def _trailing_menu(engine: "GridEngine") -> None:
-    """
-    Menú interactivo para la configuración en vivo de trailing up/down.
-    Los cambios se pueden aplicar inmediatamente o descartar.
-    """
-    def _normalize_up_mode(value: object) -> str:
-        """Normaliza el modo de trailing up a 'off', 'on' o 'extended'."""
-        return normalize_trailing_up_mode(value)
-
-    def _normalize_down_mode(value: object) -> str:
-        """Normaliza el modo de trailing down a 'off', 'on' o 'extended'."""
-        return normalize_trailing_down_mode(value)
-
-    def _up_mode_label(mode: str) -> str:
-        """Devuelve una etiqueta de visualización para el modo de trailing up."""
-        return trailing_up_mode_label(mode)
-
-    def _down_mode_label(mode: str) -> str:
-        """Devuelve una etiqueta de visualización para el modo de trailing down."""
-        return trailing_down_mode_label(mode)
-
-    original_up = _normalize_up_mode(
-        getattr(engine, "trailing_up_mode", engine.trailing_up_enabled)
-    )
-    original_down = _normalize_down_mode(
-        getattr(engine, "trailing_down_mode", engine.trailing_down_enabled)
-    )
-
-    new_up = original_up
-    new_down = original_down
-    up_cycle = ["off", "on", "extended", "fixed_quote"]
-    down_cycle = ["off", "on", "extended"]
-
-    while True:
-        print("\n=== CONFIGURAR TRAILINGS ===")
-        print(f"1. Trailing up   > {_up_mode_label(new_up)}")
-        print(f"2. Trailing down > {_down_mode_label(new_down)}")
-        print("3. Atrás")
-
-        opcion = input("Opción: ").strip()
-
-        if opcion == "1":
-            idx = up_cycle.index(new_up) if new_up in up_cycle else 0
-            new_up = up_cycle[(idx + 1) % len(up_cycle)]
-        elif opcion == "2":
-            idx = down_cycle.index(new_down) if new_down in down_cycle else 0
-            new_down = down_cycle[(idx + 1) % len(down_cycle)]
-        elif opcion == "3":
-            if new_up != original_up or new_down != original_down:
-                confirm = input("¿Aplicar cambios? (s/n): ").strip().lower()
-                if confirm.startswith("s"):
-                    engine.set_trailing(new_up, new_down)
-                    print("✓ Cambios aplicados en caliente")
-                else:
-                    print("Cambios descartados")
-            return
-        else:
-            print("Opción inválida")
-
-
 def format_balances_live(engine: Optional["GridEngine"] = None) -> str:
     """
     Construye una cadena legible para humanos que muestra los saldos disponibles y los fondos asignados en el grid.
@@ -1649,57 +1640,6 @@ def _show_balances_live(engine: Optional["GridEngine"] = None) -> None:
     print("  Consultando balances...")
     summary = format_balances_live(engine)
     print("\n" + "\n".join(f"  {line}" if line else "" for line in summary.splitlines()) + "\n")
-
-
-def _calculate_auto_grid_config(
-    current_price: Decimal,
-    total_usdc: Decimal,
-    reserve_percent: Decimal,
-    total_lines: int,
-    range_usdc: Decimal,
-) -> Tuple[int, int, Decimal, Decimal, Decimal, Decimal]:
-    """Calcula niveles, size, step percent, reserva y saldo usable para un preset automatico."""
-    if current_price <= 0:
-        raise ValueError("el precio actual debe ser mayor que cero")
-    if total_usdc <= 0:
-        raise ValueError("el saldo USDC debe ser mayor que cero")
-    if total_lines <= 0 or total_lines % 2 != 0:
-        raise ValueError("las lineas del grid deben ser un numero par mayor que cero")
-    if range_usdc <= 0:
-        raise ValueError("el rango debe ser mayor que cero")
-
-    levels_below = total_lines // 2
-    levels_above = total_lines // 2
-    reserve_usdc = (total_usdc * reserve_percent).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
-    bot_usdc_budget = total_usdc - reserve_usdc
-    if bot_usdc_budget <= 0:
-        raise ValueError("el saldo usable queda a cero tras aplicar la reserva")
-
-    step_value = (range_usdc / Decimal(levels_below)).quantize(TICK_SIZE, rounding=ROUND_DOWN)
-    if step_value <= 0:
-        raise ValueError("el step calculado queda a cero")
-
-    buy_prices = [
-        (current_price - (Decimal(i) * step_value)).quantize(TICK_SIZE, rounding=ROUND_DOWN)
-        for i in range(1, levels_below + 1)
-    ]
-    buy_prices = [price for price in buy_prices if price > 0]
-    if len(buy_prices) != levels_below:
-        raise ValueError("el rango elegido genera niveles BUY a precio cero o negativo")
-
-    per_size_value = sum(buy_prices, Decimal("0")) + (current_price * Decimal(levels_above))
-    if per_size_value <= 0:
-        raise ValueError("no se pudo calcular el size automatico")
-
-    base_size = (bot_usdc_budget / per_size_value).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
-    if base_size <= 0:
-        raise ValueError("el size calculado queda a cero")
-
-    step_percent = (step_value / current_price).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
-    if step_percent <= 0:
-        raise ValueError("el step percent calculado queda a cero")
-
-    return levels_below, levels_above, base_size, step_percent, reserve_usdc, bot_usdc_budget
 
 
 def _add_manual_order(engine: "GridEngine") -> None:
@@ -2015,6 +1955,141 @@ def _resize_to_default(engine: "GridEngine") -> None:
         f"Virtual/latente: {updated_state_only} | Saltadas: {skipped}"
     )
 
+
+# =========================================================
+# ================= ENGINE LIVE CONFIG ====================
+# =========================================================
+
+def _trailing_menu(engine: "GridEngine") -> None:
+    """
+    Menú interactivo para la configuración en vivo de trailing up/down.
+    Los cambios se pueden aplicar inmediatamente o descartar.
+    """
+    def _normalize_up_mode(value: object) -> str:
+        """Normaliza el modo de trailing up a 'off', 'on' o 'extended'."""
+        return normalize_trailing_up_mode(value)
+
+    def _normalize_down_mode(value: object) -> str:
+        """Normaliza el modo de trailing down a 'off', 'on' o 'extended'."""
+        return normalize_trailing_down_mode(value)
+
+    def _up_mode_label(mode: str) -> str:
+        """Devuelve una etiqueta de visualización para el modo de trailing up."""
+        return trailing_up_mode_label(mode)
+
+    def _down_mode_label(mode: str) -> str:
+        """Devuelve una etiqueta de visualización para el modo de trailing down."""
+        return trailing_down_mode_label(mode)
+
+    original_up = _normalize_up_mode(
+        getattr(engine, "trailing_up_mode", engine.trailing_up_enabled)
+    )
+    original_down = _normalize_down_mode(
+        getattr(engine, "trailing_down_mode", engine.trailing_down_enabled)
+    )
+
+    new_up = original_up
+    new_down = original_down
+    up_cycle = ["off", "on", "extended", "fixed_quote"]
+    down_cycle = ["off", "on", "extended"]
+
+    while True:
+        print("\n=== CONFIGURAR TRAILINGS ===")
+        print(f"1. Trailing up   > {_up_mode_label(new_up)}")
+        print(f"2. Trailing down > {_down_mode_label(new_down)}")
+        print("3. Atrás")
+
+        opcion = input("Opción: ").strip()
+
+        if opcion == "1":
+            idx = up_cycle.index(new_up) if new_up in up_cycle else 0
+            new_up = up_cycle[(idx + 1) % len(up_cycle)]
+        elif opcion == "2":
+            idx = down_cycle.index(new_down) if new_down in down_cycle else 0
+            new_down = down_cycle[(idx + 1) % len(down_cycle)]
+        elif opcion == "3":
+            if new_up != original_up or new_down != original_down:
+                confirm = input("¿Aplicar cambios? (s/n): ").strip().lower()
+                if confirm.startswith("s"):
+                    engine.set_trailing(new_up, new_down)
+                    print("✓ Cambios aplicados en caliente")
+                else:
+                    print("Cambios descartados")
+            return
+        else:
+            print("Opción inválida")
+
+
+def _reserve_usdc_menu(engine: "GridEngine") -> None:
+    """Permite cambiar la reserva USDC del engine sin detenerlo."""
+    snapshot = engine.get_runtime_snapshot()
+    current_reserve = Decimal(str(snapshot.get("reserve_usdc", "0") or "0"))
+
+    print("\n=== CONFIGURAR RESERVA USDC ===")
+    print("  Consultando saldo disponible...")
+    available_usdc, _, balances_ok = _read_available_balances()
+
+    if balances_ok:
+        print(f"  USDC disponible actual : {_fmt_usdc_value(available_usdc)}")
+    else:
+        print("  USDC disponible actual : no disponible")
+
+    print(f"  Reserva actual         : {_fmt_usdc_value(current_reserve)} USDC")
+
+    prompt = f"Nueva reserva USDC [{_fmt_usdc_value(current_reserve)}"
+    if balances_ok:
+        prompt += f" | disponible {_fmt_usdc_value(available_usdc)}"
+    prompt += "]: "
+
+    new_reserve_raw = input(prompt).strip()
+    if not new_reserve_raw:
+        print("  Reserva sin cambios.")
+        return
+
+    try:
+        new_reserve = Decimal(new_reserve_raw)
+    except Exception:
+        print("  [!] Reserva inválida.")
+        return
+
+    if new_reserve < 0:
+        print("  [!] La reserva no puede ser negativa.")
+        return
+
+    if balances_ok and new_reserve > available_usdc:
+        print(
+            "  [!] La reserva supera el USDC disponible actual "
+            f"({_fmt_usdc_value(available_usdc)})."
+        )
+        return
+
+    engine.set_reserve_usdc(new_reserve)
+    print(f"  ✓ Reserva USDC actualizada a {_fmt_usdc_value(new_reserve)} USDC")
+
+
+def _engine_config_menu(engine: "GridEngine") -> None:
+    """Submenú de configuración en caliente para el engine."""
+    while True:
+        snapshot = engine.get_runtime_snapshot()
+        reserve_usdc = Decimal(str(snapshot.get("reserve_usdc", "0") or "0"))
+
+        print("\n=== CONFIGURACIÓN ENGINE ===")
+        print(f"1. Activar/Desactivar trailings")
+        print(f"2. Cantidad de saldo reservada > {_fmt_usdc_value(reserve_usdc)} USDC")
+        print("3. Atrás")
+
+        opcion = input("Opción: ").strip()
+
+        if opcion == "1":
+            _trailing_menu(engine)
+        elif opcion == "2":
+            _reserve_usdc_menu(engine)
+        elif opcion == "3":
+            return
+        else:
+            print("Opción inválida")
+
+
 def run_engine_menu(engine: "GridEngine", engine_thread: threading.Thread) -> None:
     """
     Submenú de monitor interactivo para una instancia de GridEngine en ejecución.
@@ -2035,10 +2110,11 @@ def run_engine_menu(engine: "GridEngine", engine_thread: threading.Thread) -> No
         print(f"  Órdenes activas : {len(snapshot['active_orders'])}")
         print(f"  Fills sesión    : {len(snapshot['fill_history'])}")
         print(f"  Último fill     : {snapshot['last_fill_side'] or 'ninguno'}")
+        print(f"  Reserva USDC    : {_fmt_usdc_value(Decimal(str(snapshot.get('reserve_usdc', '0') or '0')))}")
         print("=" * 40)
         print("  1. Ver niveles del grid")
         print("  2. Ver órdenes activas")
-        print("  3. Activar-Desactivar trailings")
+        print("  3. Configuración")
         print("  4. Ver balances")
         print("  5. Añadir orden manual")
         print("  6. Cancelar orden por precio")
@@ -2059,7 +2135,7 @@ def run_engine_menu(engine: "GridEngine", engine_thread: threading.Thread) -> No
         elif opcion == "2":
             _show_active_orders(engine)
         elif opcion == "3":
-            _trailing_menu(engine)
+            _engine_config_menu(engine)
         elif opcion == "4":
             _show_balances_live(engine)
         elif opcion == "5":
