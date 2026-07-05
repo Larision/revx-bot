@@ -2637,11 +2637,13 @@ def run_cli() -> None:
                     print("  Trailing down   : off")
 
                 elif config_mode in {"m", "manual"}:
-                    available_usdc, _, balances_ok = _read_available_balances()
+                    available_usdc, available_btc, balances_ok = _read_available_balances()
                     if balances_ok:
                         print(f"USDC disponible actual: {_fmt_usdc_value(available_usdc)}")
+                        print(f"BTC disponible actual : {fmt_amount(available_btc)}")
                     else:
                         print("USDC disponible actual: no disponible")
+                        print("BTC disponible actual : no disponible")
 
                     total_usdc_default = bot_usdc_budget_default + reserve_usdc_default
                     total_usdc_text = (
@@ -2718,43 +2720,68 @@ def run_cli() -> None:
                         log_event(f"[LOG] {l['msg']}", l.get("level", "info"))
 
                     max_lines: Optional[int] = None
+                    max_buy_lines: Optional[int] = None
+                    max_sell_lines: Optional[int] = None
                     if current_price is not None and base_size_default > 0:
                         line_value = base_size_default * current_price
                         if line_value > 0:
-                            max_lines = int(bot_usdc_budget_default // line_value)
-                            print(
-                                f"Máximo aproximado de líneas con este saldo y size: {max_lines} "
-                                f"(precio actual {_price_key(current_price)} USDC)."
-                            )
+                            max_buy_lines = int(bot_usdc_budget_default // line_value)
+                            max_sell_lines = int(available_btc // base_size_default) if balances_ok else None
+                            if max_sell_lines is not None:
+                                max_lines = max_buy_lines + max_sell_lines
+                                print(
+                                    f"Máximo aproximado de líneas con este saldo, BTC y size: {max_lines} "
+                                    f"(precio actual {_price_key(current_price)} USDC)."
+                                )
+                            else:
+                                print(
+                                    f"Máximo aproximado de BUY abajo con este saldo y size: {max_buy_lines} "
+                                    f"(precio actual {_price_key(current_price)} USDC)."
+                                )
+                            print(f"  BUY abajo por USDC : {max_buy_lines}")
+                            if max_sell_lines is not None:
+                                print(f"  SELL arriba por BTC: {max_sell_lines}")
+                            else:
+                                print("  SELL arriba por BTC: no disponible")
                     else:
                         print("Máximo de líneas: no disponible porque no se pudo leer el precio actual.")
 
-                    new_levels_below_raw = input_with_esc(f"Niveles abajo [{grid_levels_below}]: ").strip()
-                    new_levels_above_raw = input_with_esc(f"Niveles arriba [{grid_levels_above}]: ").strip()
-                    try:
-                        parsed_levels_below = (
-                            int(new_levels_below_raw)
-                            if new_levels_below_raw
-                            else grid_levels_below
-                        )
-                        parsed_levels_above = (
-                            int(new_levels_above_raw)
-                            if new_levels_above_raw
-                            else grid_levels_above
-                        )
-                        if parsed_levels_below < 0 or parsed_levels_above < 0:
-                            raise ValueError("los niveles no pueden ser negativos")
-                        total_lines = parsed_levels_below + parsed_levels_above
-                        if total_lines <= 0:
-                            raise ValueError("debe haber al menos un nivel")
-                        if max_lines is not None and total_lines > max_lines:
-                            raise ValueError(
-                                f"las líneas indicadas ({total_lines}) superan el máximo aproximado ({max_lines})"
+                    while True:
+                        new_levels_below_raw = input_with_esc(f"Niveles abajo [{grid_levels_below}]: ").strip()
+                        new_levels_above_raw = input_with_esc(f"Niveles arriba [{grid_levels_above}]: ").strip()
+                        try:
+                            parsed_levels_below = (
+                                int(new_levels_below_raw)
+                                if new_levels_below_raw
+                                else grid_levels_below
                             )
-                        grid_levels_below = parsed_levels_below
-                        grid_levels_above = parsed_levels_above
-                    except Exception as exc:
-                        log_event(f"Valor de niveles inválido: {exc}. Conservando el anterior.", "error")
+                            parsed_levels_above = (
+                                int(new_levels_above_raw)
+                                if new_levels_above_raw
+                                else grid_levels_above
+                            )
+                            if parsed_levels_below < 0 or parsed_levels_above < 0:
+                                raise ValueError("los niveles no pueden ser negativos")
+                            total_lines = parsed_levels_below + parsed_levels_above
+                            if total_lines <= 0:
+                                raise ValueError("debe haber al menos un nivel")
+                            if max_buy_lines is not None and parsed_levels_below > max_buy_lines:
+                                raise ValueError(
+                                    f"los niveles abajo ({parsed_levels_below}) superan los BUY posibles con USDC ({max_buy_lines})"
+                                )
+                            if max_sell_lines is not None and parsed_levels_above > max_sell_lines:
+                                raise ValueError(
+                                    f"los niveles arriba ({parsed_levels_above}) superan los SELL posibles con BTC ({max_sell_lines})"
+                                )
+                            if max_lines is not None and total_lines > max_lines:
+                                raise ValueError(
+                                    f"las líneas indicadas ({total_lines}) superan el máximo aproximado ({max_lines})"
+                                )
+                            grid_levels_below = parsed_levels_below
+                            grid_levels_above = parsed_levels_above
+                            break
+                        except Exception as exc:
+                            log_event(f"Valor de niveles inválido: {exc}. Vuelve a intentarlo.", "error")
 
                     while True:
                         new_step_percent = input_with_esc(f"Step percent por defecto [{fmt_amount(step_percent_default)}]: ")
