@@ -2659,21 +2659,32 @@ def run_cli() -> None:
                     else:
                         print("Máximo de líneas: no disponible porque no se pudo leer el precio actual.")
 
-                    current_total_lines = grid_levels_below + grid_levels_above
-                    new_total_lines = input_with_esc(f"Líneas totales del grid [{current_total_lines}]: ").strip()
-                    if new_total_lines:
-                        try:
-                            total_lines = int(new_total_lines)
-                            if total_lines <= 0:
-                                raise ValueError("las líneas deben ser mayores que cero")
-                            if max_lines is not None and total_lines > max_lines:
-                                raise ValueError(
-                                    f"las líneas indicadas ({total_lines}) superan el máximo aproximado ({max_lines})"
-                                )
-                            grid_levels_below = total_lines // 2
-                            grid_levels_above = total_lines - grid_levels_below
-                        except Exception as exc:
-                            log_event(f"Valor de líneas inválido: {exc}. Conservando el anterior.", "error")
+                    new_levels_below_raw = input_with_esc(f"Niveles abajo [{grid_levels_below}]: ").strip()
+                    new_levels_above_raw = input_with_esc(f"Niveles arriba [{grid_levels_above}]: ").strip()
+                    try:
+                        parsed_levels_below = (
+                            int(new_levels_below_raw)
+                            if new_levels_below_raw
+                            else grid_levels_below
+                        )
+                        parsed_levels_above = (
+                            int(new_levels_above_raw)
+                            if new_levels_above_raw
+                            else grid_levels_above
+                        )
+                        if parsed_levels_below < 0 or parsed_levels_above < 0:
+                            raise ValueError("los niveles no pueden ser negativos")
+                        total_lines = parsed_levels_below + parsed_levels_above
+                        if total_lines <= 0:
+                            raise ValueError("debe haber al menos un nivel")
+                        if max_lines is not None and total_lines > max_lines:
+                            raise ValueError(
+                                f"las líneas indicadas ({total_lines}) superan el máximo aproximado ({max_lines})"
+                            )
+                        grid_levels_below = parsed_levels_below
+                        grid_levels_above = parsed_levels_above
+                    except Exception as exc:
+                        log_event(f"Valor de niveles inválido: {exc}. Conservando el anterior.", "error")
 
                     while True:
                         new_step_percent = input_with_esc(f"Step percent por defecto [{fmt_amount(step_percent_default)}]: ")
