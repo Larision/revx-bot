@@ -387,7 +387,7 @@ def exportar_datos_candles():
     Los resultados se guardan como un archivo CSV.
     """
     print("\n=== Obtener y exportar histórico de candles ===")
-    print("\n=== Maximo intervalo permitido = 50000 candles (ej: 1 mes con 1 min) ===")
+    print("\n=== Se pagina hacia atras con until; se avisara si la API no cubre todo el rango ===")
 
     try:
         symbol = input_with_esc(f"Symbol [{SYMBOL}]: ").strip() or SYMBOL
@@ -398,6 +398,8 @@ def exportar_datos_candles():
             ).strip()
             try:
                 interval = int(interval)
+                if interval not in {1, 5, 15, 30, 60, 240, 1440, 2880, 5760, 10080, 20160, 40320}:
+                    raise ValueError
                 break
             except ValueError:
                 print("Intervalo inválido.")
@@ -427,36 +429,104 @@ def exportar_datos_candles():
 
         from api import get_candles
 
-        response, logs = get_candles(
-            symbol=symbol,
-            interval=interval,
-            since=since,
-            until=until
-        )
-        for l in logs:
-            log_event(f"[LOG] {l['msg']}", l.get("level", "info"))
+        all_rows: list[dict[str, Any]] = []
+        seen_starts: set[int] = set()
+        download_until = until
 
-        if not isinstance(response, dict) or response.get("error"):
-            print("Error obteniendo candles")
-            return
+        # La API devuelve hasta 5000 candles hacia atras desde `until` cuando
+        # `since` se omite. Paginamos asi porque `since` puede ser ignorado o
+        # recortado silenciosamente en rangos historicos.
+        while download_until >= since:
+            check_esc()
 
-        data = response.get("data", [])
-        if not data:
+            print(f"\n--- Descargando ventana candles ---")
+            print(f"Hasta: {datetime.fromtimestamp(download_until/1000)}")
+
+            response, logs = get_candles(
+                symbol=symbol,
+                interval=interval,
+                until=download_until
+            )
+            for l in logs:
+                log_event(f"[LOG] {l['msg']}", l.get("level", "info"))
+
+            if not isinstance(response, dict) or response.get("error"):
+                print("Error obteniendo candles")
+                return
+
+            data = response.get("data", [])
+            page_starts: list[int] = []
+            if isinstance(data, list):
+                for row in data:
+                    check_esc()
+
+                    if not isinstance(row, dict):
+                        continue
+                    raw_start = row.get("start")
+                    if raw_start is None:
+                        continue
+                    try:
+                        start = int(raw_start)
+                    except (TypeError, ValueError):
+                        continue
+
+                    page_starts.append(start)
+                    if start < since or start > until or start in seen_starts:
+                        continue
+
+                    seen_starts.add(start)
+                    all_rows.append(row)
+
+            if not page_starts:
+                break
+
+            earliest_start = min(page_starts)
+            latest_start = max(page_starts)
+            print(f"Rango recibido: {datetime.fromtimestamp(earliest_start/1000)} -> {datetime.fromtimestamp(latest_start/1000)}")
+
+            if earliest_start <= since:
+                break
+
+            next_until = earliest_start - 1
+            if next_until >= download_until:
+                break
+            download_until = next_until
+
+        if not all_rows:
             print("No hay datos.")
             return
 
         end_label = end_str if end_str else "now"
         filename = Path(f"candles-{symbol}-{interval}m-{start_str}_to_{end_label}.csv")
 
+        all_rows.sort(key=lambda r: int(r.get("start") or 0))
+        first_raw_start = all_rows[0].get("start")
+        if first_raw_start is None:
+            first_start = 0
+        else:
+            try:
+                first_start = int(first_raw_start)
+            except (TypeError, ValueError):
+                first_start = 0
+        if first_start > since:
+            print("\n[!] La API no devolvio candles desde la fecha solicitada.")
+            print(f"    Solicitado desde: {datetime.fromtimestamp(since/1000)}")
+            print(f"    Primer candle recibido: {datetime.fromtimestamp(first_start/1000)}")
+            print("    Para fechas anteriores, el endpoint de candles devuelve 0 datos en ese intervalo.")
+
         with filename.open("w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(["start", "datetime","open", "high", "low", "close", "volume"])
-            for c in data:
-                start = c.get("start")
-                try:
-                    dt = datetime.fromtimestamp(int(start)/1000).strftime("%Y-%m-%d %H:%M:%S")
-                except Exception:
+            for c in all_rows:
+                raw_start = c.get("start")
+                start = "" if raw_start is None else raw_start
+                if raw_start is None:
                     dt = ""
+                else:
+                    try:
+                        dt = datetime.fromtimestamp(int(raw_start)/1000).strftime("%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        dt = ""
 
                 writer.writerow([
                     start,
@@ -469,7 +539,7 @@ def exportar_datos_candles():
                 ])
 
         print(f"CSV generado: {filename}")
-        print(f"Candles exportados: {len(data)}")
+        print(f"Candles exportados: {len(all_rows)}")
 
     except InputCancelled:
         print("\nOperación cancelada.")

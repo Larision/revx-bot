@@ -467,9 +467,9 @@ def get_candles(
     """
     params = {"interval": interval}
 
-    if since:
+    if since is not None:
         params["since"] = since
-    if until:
+    if until is not None:
         params["until"] = until
 
     query = urlencode(params)
