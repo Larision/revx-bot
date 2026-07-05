@@ -22,6 +22,6 @@ DEFAULT_STEP_PERCENT: Decimal = Decimal("0.002")
 DEFAULT_TRAILING_UP: str = "extended"
 DEFAULT_TRAILING_DOWN: str = "on"
 TICK_SIZE: Decimal = Decimal("0.01")
-MIN_USDC_RESERVE: Decimal = Decimal("20")  # USDC mínimo reservado — no usar en trailing down extendido
+MIN_USDC_RESERVE: Decimal = Decimal("0")  # Reserva USDC predeterminada
 
 getcontext().prec = 28
