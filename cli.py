@@ -1380,7 +1380,7 @@ def show_grid_preview(
     missing_btc_cost = missing_btc * initial_price
     usdc_needed_now = required_usdc + missing_btc_cost
 
-    budget_ok = effective_budget >= total_required_value
+    budget_ok = effective_budget >= usdc_needed_now
     cash_ok = usdc_balance >= usdc_needed_now
     btc_ok = btc_balance >= required_btc
 
@@ -1404,7 +1404,7 @@ def show_grid_preview(
     if not budget_ok:
         _lp("  [!] Presupuesto asignado insuficiente para esta configuración.", "warning")
         _lp(f"      Asignado : {_fmt_usdc_value(effective_budget)} USDC", "warning")
-        _lp(f"      Necesario: {_fmt_usdc_value(total_required_value)} USDC", "warning")
+        _lp(f"      Necesario ahora: {_fmt_usdc_value(usdc_needed_now)} USDC", "warning")
         _lp("      Ajusta saldo asignado, líneas, size o step.", "warning")
         _lp("=" * 50)
         return False, initial_price
