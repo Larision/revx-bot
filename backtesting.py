@@ -277,14 +277,31 @@ class PaperGridEngine(GridEngine):
             if info is None:
                 return None
             snapshot = self._clone_order_info(info)
+            order_id = str(snapshot.get("order_id", ""))
+            side = str(snapshot["side"])
+            virtual_disabled = (
+                order_id == "virtual"
+                and (
+                    (side == "buy" and self._normalise_trailing_down_mode(self.trailing_down_mode) == "off")
+                    or (
+                        side == "sell"
+                        and self._normalise_trailing_up_mode(self.trailing_up_mode) == "off"
+                    )
+                )
+            )
             del self.active_orders[key]
+            if virtual_disabled:
+                self.extended_levels.pop(key, None)
+                self.levels = [
+                    level for level in self.levels
+                    if _price_key(level) != key
+                ]
+                return None
 
-        order_id = str(snapshot.get("order_id", ""))
         if order_id != "virtual":
             self._paper_order_index.pop(order_id, None)
             self._paper_order_snapshot.pop(order_id, None)
 
-        side = str(snapshot["side"])
         price = Decimal(str(snapshot["price"]))
         order_size = self._order_size(snapshot)
 
@@ -532,12 +549,22 @@ def _select_trade_fill_keys(
     high = max(previous_price, trade_price)
     snapshot = engine.get_runtime_snapshot()["active_orders"]
 
+    def _virtual_enabled(info: OrderInfo) -> bool:
+        if str(info.get("order_id")) != "virtual":
+            return True
+        side = str(info.get("side"))
+        if side == "buy":
+            return engine._normalise_trailing_down_mode(engine.trailing_down_mode) != "off"
+        if side == "sell":
+            return engine._normalise_trailing_up_mode(engine.trailing_up_mode) != "off"
+        return False
+
     if trade_price > previous_price:
         return sorted(
             [
                 key
                 for key, info in snapshot.items()
-                if info["side"] == "sell" and low < Decimal(key) <= high
+                if info["side"] == "sell" and _virtual_enabled(info) and low < Decimal(key) <= high
             ],
             key=Decimal,
         )
@@ -548,7 +575,7 @@ def _select_trade_fill_keys(
             [
                 key
                 for key, info in snapshot.items()
-                if info["side"] == "buy" and low <= Decimal(key) < high
+                if info["side"] == "buy" and _virtual_enabled(info) and low <= Decimal(key) < high
             ],
             key=Decimal,
             reverse=True,
@@ -1330,4 +1357,3 @@ def run_grid_backtest(
         last_price=last_price,
         output_path=output_path,
     )
-

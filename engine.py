@@ -1070,9 +1070,35 @@ class GridEngine(TrailingPolicyMixin):
 
             # Orden virtual (centinela de extremo de grid)
             if oid == "virtual":
+                v_side = str(info["side"])
+                virtual_disabled = (
+                    (v_side == "buy" and self._normalise_trailing_down_mode(self.trailing_down_mode) == "off")
+                    or (
+                        v_side == "sell"
+                        and self._normalise_trailing_up_mode(self.trailing_up_mode) == "off"
+                    )
+                )
+                if virtual_disabled:
+                    with self._state_lock:
+                        current = self.active_orders.get(key)
+                        if current is not None and current.get("order_id") == "virtual":
+                            del self.active_orders[key]
+                            self.extended_levels.pop(key, None)
+                            self.levels = [
+                                level for level in self.levels
+                                if _price_key(level) != key
+                            ]
+                            state_changed = True
+                    log_event(
+                        f"[DETECT_FILLS] Orden virtual {v_side} en {key} eliminada "
+                        "porque su trailing está desactivado",
+                        "info",
+                        logs,
+                    )
+                    continue
+
                 if current_price is not None:
                     v_price = info["price"]
-                    v_side = info["side"]
                     triggered = (
                         (v_side == "sell" and current_price >= v_price) or
                         (v_side == "buy" and current_price <= v_price)

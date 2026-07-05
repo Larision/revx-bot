@@ -766,11 +766,13 @@ class TrailingPolicyMixin:
                         ]
                         self.extended_levels.pop(cancel_level_key, None)
 
-                removed_floor_virtuals = self._replace_floor_virtual_after_cancel(
-                    canceled_price=cancel_price,
-                    size=cancel_size,
-                    metadata=self._metadata_for_virtual_from_cancelled_order(cancel_info),
-                )
+                removed_floor_virtuals: List[str] = []
+                if self._normalise_trailing_down_mode(self.trailing_down_mode) != "off":
+                    removed_floor_virtuals = self._replace_floor_virtual_after_cancel(
+                        canceled_price=cancel_price,
+                        size=cancel_size,
+                        metadata=self._metadata_for_virtual_from_cancelled_order(cancel_info),
+                    )
                 if removed_floor_virtuals:
                     log_event(
                         f"[ENGINE] Trailing up: virtuales BUY antiguas eliminadas "
