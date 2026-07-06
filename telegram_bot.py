@@ -80,6 +80,7 @@ from config import (
     STATE_PATH,
     SYMBOL,
     TICK_SIZE,
+    UPDATE_RECOVER_PATH,
 )
 from logger import log_event
 from trailing import (
@@ -1541,11 +1542,14 @@ async def cmd_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         thread = _get_engine_thread()
         if engine is not None:
             engine.save_state()
+            UPDATE_RECOVER_PATH.write_text("1", encoding="utf-8")
             engine.stop()
             if thread is not None:
                 thread.join(timeout=15)
             _state.engine = None
             _state.engine_thread = None
+        elif UPDATE_RECOVER_PATH.exists():
+            UPDATE_RECOVER_PATH.unlink()
 
         log_event(f"[TELEGRAM] Update aplicado {before_commit} -> {after_commit}. Reiniciando proceso en la misma consola.", "info")
         await message.reply_text(

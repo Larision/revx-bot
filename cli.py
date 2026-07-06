@@ -25,6 +25,7 @@ from config import (
     VERSION,
     WINDOW_MS,
     MIN_USDC_RESERVE,
+    UPDATE_RECOVER_PATH,
 )
 from logger import log_event, log_file
 from trailing import (
@@ -2309,6 +2310,52 @@ def run_cli() -> None:
 
     engine: Optional[GridEngine] = None
     engine_thread: Optional[threading.Thread] = None
+
+    def _start_recovered_engine_after_update() -> None:
+        nonlocal engine, engine_thread
+
+        if not UPDATE_RECOVER_PATH.exists():
+            return
+
+        try:
+            UPDATE_RECOVER_PATH.unlink()
+        except OSError as exc:
+            log_event(f"[UPDATE] No se pudo eliminar marcador de recuperación: {exc}", "warning")
+
+        if not STATE_PATH.exists():
+            log_event("[UPDATE] Marcador post-update detectado, pero no existe estado previo.", "warning")
+            return
+
+        log_event("[UPDATE] Recuperando engine tras update...", "info")
+        engine = GridEngine(
+            levels_below=grid_levels_below,
+            levels_above=grid_levels_above,
+            step_percent=step_percent_default,
+            base_size=base_size_default,
+            initial_price=None,
+            reserve_usdc=reserve_usdc_default,
+        )
+        try:
+            engine.initialize(recover_state=True)
+        except Exception as exc:
+            log_event(f"[UPDATE] No se pudo recuperar el engine tras update: {exc}", "error")
+            engine = None
+            return
+
+        engine_thread = threading.Thread(
+            target=engine.run,
+            daemon=True,
+            name="GridEngineThread"
+        )
+        engine_thread.start()
+
+        if tg_state is not None:
+            tg_state.engine = engine
+            tg_state.engine_thread = engine_thread
+
+        print("\n[UPDATE] Engine recuperado y arrancado tras update.")
+
+    _start_recovered_engine_after_update()
 
     while True:
         engine_running = engine_thread is not None and engine_thread.is_alive()

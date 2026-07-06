@@ -8,6 +8,7 @@ VERSION: str = "v1.3"
 LOG_PATH   = Path("gridbot_v1_3.log")  # fichero de log principal
 FILLS_PATH = Path("fills.csv")         # registro CSV de fills confirmados
 STATE_PATH = Path("grid_state.json")   # estado persistente del grid
+UPDATE_RECOVER_PATH = Path(".revx_update_recover")  # marcador temporal post-update
 
 BASE_URL: str = os.environ.get("REVX_BASE_URL", "https://revx.revolut.com")
 SYMBOL: str = "BTC-USDC"  # Cambiar aquí afecta todo el programa

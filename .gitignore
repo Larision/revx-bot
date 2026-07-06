@@ -217,6 +217,7 @@ __pycache__/
 *.xlsx
 start.sh
 grid_state.json
+.revx_update_recover
 resumen_resultados.txt
 tax_lots.json
 *.zip
