@@ -12,6 +12,7 @@ Comandos disponibles:
   /price     — precio actual aunque el engine no este activo
   /fill_empty — repuebla niveles vacios del grid activo
   /resize_to_default — redimensiona fixed_quote a base_size
+  /update    — actualiza desde git y reinicia via systemd (Linux)
   /analyze   — resumen de fills emparejados y beneficio estimado
   /taxstatus — resumen FIFO fiscal
   /taxlots   — lotes FIFO abiertos
@@ -40,6 +41,9 @@ Seguridad:
 
 import asyncio
 import logging
+import os
+import platform
+import subprocess
 import threading
 from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
@@ -206,6 +210,85 @@ def _engine_running() -> bool:
     engine = _get_engine()
     thread = _get_engine_thread()
     return engine is not None and thread is not None and thread.is_alive()
+
+
+def _is_windows() -> bool:
+    """Indica si el proceso corre en Windows."""
+    return platform.system().lower().startswith("win")
+
+
+def _run_git(args: list[str], *, timeout: int = 30) -> tuple[bool, str]:
+    """Ejecuta git de forma acotada y devuelve salida combinada."""
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=Path.cwd(),
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except Exception as exc:
+        return False, str(exc)
+
+    output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
+    return result.returncode == 0, output
+
+
+def _git_output(args: list[str], *, timeout: int = 10, default: str = "desconocido") -> str:
+    """Obtiene una salida simple de git para previews."""
+    ok, output = _run_git(args, timeout=timeout)
+    if not ok or not output:
+        return default
+    return output.splitlines()[0].strip() or default
+
+
+def _build_update_preview() -> tuple[bool, str]:
+    """Prepara el preview de /update y bloquea estados de git inseguros."""
+    if _is_windows():
+        return False, "❌ `/update` no está disponible en Windows. Está pensado para Linux con systemd."
+
+    ok, status = _run_git(["status", "--porcelain"], timeout=10)
+    if not ok:
+        return False, f"❌ No se pudo comprobar el estado de git:\n```{status}```"
+    if status.strip():
+        return False, (
+            "❌ No se puede actualizar: hay cambios locales sin commitear.\n"
+            "Haz commit/stash primero.\n\n"
+            f"```{status[:3000]}```"
+        )
+
+    ok, fetch_output = _run_git(["fetch", "--prune"], timeout=60)
+    if not ok:
+        return False, f"❌ `git fetch` falló:\n```{fetch_output[:3000]}```"
+
+    branch = _git_output(["branch", "--show-current"])
+    local_commit = _git_output(["rev-parse", "--short", "HEAD"])
+    upstream = _git_output(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+    remote_commit = _git_output(["rev-parse", "--short", "@{u}"])
+    ok, behind = _run_git(["rev-list", "--count", "HEAD..@{u}"], timeout=10)
+    behind_count = behind.strip() if ok and behind.strip().isdigit() else "?"
+
+    engine_text = "corriendo" if _engine_running() else "parado"
+    state_text = "existe" if STATE_PATH.exists() else "no existe"
+
+    lines = [
+        "🔄 *PREVIEW UPDATE*",
+        "",
+        f"Branch local : `{branch}`",
+        f"Upstream     : `{upstream}`",
+        f"Local        : `{local_commit}`",
+        f"Remoto       : `{remote_commit}`",
+        f"Commits pend.: `{behind_count}`",
+        f"Engine       : `{engine_text}`",
+        f"Estado       : `{state_text}`",
+        "",
+        "Se ejecutará `git pull --ff-only`.",
+        "Si hay cambios, se guardará estado, se detendrá el engine y el proceso saldrá para que systemd lo reinicie.",
+        "",
+        "Responde /confirm para actualizar o /abort para cancelar.",
+    ]
+    return True, "\n".join(lines)
 
 
 def _normalize_trailing_up_mode(value: object) -> str:
@@ -704,6 +787,7 @@ def _build_help_text() -> str:
         "`/cancel` — cancela una orden real por precio con confirmación",
         "`/fill_empty` - repuebla niveles vacios del grid activo",
         "`/resize_to_default` - redimensiona fixed_quote a base_size",
+        "`/update` - actualiza desde git y reinicia via systemd (Linux)",
         "`/confirm` — confirma una acción pendiente",
         "`/abort` — cancela una acción pendiente",
         "",
@@ -1253,6 +1337,24 @@ async def cmd_cancel_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    del context
+    if not _authorized(update):
+        return
+
+    message = _get_message(update)
+    if message is None:
+        return
+
+    ok, preview = _build_update_preview()
+    if not ok:
+        await message.reply_text(preview, parse_mode="Markdown")
+        return
+
+    _state.pending_confirm = ("update_bot", {})
+    await message.reply_text(preview, parse_mode="Markdown")
+
+
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return
@@ -1399,6 +1501,60 @@ async def cmd_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             cfg=cast(Optional[dict[str, Any]], kwargs.get("cfg")),
         )
         return
+
+    if action == "update_bot":
+        if _is_windows():
+            await message.reply_text("❌ `/update` no está disponible en Windows. Está pensado para Linux con systemd.", parse_mode="Markdown")
+            return
+
+        ok, status = _run_git(["status", "--porcelain"], timeout=10)
+        if not ok:
+            await message.reply_text(f"❌ No se pudo comprobar git:\n```{status}```", parse_mode="Markdown")
+            return
+        if status.strip():
+            await message.reply_text(
+                "❌ Update cancelado: hay cambios locales sin commitear.\n"
+                "Haz commit/stash primero.\n\n"
+                f"```{status[:3000]}```",
+                parse_mode="Markdown",
+            )
+            return
+
+        before_commit = _git_output(["rev-parse", "--short", "HEAD"])
+        await message.reply_text("Ejecutando `git pull --ff-only`...", parse_mode="Markdown")
+        ok, pull_output = _run_git(["pull", "--ff-only"], timeout=120)
+        if not ok:
+            await message.reply_text(f"❌ `git pull --ff-only` falló:\n```{pull_output[:3000]}```", parse_mode="Markdown")
+            return
+
+        after_commit = _git_output(["rev-parse", "--short", "HEAD"])
+        if before_commit == after_commit:
+            await message.reply_text(
+                "✅ Repositorio ya actualizado. No se reinicia el proceso.\n"
+                f"```{pull_output[:3000] or 'Already up to date.'}```",
+                parse_mode="Markdown",
+            )
+            return
+
+        engine = _get_engine()
+        thread = _get_engine_thread()
+        if engine is not None:
+            engine.save_state()
+            engine.stop()
+            if thread is not None:
+                thread.join(timeout=15)
+            _state.engine = None
+            _state.engine_thread = None
+
+        log_event(f"[TELEGRAM] Update aplicado {before_commit} -> {after_commit}. Saliendo para reinicio systemd.", "info")
+        await message.reply_text(
+            "✅ Update aplicado.\n"
+            f"`{before_commit}` -> `{after_commit}`\n"
+            "Saliendo del proceso para que systemd lo reinicie.",
+            parse_mode="Markdown",
+        )
+        await asyncio.sleep(1)
+        os._exit(0)
 
     if action == "stop":
         engine = _get_engine()
@@ -1956,6 +2112,7 @@ def start_telegram_bot() -> None:
         app.add_handler(CommandHandler("cancel", cmd_cancel))
         app.add_handler(CommandHandler("fill_empty", cmd_fill_empty))
         app.add_handler(CommandHandler("resize_to_default", cmd_resize_to_default))
+        app.add_handler(CommandHandler("update", cmd_update))
         app.add_handler(CommandHandler("confirm", cmd_confirm))
         app.add_handler(CommandHandler("abort", cmd_abort))
         app.add_handler(CommandHandler("analyze", cmd_analyze))
