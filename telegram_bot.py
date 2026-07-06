@@ -12,7 +12,7 @@ Comandos disponibles:
   /price     — precio actual aunque el engine no este activo
   /fill_empty — repuebla niveles vacios del grid activo
   /resize_to_default — redimensiona fixed_quote a base_size
-  /update    — actualiza desde git y reinicia via systemd (Linux)
+  /update    — actualiza desde git y reinicia en la misma consola (Linux)
   /analyze   — resumen de fills emparejados y beneficio estimado
   /taxstatus — resumen FIFO fiscal
   /taxlots   — lotes FIFO abiertos
@@ -44,6 +44,7 @@ import logging
 import os
 import platform
 import subprocess
+import sys
 import threading
 from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
@@ -246,7 +247,7 @@ def _git_output(args: list[str], *, timeout: int = 10, default: str = "desconoci
 def _build_update_preview() -> tuple[bool, str]:
     """Prepara el preview de /update y bloquea estados de git inseguros."""
     if _is_windows():
-        return False, "❌ `/update` no está disponible en Windows. Está pensado para Linux con systemd."
+        return False, "❌ `/update` no está disponible en Windows. Está pensado para Linux y reinicio en la misma consola."
 
     ok, status = _run_git(["status", "--porcelain"], timeout=10)
     if not ok:
@@ -284,7 +285,7 @@ def _build_update_preview() -> tuple[bool, str]:
         f"Estado       : `{state_text}`",
         "",
         "Se ejecutará `git pull --ff-only`.",
-        "Si hay cambios, se guardará estado, se detendrá el engine y el proceso saldrá para que systemd lo reinicie.",
+        "Si hay cambios, se guardará estado, se detendrá el engine y el proceso se relanzará en la misma consola.",
         "",
         "Responde /confirm para actualizar o /abort para cancelar.",
     ]
@@ -787,7 +788,7 @@ def _build_help_text() -> str:
         "`/cancel` — cancela una orden real por precio con confirmación",
         "`/fill_empty` - repuebla niveles vacios del grid activo",
         "`/resize_to_default` - redimensiona fixed_quote a base_size",
-        "`/update` - actualiza desde git y reinicia via systemd (Linux)",
+        "`/update` - actualiza desde git y reinicia en la misma consola (Linux)",
         "`/confirm` — confirma una acción pendiente",
         "`/abort` — cancela una acción pendiente",
         "",
@@ -1504,7 +1505,7 @@ async def cmd_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if action == "update_bot":
         if _is_windows():
-            await message.reply_text("❌ `/update` no está disponible en Windows. Está pensado para Linux con systemd.", parse_mode="Markdown")
+            await message.reply_text("❌ `/update` no está disponible en Windows. Está pensado para Linux y reinicio en la misma consola.", parse_mode="Markdown")
             return
 
         ok, status = _run_git(["status", "--porcelain"], timeout=10)
@@ -1546,15 +1547,15 @@ async def cmd_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             _state.engine = None
             _state.engine_thread = None
 
-        log_event(f"[TELEGRAM] Update aplicado {before_commit} -> {after_commit}. Saliendo para reinicio systemd.", "info")
+        log_event(f"[TELEGRAM] Update aplicado {before_commit} -> {after_commit}. Reiniciando proceso en la misma consola.", "info")
         await message.reply_text(
             "✅ Update aplicado.\n"
             f"`{before_commit}` -> `{after_commit}`\n"
-            "Saliendo del proceso para que systemd lo reinicie.",
+            "Reiniciando el proceso en la misma consola.",
             parse_mode="Markdown",
         )
         await asyncio.sleep(1)
-        os._exit(0)
+        os.execv(sys.executable, [sys.executable, *sys.argv])
 
     if action == "stop":
         engine = _get_engine()
