@@ -3,9 +3,9 @@ from decimal import Decimal, getcontext
 from pathlib import Path
 
 
-VERSION: str = "v1.3"
+VERSION: str = "v1.4"
 
-LOG_PATH   = Path("gridbot_v1_3.log")  # fichero de log principal
+LOG_PATH   = Path("gridbot_v1_4.log")  # fichero de log principal
 FILLS_PATH = Path("fills.csv")         # registro CSV de fills confirmados
 STATE_PATH = Path("grid_state.json")   # estado persistente del grid
 UPDATE_RECOVER_PATH = Path(".revx_update_recover")  # marcador temporal post-update

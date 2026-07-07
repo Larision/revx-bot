@@ -282,7 +282,7 @@ class PaperGridEngine(GridEngine):
             virtual_disabled = (
                 order_id == "virtual"
                 and (
-                    (side == "buy" and self._normalise_trailing_down_mode(self.trailing_down_mode) == "off")
+                    (side == "buy" and self._normalise_trailing_down_mode(self.trailing_down_mode) != "extended")
                     or (
                         side == "sell"
                         and self._normalise_trailing_up_mode(self.trailing_up_mode) == "off"
@@ -554,7 +554,7 @@ def _select_trade_fill_keys(
             return True
         side = str(info.get("side"))
         if side == "buy":
-            return engine._normalise_trailing_down_mode(engine.trailing_down_mode) != "off"
+            return engine._normalise_trailing_down_mode(engine.trailing_down_mode) == "extended"
         if side == "sell":
             return engine._normalise_trailing_up_mode(engine.trailing_up_mode) != "off"
         return False

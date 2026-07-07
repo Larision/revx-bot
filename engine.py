@@ -69,10 +69,10 @@ class GridEngine(TrailingPolicyMixin):
                 central del grid. Cada BUY creado por trailing up usa
                 size = quote_fijo / precio_buy, y el SELL posterior mantiene ese size.
         - trailing down
-            - on: al ejecutar el ultimo BUY, se añade un BUY virtual debajo.
-                Al ejecutarse ese BUY virtual, se crea la orden SELL real correspondiente y
-                se recrea otro BUY virtual debajo.
-                Se cancelan ordenes SELL reales altos para liberar BTC si es necesario.
+            - on: al ejecutar el ultimo BUY, se añade un BUY real debajo con
+                un size 5% menor que la ultima linea ejecutada, mientras haya
+                USDC disponible. Si no hay saldo, no se extiende por abajo y
+                el bot espera a que el precio remonte con el SELL de rebalance.
             - extended: igual pero los BUY virtuales añadidos por el trailing down 
                 tienen la mitad del tamaño base para reducir el riesgo de sobreextensión.
                 Se cancelan ordenes SELL reales altos para liberar BTC si es necesario.
@@ -1091,7 +1091,7 @@ class GridEngine(TrailingPolicyMixin):
             if oid == "virtual":
                 v_side = str(info["side"])
                 virtual_disabled = (
-                    (v_side == "buy" and self._normalise_trailing_down_mode(self.trailing_down_mode) == "off")
+                    (v_side == "buy" and self._normalise_trailing_down_mode(self.trailing_down_mode) != "extended")
                     or (
                         v_side == "sell"
                         and self._normalise_trailing_up_mode(self.trailing_up_mode) == "off"
@@ -1110,7 +1110,7 @@ class GridEngine(TrailingPolicyMixin):
                             state_changed = True
                     log_event(
                         f"[DETECT_FILLS] Orden virtual {v_side} en {key} eliminada "
-                        "porque su trailing está desactivado",
+                        "porque su modo trailing no admite esa virtual",
                         "info",
                         logs,
                     )
@@ -1270,6 +1270,7 @@ class GridEngine(TrailingPolicyMixin):
         price: Decimal = Decimal(str(info["price"])).quantize(TICK_SIZE, rounding=ROUND_DOWN)
         order_size = self._order_size(info)
         order_id = str(info.get("order_id", ""))
+        trailing_down_on_factor = Decimal("0.95")
 
         cancel_order_id: Optional[str] = None
         cancel_level_key: Optional[str] = None
@@ -1298,7 +1299,6 @@ class GridEngine(TrailingPolicyMixin):
             lowest = min(levels_snapshot)
             highest = max(levels_snapshot)
             lowest_principal = min(principal_levels)
-            max_levels = self.levels_below + self.levels_above + 2
 
             filled_key = _price_key(price)
             is_virtual = order_id == "virtual"
@@ -1400,7 +1400,6 @@ class GridEngine(TrailingPolicyMixin):
                         )
                     elif self.trailing_down_mode == "on":
                         next_buy_price = (price - grid_step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
-                        self._mark_extended_level_locked(next_buy_price, grid_step)
 
                         orders_to_place.append((
                             upper_sell_price,
@@ -1417,28 +1416,32 @@ class GridEngine(TrailingPolicyMixin):
                             trailing_down_sell_release_keys.add(_price_key(upper_sell_price))
 
                         next_buy_key = _price_key(next_buy_price)
-                        if next_buy_key not in self.active_orders:
-                            virtual_info = cast(OrderInfo, {
-                                "side": "buy",
-                                "order_id": "virtual",
-                                "price": next_buy_price,
-                                "size": order_size,
-                                "placed_at": time.time(),
-                            })
-                            virtual_orders_to_add.append((
-                                next_buy_key,
-                                self._apply_order_metadata(virtual_info, {
-                                    "extended": True,
-                                    "grid_step": grid_step,
-                                    "paired_sell_price": price,
-                                }),
-                            ))
+                        next_buy_size = order_size * trailing_down_on_factor
+                        required_usdc = next_buy_price * next_buy_size
+                        available_usdc = self._get_available_usdc()
+                        if next_buy_key in self.active_orders:
+                            trailing_logs.append(
+                                f"[ENGINE] Trailing down normal: BUY real {next_buy_key} ya existe; "
+                                "no se duplica"
+                            )
+                        elif available_usdc >= required_usdc:
+                            if next_buy_price not in self.levels:
+                                self.levels.append(next_buy_price)
+                            orders_to_place.append((next_buy_price, "buy", next_buy_size, None))
+                            trailing_logs.append(
+                                f"[ENGINE] Trailing down normal: BUY {filled_key} confirmado; "
+                                f"SELL {_price_key(upper_sell_price)} size {fmt_amount(order_size)}; "
+                                f"nueva BUY real {next_buy_key} size {fmt_amount(next_buy_size)} "
+                                "(95% de la ultima linea)"
+                            )
+                        else:
+                            trailing_logs.append(
+                                f"[ENGINE] Trailing down normal: USDC insuficiente para BUY real "
+                                f"{next_buy_key} size {fmt_amount(next_buy_size)} "
+                                f"({_price_key(available_usdc)} disponible < {_price_key(required_usdc)}); "
+                                "se espera remonte"
+                            )
 
-                        trailing_logs.append(
-                            f"[ENGINE] Trailing down normal: virtual BUY {filled_key} confirmado; "
-                            f"SELL {_price_key(upper_sell_price)} size {fmt_amount(order_size)}; "
-                            f"nueva virtual BUY {next_buy_key}"
-                        )
                     else:
                         trailing_logs.append(
                             f"[ENGINE] Virtual extended BUY {filled_key} activada, pero "
@@ -1473,7 +1476,7 @@ class GridEngine(TrailingPolicyMixin):
             # debajo y el grid puede quedarse sin cobertura al caer el precio.
             # --------------------------------------------------
             is_recorded_floor_buy = price == lowest_principal
-            is_virtual_floor_buy = is_virtual and self.trailing_down_mode != "off"
+            is_virtual_floor_buy = is_virtual and self.trailing_down_mode == "extended"
 
             trailing_up_mode_for_ceiling = self._normalise_trailing_up_mode(
                 getattr(self, "trailing_up_mode", self.trailing_up_enabled)
@@ -1531,37 +1534,34 @@ class GridEngine(TrailingPolicyMixin):
 
                 elif self.trailing_down_mode == "on":
                     trail_down_price = next_buy_price
-                    self.levels.append(trail_down_price)
-                    if len(self.levels) > max_levels:
-                        self.levels.remove(highest)
-                        highest_key = _price_key(highest)
-                        removed = self.active_orders.pop(highest_key, None)
-                        if removed is not None and removed["order_id"] not in {"virtual", "pending_post_only", "pending_manual", "pending_cancel", "pending_replace"}:
-                            cancel_order_id = str(removed["order_id"])
-                            cancel_level_key = highest_key
-                            cancel_level_info = self._clone_order_info(removed)
-                            remove_ceiling_virtual_after_cancel = True
-
                     trail_down_key = _price_key(trail_down_price)
-                    if trail_down_key not in self.active_orders:
-                        virtual_orders_to_add.append((
-                            trail_down_key,
-                            cast(OrderInfo, {
-                                "side": "buy",
-                                "order_id": "virtual",
-                                "price": trail_down_price,
-                                "size": order_size,
-                                "placed_at": time.time(),
-                            }),
-                        ))
                     orders_to_place.append((next_sell_price, "sell", order_size, None))
+                    trail_down_size = order_size * trailing_down_on_factor
+                    required_usdc = trail_down_price * trail_down_size
+                    available_usdc = self._get_available_usdc()
+
+                    if trail_down_key in self.active_orders:
+                        trailing_logs.append(
+                            f"[ENGINE] Trailing down: BUY real {trail_down_key} ya existe; no se duplica"
+                        )
+                    elif available_usdc >= required_usdc:
+                        self.levels.append(trail_down_price)
+                        orders_to_place.append((trail_down_price, "buy", trail_down_size, None))
+                        trailing_logs.append(
+                            f"[ENGINE] Rebalance trailing down: grid extendido a {trail_down_key}; "
+                            f"BUY real size {fmt_amount(trail_down_size)} "
+                            "(95% de la ultima linea)"
+                        )
+                    else:
+                        trailing_logs.append(
+                            f"[ENGINE] Trailing down: USDC insuficiente para extender a {trail_down_key} "
+                            f"con BUY real size {fmt_amount(trail_down_size)} "
+                            f"({_price_key(available_usdc)} disponible < {_price_key(required_usdc)}); "
+                            "se espera remonte"
+                        )
 
                     if is_virtual:
                         trailing_down_sell_release_keys.add(_price_key(next_sell_price))
-                        
-                    trailing_logs.append(
-                        f"[ENGINE] Rebalance trailing down: grid extendido a {_price_key(trail_down_price)}"
-                    )
                 else:
                     orders_to_place.append((next_sell_price, "sell", order_size, None))
                     trailing_logs.append("[ENGINE] Trailing down desactivado: se mantiene el grid sin extenderse")

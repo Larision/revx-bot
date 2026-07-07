@@ -1315,8 +1315,8 @@ def show_grid_preview(
     _lp(f"  Total órdenes    : {levels_below + levels_above}")
     _lp(f"  Tamaño base      : {fmt_amount(base_size)} BTC por orden")
     _lp(f"  Step percent     : {fmt_amount(step_percent * 100)}%  entre niveles")
-    _lp(f"  Trailing up      : {trailing_up.upper()}")
-    _lp(f"  Trailing down    : {trailing_down.upper()}")
+    _lp(f"  Trailing up      : {trailing_up_mode_label(trailing_up)}")
+    _lp(f"  Trailing down    : {trailing_down_mode_label(trailing_down)}")
 
     initial_price = choose_initial_grid_price()
     if initial_price is None:
@@ -2035,7 +2035,7 @@ def _trailing_menu(engine: "GridEngine") -> None:
     Los cambios se pueden aplicar inmediatamente o descartar.
     """
     def _normalize_up_mode(value: object) -> str:
-        """Normaliza el modo de trailing up a 'off', 'on' o 'extended'."""
+        """Normaliza el modo de trailing up."""
         return normalize_trailing_up_mode(value)
 
     def _normalize_down_mode(value: object) -> str:
@@ -2864,7 +2864,10 @@ def run_cli() -> None:
                     elif new_trailing_up:
                         log_event("Valor de trailing up inválido (debe ser off, on, extended o fixed_quote), conservando el anterior.", "error")
 
-                    new_trailing_down = input_with_esc(f"Trailing down (off/on/extended) [{trailing_down_default}]: ").strip().lower()
+                    new_trailing_down = input_with_esc(
+                        f"Trailing down (off/on/extended) [{trailing_down_default}] "
+                        "(on=BUY real -5%, extended=BUY virtual): "
+                    ).strip().lower()
                     if new_trailing_down and new_trailing_down in ("off", "on", "extended"):
                         trailing_down_default = new_trailing_down
                     elif new_trailing_down:

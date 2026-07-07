@@ -113,7 +113,11 @@ def trailing_mode_label(mode: str) -> str:
 
 def trailing_down_mode_label(mode: str) -> str:
     """Devuelve la etiqueta visible para un modo normalizado de trailing down."""
-    return trailing_mode_label(mode)
+    return {
+        "off": "OFF",
+        "on": "ON (BUY REAL -5%)",
+        "extended": "EXTENDIDO (BUY VIRTUAL)",
+    }.get(mode, mode.upper())
 
 
 def trailing_up_mode_label(mode: str) -> str:
@@ -766,7 +770,7 @@ class TrailingPolicyMixin:
                         self.extended_levels.pop(cancel_level_key, None)
 
                 removed_floor_virtuals: List[str] = []
-                if self._normalise_trailing_down_mode(self.trailing_down_mode) != "off":
+                if self._normalise_trailing_down_mode(self.trailing_down_mode) == "extended":
                     removed_floor_virtuals = self._replace_floor_virtual_after_cancel(
                         canceled_price=cancel_price,
                         size=cancel_size,
@@ -1323,7 +1327,7 @@ class TrailingPolicyMixin:
                 if up_mode == "off" and side == "sell":
                     keys_to_remove.add(key)
                     removed_virtuals.append(f"SELL {key}")
-                elif down_mode == "off" and side == "buy":
+                elif down_mode != "extended" and side == "buy":
                     keys_to_remove.add(key)
                     removed_virtuals.append(f"BUY {key}")
 
@@ -1344,7 +1348,7 @@ class TrailingPolicyMixin:
         )
         if removed_virtuals:
             log_event(
-                "[ENGINE] Virtuales eliminadas por trailing OFF: "
+                "[ENGINE] Virtuales eliminadas por modo trailing: "
                 + ", ".join(sorted(removed_virtuals)),
                 "info",
             )

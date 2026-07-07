@@ -62,7 +62,7 @@ fmt_console = ShortColorFormatter("%(asctime)s [%(levelname)s] %(message)s")
 #  Logger principal: consola + fichero
 # ============================
 
-logger = logging.getLogger("grid_engine_v1.3")
+logger = logging.getLogger("grid_engine_v1.4")
 logger.setLevel(logging.INFO)
 
 # Consola (con colores)
@@ -80,7 +80,7 @@ logger.addHandler(fh)
 #  Logger solo-fichero
 # ============================
 
-file_logger = logging.getLogger("grid_engine_v1.3.file")
+file_logger = logging.getLogger("grid_engine_v1.4.file")
 file_logger.setLevel(logging.INFO)
 file_logger.addHandler(fh)
 file_logger.propagate = False
