@@ -1961,6 +1961,16 @@ class GridEngine(TrailingPolicyMixin):
                         "paired_sell_price": paired_sell_price,
                     }
 
+                # Re-check bajo lock antes de intentar crear la orden para evitar
+                # condiciones de carrera con órdenes latentes u otras actualizaciones
+                with self._state_lock:
+                    if key in self.active_orders:
+                        log_event(
+                            f"[ENGINE] Nivel {key} ya tiene orden tras recheck — omitiendo repoblado",
+                            "info",
+                        )
+                        continue
+
                 log_event(
                     f"[ENGINE] Nivel vacío detectado, colocando BUY en {key} "
                     f"(size {fmt_amount(order_size)})"
@@ -1989,6 +1999,16 @@ class GridEngine(TrailingPolicyMixin):
                     f"[ENGINE] Nivel vacío detectado, colocando SELL en {key} "
                     f"(size {fmt_amount(order_size)})"
                 )
+                # Re-check bajo lock antes de intentar crear la orden para evitar
+                # condiciones de carrera con órdenes latentes u otras actualizaciones
+                with self._state_lock:
+                    if key in self.active_orders:
+                        log_event(
+                            f"[ENGINE] Nivel {key} ya tiene orden tras recheck — omitiendo repoblado",
+                            "info",
+                        )
+                        continue
+
                 self._place_order_safe(level, "sell", order_size, metadata=metadata)
 
     # ----------------------------------------------------------
