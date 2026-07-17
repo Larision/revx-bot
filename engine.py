@@ -480,6 +480,7 @@ class GridEngine(TrailingPolicyMixin):
         self,
         key: str,
         expected_order_id: Optional[str] = None,
+        remove_level: bool = False,
     ) -> Tuple[bool, List[LogEntry], Optional[str]]:
         info = self.get_order_info(key)
         if info is None:
@@ -501,6 +502,12 @@ class GridEngine(TrailingPolicyMixin):
             current = self.active_orders.get(key)
             if current is not None and current["order_id"] == order_id:
                 del self.active_orders[key]
+                if remove_level:
+                    self.levels = [
+                        level for level in self.levels
+                        if _price_key(level) != key
+                    ]
+                    self.extended_levels.pop(key, None)
                 removed = True
 
         if removed:
