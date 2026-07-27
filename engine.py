@@ -490,8 +490,36 @@ class GridEngine(TrailingPolicyMixin):
         if expected_order_id is not None and order_id != expected_order_id:
             return False, [], f"La orden en {key} cambió antes de confirmar la cancelación."
 
-        if order_id in {"virtual", "pending_post_only", "pending_manual", "pending_cancel", "pending_replace"}:
-            return False, [], f"La orden en {key} no existe todavía en el exchange."
+        if order_id == "virtual":
+            return False, [], f"La orden en {key} es virtual y no existe en el exchange."
+
+        if order_id == "pending_post_only":
+            removed = False
+            with self._state_lock:
+                current = self.active_orders.get(key)
+                if current is not None and current["order_id"] == order_id:
+                    del self.active_orders[key]
+                    if remove_level:
+                        self.levels = [
+                            level for level in self.levels
+                            if _price_key(level) != key
+                        ]
+                        self.extended_levels.pop(key, None)
+                    removed = True
+
+            if not removed:
+                return False, [], f"La orden en {key} cambió antes de cancelar la pendiente."
+
+            self.save_state()
+            return True, [
+                {
+                    "level": "info",
+                    "msg": f"Orden pendiente {str(info['side']).upper()} en {key} eliminada del estado local.",
+                }
+            ], None
+
+        if order_id in {"pending_manual", "pending_cancel", "pending_replace"}:
+            return False, [], f"La orden en {key} tiene una operación pendiente ({order_id})."
 
         response, logs = self.cancel_order(order_id)
         if isinstance(response, dict) and response.get("error"):

@@ -1818,11 +1818,19 @@ def _cancel_order_by_price(engine: "GridEngine") -> None:
     order_id = str(info["order_id"])
     side = str(info["side"]).upper()
 
-    if order_id in {"virtual", "pending_post_only", "pending_manual", "pending_cancel", "pending_replace"}:
+    if order_id == "virtual":
         print(f"  [!] La orden en {target_key} no se puede cancelar desde aquí ({order_id}).")
         return
+    if order_id in {"pending_manual", "pending_cancel", "pending_replace"}:
+        print(f"  [!] La orden en {target_key} tiene una operación pendiente ({order_id}).")
+        return
 
-    confirm = input(f"  ¿Cancelar {side} en {target_key} ({order_id})? (s/n): ").strip().lower()
+    if order_id == "pending_post_only":
+        confirm_msg = f"  ¿Eliminar orden pendiente {side} en {target_key} del estado local? (s/n): "
+    else:
+        confirm_msg = f"  ¿Cancelar {side} en {target_key} ({order_id})? (s/n): "
+
+    confirm = input(confirm_msg).strip().lower()
     if not confirm.startswith("s"):
         print("  Abortado.")
         return

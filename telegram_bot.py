@@ -786,7 +786,7 @@ def _build_help_text() -> str:
         "`/stop cancel_orders` - detiene el engine y cancela todas las ordenes",
         "`/cancel_all` - cancela todas las ordenes si el engine esta parado",
         "`/add_order` — añade una orden manual guiada por pasos",
-        "`/cancel` — cancela una orden real por precio con confirmación",
+        "`/cancel` — cancela una orden por precio con confirmación",
         "`/fill_empty` - repuebla niveles vacios del grid activo",
         "`/resize_to_default` - redimensiona fixed_quote a base_size",
         "`/update` - actualiza desde git y reinicia en la misma consola (Linux)",
@@ -1425,19 +1425,20 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     active_orders = eng.get_runtime_snapshot()["active_orders"]
-    real_orders = {
+    cancelable_orders = {
         key: info
         for key, info in active_orders.items()
-        if str(info["order_id"]) not in {"virtual", "pending_post_only", "pending_manual"}
+        if str(info["order_id"]) not in {"virtual", "pending_manual", "pending_cancel", "pending_replace"}
     }
 
-    if not real_orders:
+    if not cancelable_orders:
         await message.reply_text("No hay órdenes activas para cancelar.")
         return
 
     lines = ["📋 *Órdenes activas* — responde con el precio a cancelar:\n```"]
-    for key, info in sorted(real_orders.items(), key=lambda item: Decimal(item[0]), reverse=True):
-        lines.append(f"{key:>12}  {str(info['side']).upper()}")
+    for key, info in sorted(cancelable_orders.items(), key=lambda item: Decimal(item[0]), reverse=True):
+        tag = " [P]" if str(info["order_id"]) == "pending_post_only" else ""
+        lines.append(f"{key:>12}  {str(info['side']).upper()}{tag}")
     lines.append("```")
     await message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -2060,8 +2061,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 _state.pending_confirm = None
                 return
 
-            if str(info["order_id"]) in {"virtual", "pending_post_only", "pending_manual"}:
+            order_id = str(info["order_id"])
+            if order_id == "virtual":
                 await message.reply_text("Esa orden no se puede cancelar desde aquí.")
+                _state.pending_confirm = None
+                return
+            if order_id in {"pending_manual", "pending_cancel", "pending_replace"}:
+                await message.reply_text(f"Esa orden tiene una operación pendiente ({order_id}).")
                 _state.pending_confirm = None
                 return
 
@@ -2069,8 +2075,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 "cancel_order",
                 {"key": target_key, "order_id": info["order_id"]},
             )
+            action_label = "Eliminar orden pendiente" if order_id == "pending_post_only" else "Cancelar orden"
             await message.reply_text(
-                f"¿Cancelar orden {str(info['side']).upper()} en `{target_key}`?\n"
+                f"¿{action_label} {str(info['side']).upper()} en `{target_key}`?\n"
                 f"Responde /confirm o /abort",
                 parse_mode="Markdown",
             )
