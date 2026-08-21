@@ -1838,7 +1838,6 @@ def _cancel_order_by_price(engine: "GridEngine") -> None:
     ok, logs, error_msg = engine.cancel_order_by_key(
         target_key,
         expected_order_id=order_id,
-        remove_level=True,
     )
     for entry in logs:
         log_event(f"[CANCEL] {entry['msg']}", entry["level"])
@@ -1847,7 +1846,7 @@ def _cancel_order_by_price(engine: "GridEngine") -> None:
         print(f"  [!] {error_msg or 'No se pudo cancelar la orden.'}")
         return
 
-    print(f"  ✓ Orden cancelada y nivel eliminado del grid en {target_key}.")
+    print(f"  ✓ Orden cancelada; el nivel {target_key} queda vacío en el grid.")
 
 
 def _fill_empty_levels(engine: "GridEngine") -> None:

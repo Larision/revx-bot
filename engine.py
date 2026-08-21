@@ -472,6 +472,9 @@ class GridEngine(TrailingPolicyMixin):
                 "size": size,
                 "placed_at": time.time(),
             }
+            if key not in {_price_key(level) for level in self.levels}:
+                self.levels.append(Decimal(key))
+                self.levels = sorted(set(self.levels))
 
         self.save_state()
         return order_id, logs, None
