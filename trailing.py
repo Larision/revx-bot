@@ -238,6 +238,12 @@ class TrailingPolicyMixin:
         capped = min(calculated, self.base_size)
         return capped.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
 
+    def _refresh_trailing_up_fixed_quote_after_resize_locked(self) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+        """Recalcula el ancla fixed_quote tras devolver ordenes a base_size."""
+        previous_anchor = self._trailing_up_fixed_quote_anchor_locked()
+        new_anchor = self._lock_trailing_up_fixed_quote_anchor_locked()
+        return previous_anchor, new_anchor
+
     def _trailing_up_anchor_high_locked(self) -> Optional[Decimal]:
         """Techo original del grid principal, usado como ancla del trailing up."""
         if self.center_price is None:
@@ -1122,6 +1128,9 @@ class TrailingPolicyMixin:
             "available_btc": Decimal("0"),
             "required_usdc": Decimal("0"),
             "available_usdc": Decimal("0"),
+            "previous_anchor": None,
+            "new_anchor": None,
+            "new_fixed_quote": Decimal("0"),
         }
 
         with self._state_lock:
@@ -1266,6 +1275,20 @@ class TrailingPolicyMixin:
 
         changed = bool(summary["resized_real"] or summary["updated_state_only"])
         if changed:
+            with self._state_lock:
+                previous_anchor, new_anchor = self._refresh_trailing_up_fixed_quote_after_resize_locked()
+                summary["previous_anchor"] = previous_anchor
+                summary["new_anchor"] = new_anchor
+                summary["new_fixed_quote"] = self._trailing_up_fixed_quote_locked()
+
+            if previous_anchor != new_anchor:
+                log_event(
+                    "[ENGINE] Resize fixed_quote: ancla recalculada "
+                    f"{_price_key(previous_anchor) if previous_anchor is not None else 'N/A'} -> "
+                    f"{_price_key(new_anchor) if new_anchor is not None else 'N/A'}; "
+                    f"quote {_price_key(cast(Decimal, summary['new_fixed_quote']))}",
+                    "info",
+                )
             self.save_state()
 
         failed = cast(List[str], summary["failed"])
