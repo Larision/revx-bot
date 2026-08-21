@@ -2720,12 +2720,12 @@ def run_cli() -> None:
                         print("USDC disponible actual: no disponible")
                         print("BTC disponible actual : no disponible")
 
-                    total_usdc_default = bot_usdc_budget_default + reserve_usdc_default
-                    total_usdc_text = (
-                        _fmt_usdc_value(total_usdc_default)
-                        if total_usdc_default > 0
-                        else "0"
+                    total_usdc_default = (
+                        available_usdc
+                        if balances_ok
+                        else bot_usdc_budget_default + reserve_usdc_default
                     )
+                    total_usdc_text = _fmt_usdc_value(total_usdc_default)
                     new_total_usdc = input_with_esc(
                         f"Saldo USDC total que quieres emplear [{total_usdc_text}] "
                         "(max/todo = disponible): "
