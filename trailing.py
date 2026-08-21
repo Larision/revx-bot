@@ -1016,13 +1016,6 @@ class TrailingPolicyMixin:
                 except Exception:
                     continue
 
-            # En fixed_quote, cualquier orden por encima del ancla puede quedar
-            # por debajo del base_size: tanto SELLs superiores como BUYs pareja
-            # creados durante el trailing up. Los niveles en/ancla o por debajo
-            # ya deben estar capados a base_size y no se tocan.
-            if price <= anchor:
-                continue
-
             current_size = self._order_size(info)
             if current_size >= default_size:
                 continue

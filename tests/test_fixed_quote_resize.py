@@ -45,6 +45,34 @@ from engine import GridEngine
 
 
 class FixedQuoteResizeTests(unittest.TestCase):
+    def test_virtual_sell_requires_two_price_confirmations(self) -> None:
+        engine = GridEngine(
+            levels_below=1,
+            levels_above=1,
+            step_percent=Decimal("0.10"),
+            base_size=Decimal("0.01"),
+            initial_price=Decimal("100"),
+        )
+
+        with engine._state_lock:
+            engine.trailing_up_mode = "fixed_quote"
+            engine.trailing_up_enabled = True
+            engine.active_orders = {
+                "110": {
+                    "side": "sell",
+                    "order_id": "virtual",
+                    "price": Decimal("110"),
+                    "placed_at": 1.0,
+                    "size": Decimal("0.009"),
+                },
+            }
+
+        first_filled, _first_logs = engine.detect_fills(Decimal("111"))
+        second_filled, _second_logs = engine.detect_fills(Decimal("111"))
+
+        self.assertEqual(first_filled, [])
+        self.assertEqual(second_filled, ["110"])
+
     def test_resize_to_default_refreshes_fixed_quote_anchor_for_future_sizes(self) -> None:
         engine = GridEngine(
             levels_below=2,
@@ -97,6 +125,50 @@ class FixedQuoteResizeTests(unittest.TestCase):
 
         self.assertEqual(old_next_size, Decimal("0.00666666"))
         self.assertEqual(new_next_size, Decimal("0.00733333"))
+
+    def test_resize_preview_includes_under_anchor_fixed_quote_orders(self) -> None:
+        engine = GridEngine(
+            levels_below=2,
+            levels_above=2,
+            step_percent=Decimal("0.10"),
+            base_size=Decimal("0.01"),
+            initial_price=Decimal("100"),
+        )
+
+        with engine._state_lock:
+            engine.trailing_up_mode = "fixed_quote"
+            engine.trailing_up_enabled = True
+            engine._trailing_up_fixed_quote_anchor = Decimal("100")
+            engine.active_orders = {
+                "90": {
+                    "side": "buy",
+                    "order_id": "buy-under-anchor",
+                    "price": Decimal("90"),
+                    "placed_at": 1.0,
+                    "size": Decimal("0.009"),
+                },
+                "110": {
+                    "side": "sell",
+                    "order_id": "sell-over-anchor",
+                    "price": Decimal("110"),
+                    "placed_at": 1.0,
+                    "size": Decimal("0.009"),
+                },
+                "120": {
+                    "side": "sell",
+                    "order_id": "already-default",
+                    "price": Decimal("120"),
+                    "placed_at": 1.0,
+                    "size": Decimal("0.01"),
+                },
+            }
+
+        preview = engine.preview_resize_trailing_up_fixed_quote_to_default()
+        real_order_ids = {row["order_id"] for row in preview["real_orders"]}
+
+        self.assertEqual(real_order_ids, {"buy-under-anchor", "sell-over-anchor"})
+        self.assertEqual(preview["required_usdc"], Decimal("0.09"))
+        self.assertEqual(preview["required_btc"], Decimal("0.001"))
 
 
 if __name__ == "__main__":

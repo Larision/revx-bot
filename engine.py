@@ -115,6 +115,7 @@ class GridEngine(TrailingPolicyMixin):
         self.last_fill_side: Optional[str]   = None  # "buy" o "sell"
         self.last_fill_price: Optional[Decimal] = None  # último nivel ejecutado
         self.current_price: Optional[Decimal] = None  # último precio conocido
+        self._virtual_trigger_counts: Dict[str, int] = {}
 
         # Historial de fills en memoria para el submenú de monitorización
         # Cada entrada: {"side": str, "price": str, "order_id": str, "ts": float}
@@ -1168,6 +1169,7 @@ class GridEngine(TrailingPolicyMixin):
                 )
                 if virtual_disabled:
                     with self._state_lock:
+                        self._virtual_trigger_counts.pop(key, None)
                         current = self.active_orders.get(key)
                         if current is not None and current.get("order_id") == "virtual":
                             del self.active_orders[key]
@@ -1192,12 +1194,27 @@ class GridEngine(TrailingPolicyMixin):
                         (v_side == "buy" and current_price <= v_price)
                     )
                     if triggered:
-                        filled_keys.append(key)
-                        log_event(
-                            f"[DETECT_FILLS] Orden virtual {v_side} en {key} activada "
-                            f"(precio actual {_price_key(current_price)})",
-                            "info", logs
-                        )
+                        with self._state_lock:
+                            trigger_count = self._virtual_trigger_counts.get(key, 0) + 1
+                            self._virtual_trigger_counts[key] = trigger_count
+                        if trigger_count >= 2:
+                            with self._state_lock:
+                                self._virtual_trigger_counts.pop(key, None)
+                            filled_keys.append(key)
+                            log_event(
+                                f"[DETECT_FILLS] Orden virtual {v_side} en {key} activada "
+                                f"(precio actual {_price_key(current_price)})",
+                                "info", logs
+                            )
+                        else:
+                            log_event(
+                                f"[DETECT_FILLS] Orden virtual {v_side} en {key} pendiente de confirmación "
+                                f"(precio actual {_price_key(current_price)})",
+                                "info", logs
+                            )
+                    else:
+                        with self._state_lock:
+                            self._virtual_trigger_counts.pop(key, None)
                 continue  # las virtuales nunca son cancelación externa
 
             if oid in {"pending_manual", "pending_cancel", "pending_replace"}:
@@ -2133,6 +2150,7 @@ class GridEngine(TrailingPolicyMixin):
                                 real_fill_keys.append(key)
                             else:
                                 log_event(f"[ENGINE] Orden virtual activada: {key}", "info")
+                                self._virtual_trigger_counts.pop(key, None)
                             del self.active_orders[key]
 
                     for key in real_fill_keys:
