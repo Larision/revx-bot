@@ -429,6 +429,37 @@ class GridEngine(TrailingPolicyMixin):
                 return None
             return self._clone_order_info(info)
 
+    def get_price_cancel_plan(self, key: str) -> Optional[Dict[str, Any]]:
+        """Describe como cancelar una orden por precio sin duplicar reglas en las UIs."""
+        with self._state_lock:
+            info = self.active_orders.get(key)
+            if info is None:
+                return None
+
+            level_keys = sorted({_price_key(level) for level in self.levels}, key=Decimal)
+            is_edge = bool(level_keys) and key in {level_keys[0], level_keys[-1]}
+            order_id = str(info["order_id"])
+            is_state_only = order_id in {"pending_post_only", "pending_manual"}
+            is_busy = order_id in {"pending_cancel", "pending_replace"}
+            is_real_order = order_id not in {
+                "virtual",
+                "pending_post_only",
+                "pending_manual",
+                "pending_cancel",
+                "pending_replace",
+            }
+
+            return {
+                "key": key,
+                "side": str(info["side"]),
+                "order_id": order_id,
+                "is_edge": is_edge,
+                "is_state_only": is_state_only,
+                "is_busy": is_busy,
+                "is_real_order": is_real_order,
+                "remove_level": is_edge and is_real_order,
+            }
+
     def place_manual_order(
         self,
         price: Decimal,
@@ -496,7 +527,7 @@ class GridEngine(TrailingPolicyMixin):
         if order_id == "virtual":
             return False, [], f"La orden en {key} es virtual y no existe en el exchange."
 
-        if order_id == "pending_post_only":
+        if order_id in {"pending_post_only", "pending_manual"}:
             removed = False
             with self._state_lock:
                 current = self.active_orders.get(key)
@@ -517,11 +548,11 @@ class GridEngine(TrailingPolicyMixin):
             return True, [
                 {
                     "level": "info",
-                    "msg": f"Orden pendiente {str(info['side']).upper()} en {key} eliminada del estado local.",
+                    "msg": f"Orden local {str(info['side']).upper()} en {key} eliminada del estado.",
                 }
             ], None
 
-        if order_id in {"pending_manual", "pending_cancel", "pending_replace"}:
+        if order_id in {"pending_cancel", "pending_replace"}:
             return False, [], f"La orden en {key} tiene una operación pendiente ({order_id})."
 
         response, logs = self.cancel_order(order_id)

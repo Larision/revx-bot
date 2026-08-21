@@ -1810,25 +1810,38 @@ def _cancel_order_by_price(engine: "GridEngine") -> None:
         except Exception:
             print("  Precio inválido.")
 
-    info = engine.get_order_info(target_key)
-    if info is None:
+    cancel_plan = engine.get_price_cancel_plan(target_key)
+    if cancel_plan is None:
         print(f"  [!] No hay orden en {target_key}.")
         return
 
-    order_id = str(info["order_id"])
-    side = str(info["side"]).upper()
+    order_id = str(cancel_plan["order_id"])
+    side = str(cancel_plan["side"]).upper()
+    remove_level = bool(cancel_plan["remove_level"])
 
     if order_id == "virtual":
         print(f"  [!] La orden en {target_key} no se puede cancelar desde aquí ({order_id}).")
         return
-    if order_id in {"pending_manual", "pending_cancel", "pending_replace"}:
+    if bool(cancel_plan["is_busy"]):
         print(f"  [!] La orden en {target_key} tiene una operación pendiente ({order_id}).")
         return
 
-    if order_id == "pending_post_only":
-        confirm_msg = f"  ¿Eliminar orden pendiente {side} en {target_key} del estado local? (s/n): "
+    if bool(cancel_plan["is_state_only"]):
+        confirm_msg = (
+            f"  ¿Eliminar orden local/latente {side} en {target_key} "
+            "dejando el hueco vacío? (s/n): "
+        )
     else:
-        confirm_msg = f"  ¿Cancelar {side} en {target_key} ({order_id})? (s/n): "
+        effect = (
+            "se eliminará también el nivel del grid"
+            if remove_level
+            else "quedará un hueco vacío para rellenar"
+        )
+        print(
+            "  [!] Aviso: es una orden real del grid. "
+            "Cancelarla manualmente puede alterar el ciclo previsto."
+        )
+        confirm_msg = f"  ¿Cancelar {side} en {target_key} ({order_id})? {effect}. (s/n): "
 
     confirm = input(confirm_msg).strip().lower()
     if not confirm.startswith("s"):
@@ -1838,6 +1851,7 @@ def _cancel_order_by_price(engine: "GridEngine") -> None:
     ok, logs, error_msg = engine.cancel_order_by_key(
         target_key,
         expected_order_id=order_id,
+        remove_level=remove_level,
     )
     for entry in logs:
         log_event(f"[CANCEL] {entry['msg']}", entry["level"])
@@ -1846,7 +1860,10 @@ def _cancel_order_by_price(engine: "GridEngine") -> None:
         print(f"  [!] {error_msg or 'No se pudo cancelar la orden.'}")
         return
 
-    print(f"  ✓ Orden cancelada; el nivel {target_key} queda vacío en el grid.")
+    if remove_level:
+        print(f"  ✓ Orden cancelada y nivel {target_key} eliminado del grid.")
+    else:
+        print(f"  ✓ Orden cancelada; el nivel {target_key} queda vacío en el grid.")
 
 
 def _fill_empty_levels(engine: "GridEngine") -> None:

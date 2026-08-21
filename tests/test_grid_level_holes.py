@@ -62,7 +62,55 @@ class GridLevelHoleTests(unittest.TestCase):
             engine.active_orders = {}
         return engine
 
-    def test_cancel_order_by_key_keeps_level_empty_by_default(self) -> None:
+    def test_cancel_plan_marks_real_edges_for_grid_removal(self) -> None:
+        engine = self._engine()
+        with engine._state_lock:
+            engine.active_orders["90.00"] = {
+                "side": "buy",
+                "order_id": "order-90",
+                "price": Decimal("90"),
+                "placed_at": 1.0,
+                "size": Decimal("0.01"),
+            }
+            engine.active_orders["100.00"] = {
+                "side": "buy",
+                "order_id": "order-100",
+                "price": Decimal("100"),
+                "placed_at": 1.0,
+                "size": Decimal("0.01"),
+            }
+
+        edge_plan = engine.get_price_cancel_plan("90.00")
+        middle_plan = engine.get_price_cancel_plan("100.00")
+
+        self.assertIsNotNone(edge_plan)
+        self.assertIsNotNone(middle_plan)
+        self.assertTrue(edge_plan["is_real_order"])
+        self.assertTrue(edge_plan["is_edge"])
+        self.assertTrue(edge_plan["remove_level"])
+        self.assertFalse(middle_plan["is_edge"])
+        self.assertFalse(middle_plan["remove_level"])
+
+    def test_cancel_order_by_key_keeps_interior_level_empty_by_default(self) -> None:
+        engine = self._engine()
+        with engine._state_lock:
+            engine.active_orders["100.00"] = {
+                "side": "buy",
+                "order_id": "order-100",
+                "price": Decimal("100"),
+                "placed_at": 1.0,
+                "size": Decimal("0.01"),
+            }
+
+        with patch.object(engine, "save_state", return_value=True):
+            ok, _logs, error_msg = engine.cancel_order_by_key("100.00", expected_order_id="order-100")
+
+        self.assertTrue(ok)
+        self.assertIsNone(error_msg)
+        self.assertNotIn("100.00", engine.active_orders)
+        self.assertIn(Decimal("100"), engine.levels)
+
+    def test_cancel_real_edge_order_removes_grid_level_when_requested(self) -> None:
         engine = self._engine()
         with engine._state_lock:
             engine.active_orders["90.00"] = {
@@ -74,7 +122,36 @@ class GridLevelHoleTests(unittest.TestCase):
             }
 
         with patch.object(engine, "save_state", return_value=True):
-            ok, _logs, error_msg = engine.cancel_order_by_key("90.00", expected_order_id="order-90")
+            ok, _logs, error_msg = engine.cancel_order_by_key(
+                "90.00",
+                expected_order_id="order-90",
+                remove_level=True,
+            )
+
+        self.assertTrue(ok)
+        self.assertIsNone(error_msg)
+        self.assertNotIn("90.00", engine.active_orders)
+        self.assertNotIn(Decimal("90"), engine.levels)
+
+    def test_cancel_state_only_order_keeps_grid_level_empty(self) -> None:
+        engine = self._engine()
+        with engine._state_lock:
+            engine.active_orders["90.00"] = {
+                "side": "buy",
+                "order_id": "pending_manual",
+                "price": Decimal("90"),
+                "placed_at": 1.0,
+                "size": Decimal("0.01"),
+            }
+
+        plan = engine.get_price_cancel_plan("90.00")
+
+        self.assertIsNotNone(plan)
+        self.assertTrue(plan["is_state_only"])
+        self.assertFalse(plan["remove_level"])
+
+        with patch.object(engine, "save_state", return_value=True):
+            ok, _logs, error_msg = engine.cancel_order_by_key("90.00", expected_order_id="pending_manual")
 
         self.assertTrue(ok)
         self.assertIsNone(error_msg)

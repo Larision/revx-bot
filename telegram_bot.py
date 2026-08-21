@@ -1428,7 +1428,7 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     cancelable_orders = {
         key: info
         for key, info in active_orders.items()
-        if str(info["order_id"]) not in {"virtual", "pending_manual", "pending_cancel", "pending_replace"}
+        if str(info["order_id"]) not in {"virtual", "pending_cancel", "pending_replace"}
     }
 
     if not cancelable_orders:
@@ -1437,7 +1437,13 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     lines = ["📋 *Órdenes activas* — responde con el precio a cancelar:\n```"]
     for key, info in sorted(cancelable_orders.items(), key=lambda item: Decimal(item[0]), reverse=True):
-        tag = " [P]" if str(info["order_id"]) == "pending_post_only" else ""
+        order_id = str(info["order_id"])
+        if order_id == "pending_post_only":
+            tag = " [P]"
+        elif order_id == "pending_manual":
+            tag = " [M]"
+        else:
+            tag = ""
         lines.append(f"{key:>12}  {str(info['side']).upper()}{tag}")
     lines.append("```")
     await message.reply_text("\n".join(lines), parse_mode="Markdown")
@@ -1649,12 +1655,17 @@ async def cmd_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if action == "cancel_order":
         key = str(kwargs["key"])
         order_id = str(kwargs["order_id"])
+        remove_level = bool(kwargs.get("remove_level", False))
         eng = _get_engine()
         if eng is None:
             await message.reply_text("⚪ Engine no disponible.")
             return
 
-        ok, logs, error_msg = eng.cancel_order_by_key(key, expected_order_id=order_id)
+        ok, logs, error_msg = eng.cancel_order_by_key(
+            key,
+            expected_order_id=order_id,
+            remove_level=remove_level,
+        )
         for log_item in logs:
             log_event(f"[TELEGRAM] {log_item['msg']}", log_item["level"])
 
@@ -1663,7 +1674,10 @@ async def cmd_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
         log_event(f"[TELEGRAM] Orden cancelada en {key} via Telegram.", "info")
-        await message.reply_text(f"✅ Orden en {key} cancelada.")
+        if remove_level:
+            await message.reply_text(f"✅ Orden en {key} cancelada y nivel eliminado del grid.")
+        else:
+            await message.reply_text(f"✅ Orden en {key} cancelada; queda hueco vacío en el grid.")
         return
 
     await message.reply_text("No hay ninguna acción pendiente de confirmar.")
@@ -2055,29 +2069,43 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 await message.reply_text("Precio inválido.")
                 return
 
-            info = eng.get_order_info(target_key)
-            if info is None:
+            cancel_plan = eng.get_price_cancel_plan(target_key)
+            if cancel_plan is None:
                 await message.reply_text(f"No hay orden en {target_key}.")
                 _state.pending_confirm = None
                 return
 
-            order_id = str(info["order_id"])
+            order_id = str(cancel_plan["order_id"])
             if order_id == "virtual":
                 await message.reply_text("Esa orden no se puede cancelar desde aquí.")
                 _state.pending_confirm = None
                 return
-            if order_id in {"pending_manual", "pending_cancel", "pending_replace"}:
+            if bool(cancel_plan["is_busy"]):
                 await message.reply_text(f"Esa orden tiene una operación pendiente ({order_id}).")
                 _state.pending_confirm = None
                 return
 
             _state.pending_confirm = (
                 "cancel_order",
-                {"key": target_key, "order_id": info["order_id"]},
+                {
+                    "key": target_key,
+                    "order_id": order_id,
+                    "remove_level": bool(cancel_plan["remove_level"]),
+                },
             )
-            action_label = "Eliminar orden pendiente" if order_id == "pending_post_only" else "Cancelar orden"
+            if bool(cancel_plan["is_state_only"]):
+                action_label = "Eliminar orden local/latente"
+                effect_text = "Quedará hueco vacío en el grid."
+            else:
+                action_label = "Cancelar orden real"
+                effect_text = (
+                    "Aviso: puede alterar el ciclo previsto. Al estar en esquina, se eliminará también el nivel del grid."
+                    if bool(cancel_plan["remove_level"])
+                    else "Aviso: puede alterar el ciclo previsto. Quedará hueco vacío para rellenar."
+                )
             await message.reply_text(
-                f"¿{action_label} {str(info['side']).upper()} en `{target_key}`?\n"
+                f"¿{action_label} {str(cancel_plan['side']).upper()} en `{target_key}`?\n"
+                f"{effect_text}\n"
                 f"Responde /confirm o /abort",
                 parse_mode="Markdown",
             )
