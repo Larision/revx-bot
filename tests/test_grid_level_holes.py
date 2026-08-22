@@ -176,6 +176,44 @@ class GridLevelHoleTests(unittest.TestCase):
         self.assertIn("120.00", engine.active_orders)
         self.assertIn(Decimal("120"), engine.levels)
 
+    def test_fill_empty_preview_lists_all_empty_sides_when_center_is_active(self) -> None:
+        engine = self._engine()
+        with engine._state_lock:
+            engine.active_orders["100.00"] = {
+                "side": "buy",
+                "order_id": "order-100",
+                "price": Decimal("100"),
+                "placed_at": 1.0,
+                "size": Decimal("0.01"),
+            }
+
+        preview = engine.preview_fill_empty_levels(Decimal("100"))
+
+        self.assertEqual(
+            [(item["side"], item["price"]) for item in preview["to_place"]],
+            [("buy", Decimal("90")), ("sell", Decimal("110"))],
+        )
+        self.assertEqual(preview["skipped"], [])
+
+    def test_fill_empty_uses_preview_plan(self) -> None:
+        engine = self._engine()
+        with engine._state_lock:
+            engine.active_orders["100.00"] = {
+                "side": "buy",
+                "order_id": "order-100",
+                "price": Decimal("100"),
+                "placed_at": 1.0,
+                "size": Decimal("0.01"),
+            }
+
+        with patch.object(engine, "_place_order_safe", return_value=True) as place_order:
+            engine.fill_empty_levels(Decimal("100"))
+
+        self.assertEqual(
+            [(call.args[0], call.args[1]) for call in place_order.call_args_list],
+            [(Decimal("90"), "buy"), (Decimal("110"), "sell")],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

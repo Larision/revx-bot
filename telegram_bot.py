@@ -1274,13 +1274,26 @@ async def cmd_fill_empty(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await message.reply_text("No se pudo obtener precio actual para fill_empty.")
         return
 
+    preview = eng.preview_fill_empty_levels(current_price)
+    lines = [
+        "*FILL EMPTY LEVELS*",
+        f"Precio usado: `{_price_key(current_price)} USDC`",
+        f"Huecos a rellenar: `{len(preview['to_place'])}`",
+    ]
+    if preview["to_place"]:
+        lines.append("\nOrdenes previstas:")
+        for item in preview["to_place"]:
+            lines.append(
+                f"`{item['side'].upper():4} {_price_key(item['price']):>10} "
+                f"size {_fmt_grid_size(item['size'])}`"
+            )
+    if preview["skipped"]:
+        lines.append("\nNiveles omitidos:")
+        for item in preview["skipped"]:
+            lines.append(f"`{_price_key(item['price']):>10}`: {item['reason']}")
+    lines.extend(["", "Responde /confirm para ejecutar o /abort para cancelar."])
     _state.pending_confirm = ("fill_empty", {"current_price": current_price})
-    await message.reply_text(
-        "*FILL EMPTY LEVELS*\n"
-        f"Precio usado: `{_price_key(current_price)} USDC`\n\n"
-        "Responde /confirm para ejecutar o /abort para cancelar.",
-        parse_mode="Markdown",
-    )
+    await message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def cmd_resize_to_default(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

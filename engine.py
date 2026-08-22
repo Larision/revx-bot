@@ -1969,21 +1969,13 @@ class GridEngine(TrailingPolicyMixin):
     # FILL EMPTY LEVELS (recuperación)
     # ----------------------------------------------------------
 
-    def fill_empty_levels(self, current_price: Decimal) -> None:
-        """
-        Repobla niveles vacíos (por cancelación externa u otros motivos).
-
-        Prioridad para decidir qué nivel debe permanecer vacío:
-          1. Si existe el último nivel ejecutado y sigue libre, se conserva ese hueco.
-          2. Si no, se usa la heurística anterior basada en last_fill_side/current_price.
-
-        Esto evita recrear una orden justo en el último fill si el precio oscila
-        ligeramente antes de ejecutar la recuperación.
-        """
+    def _build_fill_empty_plan(self, current_price: Decimal) -> Dict[str, Any]:
+        """Calcula los niveles que fill_empty_levels rellenaria."""
         snapshot = self.get_runtime_snapshot()
         step = snapshot["step"]
+        plan: Dict[str, Any] = {"current_price": current_price, "to_place": [], "skipped": []}
         if step is None:
-            return
+            return plan
 
         levels_sorted = sorted(snapshot["levels"])
         active_orders = snapshot["active_orders"]
@@ -1992,10 +1984,8 @@ class GridEngine(TrailingPolicyMixin):
         last_fill_price = snapshot["last_fill_price"]
         last_fill_side = snapshot["last_fill_side"]
 
-        # Determinar qué nivel debe permanecer vacío (último fill)
         skip_level: Optional[Decimal] = None
         skip_reason = "heurística"
-
         if last_fill_price is not None:
             last_fill_level = last_fill_price.quantize(TICK_SIZE, rounding=ROUND_DOWN)
             last_fill_key = _price_key(last_fill_level)
@@ -2013,89 +2003,96 @@ class GridEngine(TrailingPolicyMixin):
 
         for level in levels_sorted:
             key = _price_key(level)
-
-            with self._state_lock:
-                if key in self.active_orders:
-                    continue
-
+            if key in active_orders:
+                continue
             if key in protected_empty_keys:
-                log_event(
-                    f"[ENGINE] Nivel {key} dejado vacío intencionalmente "
-                    f"(pareja pendiente de orden extended activa)"
-                )
+                plan["skipped"].append({"price": level, "reason": "pareja extended activa"})
                 continue
-
             if skip_level is not None and level == skip_level:
-                log_event(
-                    f"[ENGINE] Nivel {key} dejado vacío intencionalmente "
-                    f"({skip_reason}: {last_fill_side or 'desconocido'})"
-                )
+                plan["skipped"].append({
+                    "price": level,
+                    "reason": f"{skip_reason}: {last_fill_side or 'desconocido'}",
+                })
+                continue
+            if level == current_price:
+                plan["skipped"].append({"price": level, "reason": "precio actual"})
                 continue
 
+            side = "buy" if level < current_price else "sell"
             order_size = self._infer_fill_empty_level_size(level, current_price, active_orders, levels_sorted)
             metadata: Optional[Dict[str, Any]] = None
-
-            if level < current_price:
+            if side == "buy":
                 raw_step = extended_levels.get(key) if isinstance(extended_levels, dict) else None
                 if raw_step is not None:
                     grid_step = self._decimal_from_meta(raw_step, step)
-                    paired_sell_price = (level + grid_step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
                     order_size = self._extended_down_order_size()
                     metadata = {
                         "extended": True,
                         "grid_step": grid_step,
-                        "paired_sell_price": paired_sell_price,
+                        "paired_sell_price": (level + grid_step).quantize(TICK_SIZE, rounding=ROUND_DOWN),
                     }
-
-                # Re-check bajo lock antes de intentar crear la orden para evitar
-                # condiciones de carrera con órdenes latentes u otras actualizaciones
-                with self._state_lock:
-                    if key in self.active_orders:
-                        log_event(
-                            f"[ENGINE] Nivel {key} ya tiene orden tras recheck — omitiendo repoblado",
-                            "info",
-                        )
+            elif isinstance(extended_levels, dict):
+                for lower_key, raw_step in extended_levels.items():
+                    try:
+                        lower_price = Decimal(str(lower_key))
+                        grid_step = self._decimal_from_meta(raw_step, step)
+                        paired_sell_price = (lower_price + grid_step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
+                    except Exception:
                         continue
+                    if paired_sell_price == level:
+                        order_size = self._extended_down_order_size()
+                        metadata = {
+                            "extended": True,
+                            "grid_step": grid_step,
+                            "paired_buy_price": lower_price,
+                        }
+                        break
 
-                log_event(
-                    f"[ENGINE] Nivel vacío detectado, colocando BUY en {key} "
-                    f"(size {fmt_amount(order_size)})"
-                )
-                self._place_order_safe(level, "buy", order_size, metadata=metadata)
-            elif level > current_price:
-                if isinstance(extended_levels, dict):
-                    for lower_key, raw_step in extended_levels.items():
-                        try:
-                            lower_price = Decimal(str(lower_key))
-                            grid_step = self._decimal_from_meta(raw_step, step)
-                            paired_sell_price = (lower_price + grid_step).quantize(TICK_SIZE, rounding=ROUND_DOWN)
-                        except Exception:
-                            continue
+            plan["to_place"].append({
+                "price": level,
+                "side": side,
+                "size": order_size,
+                "metadata": metadata,
+            })
+        return plan
 
-                        if paired_sell_price == level:
-                            order_size = self._extended_down_order_size()
-                            metadata = {
-                                "extended": True,
-                                "grid_step": grid_step,
-                                "paired_buy_price": lower_price,
-                            }
-                            break
+    def preview_fill_empty_levels(self, current_price: Decimal) -> Dict[str, Any]:
+        """Devuelve una preview de los huecos y decisiones de recuperación."""
+        return self._build_fill_empty_plan(Decimal(str(current_price)))
 
-                log_event(
-                    f"[ENGINE] Nivel vacío detectado, colocando SELL en {key} "
-                    f"(size {fmt_amount(order_size)})"
-                )
-                # Re-check bajo lock antes de intentar crear la orden para evitar
-                # condiciones de carrera con órdenes latentes u otras actualizaciones
-                with self._state_lock:
-                    if key in self.active_orders:
-                        log_event(
-                            f"[ENGINE] Nivel {key} ya tiene orden tras recheck — omitiendo repoblado",
-                            "info",
-                        )
-                        continue
+    def fill_empty_levels(self, current_price: Decimal) -> Dict[str, Any]:
+        """
+        Repobla niveles vacíos (por cancelación externa u otros motivos).
 
-                self._place_order_safe(level, "sell", order_size, metadata=metadata)
+        Prioridad para decidir qué nivel debe permanecer vacío:
+          1. Si existe el último nivel ejecutado y sigue libre, se conserva ese hueco.
+          2. Si no, se usa la heurística anterior basada en last_fill_side/current_price.
+
+        Esto evita recrear una orden justo en el último fill si el precio oscila
+        ligeramente antes de ejecutar la recuperación.
+        """
+        plan = self._build_fill_empty_plan(Decimal(str(current_price)))
+        for item in plan["skipped"]:
+            log_event(
+                f"[ENGINE] Nivel { _price_key(item['price']) } dejado vacío intencionalmente ({item['reason']})"
+            )
+
+        for item in plan["to_place"]:
+            level = item["price"]
+            key = _price_key(level)
+            side = item["side"]
+            order_size = item["size"]
+            metadata = item["metadata"]
+
+            with self._state_lock:
+                if key in self.active_orders:
+                    continue
+            log_event(
+                f"[ENGINE] Nivel vacío detectado, colocando {side.upper()} en {key} "
+                f"(size {fmt_amount(order_size)})"
+            )
+            self._place_order_safe(level, side, order_size, metadata=metadata)
+        return plan
 
     # ----------------------------------------------------------
     # MAIN LOOP

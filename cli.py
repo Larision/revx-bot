@@ -1885,6 +1885,22 @@ def _fill_empty_levels(engine: "GridEngine") -> None:
     print("=" * 50)
     print(f"  Precio actual: {_price_key(current_price)} USDC")
 
+    preview = engine.preview_fill_empty_levels(current_price)
+    to_place = preview["to_place"]
+    skipped = preview["skipped"]
+    print(f"\n  Huecos a rellenar: {len(to_place)}")
+    for item in to_place:
+        print(
+            f"    {item['side'].upper():4} {_price_key(item['price']):>12}"
+            f"  size {fmt_amount(item['size'])}"
+        )
+    if skipped:
+        print("  Niveles omitidos:")
+        for item in skipped:
+            print(f"    {_price_key(item['price']):>12}  ({item['reason']})")
+    if not to_place:
+        print("  No hay niveles que rellenar.")
+
     try:
         confirm = input("\n  ¿Ejecutar fill empty levels? (s/n): ").strip().lower()
     except EOFError:
