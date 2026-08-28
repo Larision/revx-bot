@@ -13,7 +13,7 @@ import csv
 import json
 import sys
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from statistics import median
@@ -23,6 +23,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 TICK_SIZE = Decimal("0.01")
 MULTIPLE_DECIMALS = Decimal("0.0001")
 QTY_EPSILON = Decimal("0.00000000000001")
+STEP_DETECTION_WINDOWS_DAYS = (7, 14, 30)
 
 
 def _price_key(price: Decimal) -> str:
@@ -95,15 +96,8 @@ def _common_positive_diffs(prices: Iterable[Decimal]) -> List[Decimal]:
     return diffs
 
 
-def detect_step(fills: List[Dict]) -> Decimal:
-    """
-    Detecta un step base robusto desde fills historicos.
-
-    Antes se usaba el menor salto positivo entre cualquier precio. Con trailing,
-    cambios de size o resets del grid, ese minimo suele ser ruido y distorsiona
-    todos los multiplos. Aqui usamos el salto mas frecuente; si no hay una moda
-    clara, usamos una mediana recortada.
-    """
+def _detect_step_from_fills(fills: List[Dict], require_repeated: bool = True) -> Decimal:
+    """Detecta el salto dominante entre niveles de precio de un conjunto de fills."""
     diffs = _common_positive_diffs(f["price"] for f in fills)
     if not diffs:
         return Decimal("0")
@@ -113,8 +107,11 @@ def detect_step(fills: List[Dict]) -> Decimal:
     if most_common_count > 1:
         return most_common_diff
 
+    if require_repeated:
+        return Decimal("0")
+
     if len(diffs) <= 4:
-        return median(diffs)
+        return Decimal(str(median(diffs))).quantize(TICK_SIZE, rounding=ROUND_DOWN)
 
     ordered = sorted(diffs)
     trim = max(1, len(ordered) // 10)
@@ -122,31 +119,65 @@ def detect_step(fills: List[Dict]) -> Decimal:
     return Decimal(str(median(trimmed))).quantize(TICK_SIZE, rounding=ROUND_DOWN)
 
 
-def _find_best_buy_match(open_buys: List[Dict], sell_fill: Dict) -> Optional[int]:
-    """Busca el BUY abierto mas cercano para emparejar un SELL ejecutado."""
-    sell_price = sell_fill["price"]
-    remaining_sell_qty = sell_fill.get("remaining_quantity", sell_fill["quantity"])
+def detect_step(fills: List[Dict]) -> Decimal:
+    """
+    Detecta el step base dando prioridad al regimen reciente del grid.
 
-    exact_qty_candidates: List[Tuple[int, Dict]] = []
-    fallback_candidates: List[Tuple[int, Dict]] = []
+    El historico puede contener distintos steps usados en meses anteriores. Si se
+    mezclan todos los precios, la moda historica puede dejar de representar el
+    grid actual. Por eso se prueban primero ventanas recientes (7, 14 y 30 dias)
+    respecto al ultimo fill. Solo si ninguna ofrece una moda repetida se usa todo
+    el historico como fallback.
+    """
+    if not fills:
+        return Decimal("0")
+
+    parsed: List[Tuple[datetime, Dict]] = []
+    for fill in fills:
+        try:
+            parsed.append((datetime.fromisoformat(str(fill["ts"])), fill))
+        except (TypeError, ValueError):
+            continue
+
+    if parsed:
+        latest_ts = max(ts for ts, _ in parsed)
+        for window_days in STEP_DETECTION_WINDOWS_DAYS:
+            cutoff = latest_ts - timedelta(days=window_days)
+            recent_fills = [fill for ts, fill in parsed if ts >= cutoff]
+            recent_step = _detect_step_from_fills(recent_fills, require_repeated=True)
+            if recent_step > 0:
+                return recent_step
+
+    return _detect_step_from_fills(fills, require_repeated=False)
+
+
+def _find_best_buy_match(open_buys: List[Dict], sell_fill: Dict) -> Optional[int]:
+    """
+    Busca el BUY abierto mas cercano por precio para emparejar un SELL.
+
+    La cantidad no interviene en la prioridad. Si las cantidades son distintas,
+    pair_fills consume parcialmente el BUY o el SELL y continua con el siguiente
+    nivel mas cercano. Esto evita saltarse BUYs proximos solo para encontrar una
+    cantidad exactamente igual mucho mas abajo.
+    """
+    sell_price = sell_fill["price"]
+    candidates: List[Tuple[int, Dict]] = []
 
     for idx, buy in enumerate(open_buys):
         if buy["price"] >= sell_price:
             continue
 
         buy_qty = buy.get("remaining_quantity", buy["quantity"])
-        if buy_qty <= 0:
+        if buy_qty <= QTY_EPSILON:
             continue
 
-        if buy_qty == remaining_sell_qty:
-            exact_qty_candidates.append((idx, buy))
-        else:
-            fallback_candidates.append((idx, buy))
+        candidates.append((idx, buy))
 
-    candidates = exact_qty_candidates or fallback_candidates
     if not candidates:
         return None
 
+    # Mayor precio BUY = menor distancia positiva al SELL. En empate, el mas
+    # reciente primero para mantener un criterio determinista.
     candidates.sort(key=lambda item: (item[1]["price"], item[1]["ts"]), reverse=True)
     return candidates[0][0]
 
@@ -186,7 +217,15 @@ def _step_flags(step_used: Decimal, step_base: Decimal) -> Dict[str, str]:
 
 
 def pair_fills(fills: List[Dict], step: Decimal) -> Tuple[List[Dict], List[Dict]]:
-    """Empareja fills BUY/SELL y devuelve pares cerrados mas BUYs abiertos."""
+    """
+    Empareja fills BUY/SELL y devuelve un unico par por SELL cerrado.
+
+    Un SELL puede consumir varios BUYs cercanos cuando sus quantities no coinciden
+    exactamente (por ejemplo, tras un resize). Esos consumos se agregan en un solo
+    par usando un precio BUY medio ponderado. Asi el numero de pares sigue
+    representando el numero de SELLs cerrados y no el numero de fragmentos usados
+    internamente para reconstruir su coste.
+    """
     pairs: List[Dict] = []
     open_buys: List[Dict] = []
 
@@ -201,6 +240,12 @@ def pair_fills(fills: List[Dict], step: Decimal) -> Tuple[List[Dict], List[Dict]
         if side != "sell":
             continue
 
+        sell_price = fill["price"]
+        matched_quantity = Decimal("0")
+        total_buy_value = Decimal("0")
+        total_sell_value = Decimal("0")
+        first_buy_ts: Optional[str] = None
+
         while fill["remaining_quantity"] > QTY_EPSILON:
             matched_idx = _find_best_buy_match(open_buys, fill)
             if matched_idx is None:
@@ -209,28 +254,36 @@ def pair_fills(fills: List[Dict], step: Decimal) -> Tuple[List[Dict], List[Dict]
             buy = open_buys[matched_idx]
             buy_qty = buy["remaining_quantity"]
             quantity = min(buy_qty, fill["remaining_quantity"])
-            sell_price = fill["price"]
-            buy_price = buy["price"]
-            buy_value = buy_price * quantity
-            sell_value = sell_price * quantity
-            profit = sell_value - buy_value
-            step_used = sell_price - buy_price
 
-            pairs.append({
-                "buy_ts": buy["ts"],
-                "buy_price": _price_key(buy_price),
-                "sell_ts": fill["ts"],
-                "sell_price": _price_key(sell_price),
-                "quantity": _quantity_key(quantity),
-                "step_usdc": _price_key(step_used),
-                "profit_usdc": f"{profit:.4f}",
-                **_step_flags(step_used, step),
-            })
+            if first_buy_ts is None:
+                first_buy_ts = str(buy["ts"])
+
+            matched_quantity += quantity
+            total_buy_value += buy["price"] * quantity
+            total_sell_value += sell_price * quantity
 
             buy["remaining_quantity"] -= quantity
             fill["remaining_quantity"] -= quantity
             if buy["remaining_quantity"] <= QTY_EPSILON:
                 open_buys.pop(matched_idx)
+
+        if matched_quantity <= QTY_EPSILON:
+            continue
+
+        weighted_buy_price = total_buy_value / matched_quantity
+        profit = total_sell_value - total_buy_value
+        step_used = sell_price - weighted_buy_price
+
+        pairs.append({
+            "buy_ts": first_buy_ts or "",
+            "buy_price": _price_key(weighted_buy_price),
+            "sell_ts": fill["ts"],
+            "sell_price": _price_key(sell_price),
+            "quantity": _quantity_key(matched_quantity),
+            "step_usdc": _price_key(step_used),
+            "profit_usdc": f"{profit:.4f}",
+            **_step_flags(step_used, step),
+        })
 
     return pairs, open_buys
 
