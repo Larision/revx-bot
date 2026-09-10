@@ -10,7 +10,8 @@ Comandos disponibles:
   /set_config — cambia un valor de configuración guardada
   /trailings — muestra o configura trailing up/down
   /price     — precio actual aunque el engine no este activo
-  /fill_empty — repuebla niveles vacios del grid activo
+  /fill_empty — repuebla niveles vacios del grid activo manualmente
+  /fill_empty auto on|off — activa/desactiva la recuperación automática
   /resize_to_default — redimensiona fixed_quote a base_size
   /update    — actualiza desde git y reinicia en la misma consola (Linux)
   /analyze   — resumen de fills emparejados y beneficio estimado
@@ -23,7 +24,7 @@ Comandos disponibles:
   /start_engine  — previsualiza y arranca el engine con confirmación
   /stop      — detiene el engine (requiere confirmación)
   /cancel_all — cancela todas las ordenes si el engine esta parado
-  /add_order — añade una orden manual (guiado por pasos)
+  /add_order — añade una orden manual o un nivel vacío (guiado por pasos)
   /cancel    — cancela una orden por precio (requiere confirmación)
   /confirm   — confirma una acción pendiente
   /abort     — cancela una acción pendiente
@@ -785,9 +786,10 @@ def _build_help_text() -> str:
         "`/stop` — detiene el engine; conserva órdenes del exchange",
         "`/stop cancel_orders` - detiene el engine y cancela todas las ordenes",
         "`/cancel_all` - cancela todas las ordenes si el engine esta parado",
-        "`/add_order` — añade una orden manual guiada por pasos",
+        "`/add_order` — añade una orden manual o nivel vacío guiado por pasos",
         "`/cancel` — cancela una orden por precio con confirmación",
-        "`/fill_empty` - repuebla niveles vacios del grid activo",
+        "`/fill_empty` - repuebla niveles vacios del grid activo manualmente",
+        "`/fill_empty auto on|off` - activa/desactiva el rellenado automático",
         "`/resize_to_default` - redimensiona fixed_quote a base_size",
         "`/update` - actualiza desde git y reinicia en la misma consola (Linux)",
         "`/confirm` — confirma una acción pendiente",
@@ -1246,7 +1248,6 @@ def _format_resize_preview(preview: dict[str, Any]) -> str:
 
 
 async def cmd_fill_empty(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    del context
     if not _authorized(update):
         return
 
@@ -1261,6 +1262,28 @@ async def cmd_fill_empty(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     eng = _get_engine()
     if eng is None:
         await message.reply_text("Engine no disponible.")
+        return
+
+    args = [arg.strip().lower() for arg in (context.args or [])]
+    if args:
+        if len(args) != 2 or args[0] not in {"auto", "automatico", "automático"}:
+            await message.reply_text(
+                "Uso:\n"
+                "`/fill_empty`\n"
+                "`/fill_empty auto on|off`",
+                parse_mode="Markdown",
+            )
+            return
+
+        enabled = _parse_on_off(args[1])
+        if enabled is None:
+            await message.reply_text("Usa `on` u `off`.", parse_mode="Markdown")
+            return
+
+        eng.set_fill_empty_enabled(enabled)
+        status = "activado" if enabled else "desactivado"
+        log_event(f"[TELEGRAM] Fill empty automático {status} via Telegram.", "info")
+        await message.reply_text(f"✅ Fill empty automático {status}.")
         return
 
     current_price, logs = get_current_price()
@@ -1416,7 +1439,7 @@ async def cmd_add_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     _state.add_order_step = "price"
     _state.add_order_data = {}
-    await message.reply_text("💰 Introduce el precio de la orden:")
+    await message.reply_text("💰 Introduce el precio de la orden o nivel vacío:")
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1485,8 +1508,19 @@ async def cmd_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         price = cast(Decimal, data["price"])
         side = cast(str, data["side"])
-        size = cast(Decimal, data["size"])
         key = _price_key(price)
+
+        if side == "empty":
+            added, error_msg = eng.add_empty_level(price)
+            if error_msg:
+                await message.reply_text(f"⚠️ {error_msg}")
+                return
+            if added:
+                log_event(f"[TELEGRAM] Nivel vacío añadido al grid en {key}", "info")
+                await message.reply_text(f"✅ Nivel vacío añadido al grid en `{key}`.", parse_mode="Markdown")
+            return
+
+        size = cast(Decimal, data["size"])
 
         order_id, logs, error_msg = eng.place_manual_order(price, side, size)
         for log_item in logs:
@@ -2022,16 +2056,28 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             price = Decimal(text)
             _state.add_order_data["price"] = price
             _state.add_order_step = "side"
-            await message.reply_text("Lado (buy / sell):")
+            await message.reply_text("Lado (buy / sell / vacía):")
         except Exception:
             await message.reply_text("Precio inválido. Introduce un número:")
         return
 
     if _state.add_order_step == "side":
-        if text.lower() not in ("buy", "sell"):
-            await message.reply_text("Debe ser buy o sell:")
+        normalized_side = text.lower()
+        if normalized_side in ("vacia", "vacía", "empty"):
+            _state.add_order_data["side"] = "empty"
+            _state.add_order_step = "confirm"
+            price = cast(Decimal, _state.add_order_data["price"])
+            await message.reply_text(
+                f"¿Confirmar nivel vacío en `{_price_key(price)}` USDC?\n\n"
+                "Responde /confirm o /abort",
+                parse_mode="Markdown",
+            )
             return
-        _state.add_order_data["side"] = text.lower()
+
+        if normalized_side not in ("buy", "sell"):
+            await message.reply_text("Debe ser buy, sell o vacía:")
+            return
+        _state.add_order_data["side"] = normalized_side
         _state.add_order_step = "size"
         eng = _get_engine()
         if eng is None:

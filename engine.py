@@ -130,6 +130,7 @@ class GridEngine(TrailingPolicyMixin):
         self.trailing_up_enabled: bool = True  # compatibilidad con estado antiguo
         self.trailing_down_mode: str = 'on'  # 'off' | 'on' | 'extended'
         self.trailing_down_enabled: bool = True  # compatibilidad con estado antiguo
+        self.fill_empty_enabled: bool = True  # recuperación automática de niveles vacíos
 
         # Trailing up extendido / híbrido:
         # - El grid normal mantiene base_size.
@@ -280,6 +281,15 @@ class GridEngine(TrailingPolicyMixin):
         )
         self.save_state()
 
+    def set_fill_empty_enabled(self, enabled: bool) -> None:
+        """Activa o desactiva en caliente la recuperación automática de huecos."""
+        with self._state_lock:
+            self.fill_empty_enabled = bool(enabled)
+
+        status = "activado" if enabled else "desactivado"
+        log_event(f"[ENGINE] Fill empty automático {status}.", "info")
+        self.save_state()
+
     def _get_available_btc(self) -> Decimal:
         """Calcula BTC disponible para nuevas ordenes SELL."""
         balances_resp, _ = get_all_balances()
@@ -362,6 +372,7 @@ class GridEngine(TrailingPolicyMixin):
             "trailing_up_fixed_quote": str(self._trailing_up_fixed_quote_locked()),
             "trailing_down_mode": self.trailing_down_mode,
             "trailing_down_enabled": self.trailing_down_enabled,
+            "fill_empty_enabled": self.fill_empty_enabled,
             "center_price": str(self.center_price) if self.center_price else None,
             "step": str(self.step) if self.step else None,
             "base_step": str(self.base_step) if self.base_step else None,
@@ -412,6 +423,7 @@ class GridEngine(TrailingPolicyMixin):
                 "trailing_up_fixed_quote": self._trailing_up_fixed_quote_locked(),
                 "trailing_down_mode": self.trailing_down_mode,
                 "trailing_down_enabled": self.trailing_down_enabled,
+                "fill_empty_enabled": self.fill_empty_enabled,
                 "trailing_down_extended_drops": self._trailing_down_extended_drops,
                 "levels": list(self.levels),
                 "extended_levels": dict(self.extended_levels),
@@ -510,6 +522,20 @@ class GridEngine(TrailingPolicyMixin):
 
         self.save_state()
         return order_id, logs, None
+
+    def add_empty_level(self, price: Decimal) -> Tuple[bool, Optional[str]]:
+        """Añade al grid un nivel sin orden en el exchange."""
+        key = _price_key(price)
+
+        with self._state_lock:
+            if key in {_price_key(level) for level in self.levels}:
+                return False, f"El nivel {key} ya existe en el grid."
+
+            self.levels.append(Decimal(key))
+            self.levels = sorted(set(self.levels))
+
+        self.save_state()
+        return True, None
 
     def cancel_order_by_key(
         self,
@@ -720,6 +746,7 @@ class GridEngine(TrailingPolicyMixin):
             trailing_down_mode = self._normalise_trailing_down_mode(
                 raw.get("trailing_down_mode", raw.get("trailing_down_enabled", True))
             )
+            fill_empty_enabled = bool(raw.get("fill_empty_enabled", True))
             trailing_down_extended_drops = int(raw.get("trailing_down_extended_drops", 0) or 0)
 
             # Si falta last_fill_price pero hay un solo nivel sin orden, inferir
@@ -768,6 +795,7 @@ class GridEngine(TrailingPolicyMixin):
                     self._trailing_up_fixed_quote_anchor = None
                 self.trailing_down_mode = trailing_down_mode
                 self.trailing_down_enabled = trailing_down_mode != 'off'
+                self.fill_empty_enabled = fill_empty_enabled
                 self._trailing_down_extended_drops = max(0, trailing_down_extended_drops)
                 removed_virtual_buys = self._prune_floor_virtual_buys_locked(keep_key=None)
 
@@ -2102,7 +2130,8 @@ class GridEngine(TrailingPolicyMixin):
         """
         poll_interval:     segundos entre cada ciclo de detección de fills (flujo normal).
         current_price_interval: segundos entre cada actualización de precio actual.
-        recovery_interval: segundos entre cada ejecución de fill_empty_levels (recuperación).
+        recovery_interval: segundos entre ejecuciones automáticas de fill_empty_levels,
+                            si fill_empty_enabled está activado.
         """
         log_event("[ENGINE] Iniciando loop principal", "info")
 
@@ -2166,7 +2195,7 @@ class GridEngine(TrailingPolicyMixin):
                         self.rebalance_after_fill(key, snapshot)
 
                 now = time.time()
-                if now - last_recovery >= recovery_interval:
+                if self.fill_empty_enabled and now - last_recovery >= recovery_interval:
                     self.fill_empty_levels(current_price)
                     last_recovery = now
 

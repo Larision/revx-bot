@@ -1715,8 +1715,8 @@ def _show_balances_live(engine: Optional["GridEngine"] = None) -> None:
 
 def _add_manual_order(engine: "GridEngine") -> None:
     """
-    Función interactiva para colocar una orden manual y registrarla en las órdenes activas del motor.
-    Reserva el nivel antes de enviar para evitar condiciones de carrera.
+    Añade una orden manual o un nivel vacío al grid.
+    Las órdenes se reservan antes de enviarse para evitar condiciones de carrera.
     """
     try:
         while True:
@@ -1729,10 +1729,25 @@ def _add_manual_order(engine: "GridEngine") -> None:
         key = _price_key(price_val)
 
         while True:
-            side = input_with_esc("  Lado (buy/sell): ").strip().lower()
-            if side in ("buy", "sell"):
+            side = input_with_esc("  Lado (buy/sell; Enter = nivel vacío): ").strip().lower()
+            if side in ("", "buy", "sell"):
                 break
-            print("  Lado inválido. Debe ser buy o sell.")
+            print("  Lado inválido. Debe ser buy, sell o vacío.")
+
+        if not side:
+            confirm = input(f"  Añadir nivel vacío en {key}? (s/n): ").strip().lower()
+            if not confirm.startswith("s"):
+                print("  Abortado.")
+                return
+
+            added, error_msg = engine.add_empty_level(price_val)
+            if error_msg:
+                print(f"  [!] {error_msg}")
+                return
+            if added:
+                log_event(f"[MANUAL] Nivel vacío añadido al grid en {key}", "info")
+                print("  ✓ Nivel vacío añadido al grid.")
+            return
 
         default_size = engine.get_runtime_snapshot()["base_size"]
         while True:
@@ -2185,11 +2200,14 @@ def _engine_config_menu(engine: "GridEngine") -> None:
     while True:
         snapshot = engine.get_runtime_snapshot()
         reserve_usdc = Decimal(str(snapshot.get("reserve_usdc", "0") or "0"))
+        fill_empty_enabled = bool(snapshot.get("fill_empty_enabled", True))
+        fill_empty_status = "Activado" if fill_empty_enabled else "Desactivado"
 
         print("\n=== CONFIGURACIÓN ENGINE ===")
         print(f"1. Activar/Desactivar trailings")
         print(f"2. Cantidad de saldo reservada > {_fmt_usdc_value(reserve_usdc)} USDC")
-        print("3. Atrás")
+        print(f"3. Fill empty automático > {fill_empty_status}")
+        print("4. Atrás")
 
         opcion = input("Opción: ").strip()
 
@@ -2198,6 +2216,9 @@ def _engine_config_menu(engine: "GridEngine") -> None:
         elif opcion == "2":
             _reserve_usdc_menu(engine)
         elif opcion == "3":
+            engine.set_fill_empty_enabled(not fill_empty_enabled)
+            print(f"✓ Fill empty automático {('activado' if not fill_empty_enabled else 'desactivado')}.")
+        elif opcion == "4":
             return
         else:
             print("Opción inválida")

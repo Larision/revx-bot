@@ -176,6 +176,37 @@ class GridLevelHoleTests(unittest.TestCase):
         self.assertIn("120.00", engine.active_orders)
         self.assertIn(Decimal("120"), engine.levels)
 
+    def test_add_empty_level_adds_persisted_grid_level_without_order(self) -> None:
+        engine = self._engine()
+
+        with patch.object(engine, "save_state", return_value=True):
+            added, error_msg = engine.add_empty_level(Decimal("120"))
+
+        self.assertTrue(added)
+        self.assertIsNone(error_msg)
+        self.assertIn(Decimal("120"), engine.levels)
+        self.assertNotIn("120.00", engine.active_orders)
+
+    def test_add_empty_level_rejects_an_existing_grid_level(self) -> None:
+        engine = self._engine()
+
+        with patch.object(engine, "save_state", return_value=True) as save_state:
+            added, error_msg = engine.add_empty_level(Decimal("100"))
+
+        self.assertFalse(added)
+        self.assertEqual(error_msg, "El nivel 100.00 ya existe en el grid.")
+        save_state.assert_not_called()
+
+    def test_fill_empty_auto_toggle_is_saved_and_exposed_in_snapshot(self) -> None:
+        engine = self._engine()
+
+        with patch.object(engine, "save_state", return_value=True) as save_state:
+            engine.set_fill_empty_enabled(False)
+
+        self.assertFalse(engine.get_runtime_snapshot()["fill_empty_enabled"])
+        self.assertFalse(engine._build_state_snapshot_locked()["fill_empty_enabled"])
+        save_state.assert_called_once()
+
     def test_fill_empty_preview_lists_all_empty_sides_when_center_is_active(self) -> None:
         engine = self._engine()
         with engine._state_lock:
