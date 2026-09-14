@@ -449,8 +449,6 @@ class GridEngine(TrailingPolicyMixin):
             if info is None:
                 return None
 
-            level_keys = sorted({_price_key(level) for level in self.levels}, key=Decimal)
-            is_edge = bool(level_keys) and key in {level_keys[0], level_keys[-1]}
             order_id = str(info["order_id"])
             is_state_only = order_id in {"pending_post_only", "pending_manual"}
             is_busy = order_id in {"pending_cancel", "pending_replace"}
@@ -461,10 +459,33 @@ class GridEngine(TrailingPolicyMixin):
                 "pending_cancel",
                 "pending_replace",
             }
+            real_buy_keys: List[str] = []
+            real_sell_keys: List[str] = []
+            for order_key, order_info in self.active_orders.items():
+                candidate_id = str(order_info.get("order_id"))
+                if candidate_id in {
+                    "virtual",
+                    "pending_post_only",
+                    "pending_manual",
+                    "pending_cancel",
+                    "pending_replace",
+                }:
+                    continue
+                candidate_side = str(order_info.get("side"))
+                if candidate_side == "buy":
+                    real_buy_keys.append(order_key)
+                elif candidate_side == "sell":
+                    real_sell_keys.append(order_key)
+
+            side = str(info["side"])
+            is_edge = (
+                (side == "buy" and bool(real_buy_keys) and key == min(real_buy_keys, key=Decimal))
+                or (side == "sell" and bool(real_sell_keys) and key == max(real_sell_keys, key=Decimal))
+            )
 
             return {
                 "key": key,
-                "side": str(info["side"]),
+                "side": side,
                 "order_id": order_id,
                 "is_edge": is_edge,
                 "is_state_only": is_state_only,
@@ -472,6 +493,39 @@ class GridEngine(TrailingPolicyMixin):
                 "is_real_order": is_real_order,
                 "remove_level": is_edge and is_real_order,
             }
+
+    def _remove_virtuals_beyond_cancelled_edge_locked(self, key: str, side: str) -> List[str]:
+        """Elimina centinelas virtuales que quedan fuera del borde real cancelado."""
+        try:
+            price = Decimal(key)
+        except Exception:
+            return []
+
+        keys_to_remove: List[str] = []
+        for order_key, order_info in self.active_orders.items():
+            if str(order_info.get("order_id")) != "virtual":
+                continue
+            if str(order_info.get("side")) != side:
+                continue
+            try:
+                virtual_price = Decimal(order_key)
+            except Exception:
+                continue
+            if (side == "sell" and virtual_price > price) or (side == "buy" and virtual_price < price):
+                keys_to_remove.append(order_key)
+
+        for order_key in keys_to_remove:
+            self.active_orders.pop(order_key, None)
+            self.extended_levels.pop(order_key, None)
+
+        if keys_to_remove:
+            keys = set(keys_to_remove)
+            self.levels = [
+                level for level in self.levels
+                if _price_key(level) not in keys
+            ]
+
+        return sorted(keys_to_remove, key=Decimal, reverse=(side == "sell"))
 
     def place_manual_order(
         self,
@@ -587,6 +641,7 @@ class GridEngine(TrailingPolicyMixin):
             return False, logs, f"No se pudo cancelar la orden en {key}."
 
         removed = False
+        removed_virtuals: List[str] = []
         with self._state_lock:
             current = self.active_orders.get(key)
             if current is not None and current["order_id"] == order_id:
@@ -597,9 +652,18 @@ class GridEngine(TrailingPolicyMixin):
                         if _price_key(level) != key
                     ]
                     self.extended_levels.pop(key, None)
+                    removed_virtuals = self._remove_virtuals_beyond_cancelled_edge_locked(
+                        key,
+                        str(info["side"]),
+                    )
                 removed = True
 
         if removed:
+            for virtual_key in removed_virtuals:
+                logs.append({
+                    "level": "info",
+                    "msg": f"Orden virtual {str(info['side']).upper()} en {virtual_key} eliminada junto al borde cancelado.",
+                })
             self.save_state()
 
         return True, logs, None

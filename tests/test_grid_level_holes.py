@@ -133,6 +133,46 @@ class GridLevelHoleTests(unittest.TestCase):
         self.assertNotIn("90.00", engine.active_orders)
         self.assertNotIn(Decimal("90"), engine.levels)
 
+    def test_cancel_top_real_sell_with_virtual_above_removes_both_levels(self) -> None:
+        engine = self._engine()
+        with engine._state_lock:
+            engine.levels = [Decimal("90"), Decimal("100"), Decimal("110"), Decimal("120")]
+            engine.active_orders["110.00"] = {
+                "side": "sell",
+                "order_id": "order-110",
+                "price": Decimal("110"),
+                "placed_at": 1.0,
+                "size": Decimal("0.01"),
+            }
+            engine.active_orders["120.00"] = {
+                "side": "sell",
+                "order_id": "virtual",
+                "price": Decimal("120"),
+                "placed_at": 1.0,
+                "size": Decimal("0.01"),
+            }
+
+        plan = engine.get_price_cancel_plan("110.00")
+
+        self.assertIsNotNone(plan)
+        self.assertTrue(plan["is_edge"])
+        self.assertTrue(plan["remove_level"])
+
+        with patch.object(engine, "save_state", return_value=True):
+            ok, logs, error_msg = engine.cancel_order_by_key(
+                "110.00",
+                expected_order_id="order-110",
+                remove_level=True,
+            )
+
+        self.assertTrue(ok)
+        self.assertIsNone(error_msg)
+        self.assertNotIn("110.00", engine.active_orders)
+        self.assertNotIn("120.00", engine.active_orders)
+        self.assertNotIn(Decimal("110"), engine.levels)
+        self.assertNotIn(Decimal("120"), engine.levels)
+        self.assertTrue(any("Orden virtual SELL en 120.00 eliminada" in log["msg"] for log in logs))
+
     def test_cancel_state_only_order_keeps_grid_level_empty(self) -> None:
         engine = self._engine()
         with engine._state_lock:
