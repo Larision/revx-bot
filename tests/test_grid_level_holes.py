@@ -262,7 +262,7 @@ class GridLevelHoleTests(unittest.TestCase):
 
         self.assertEqual(
             [(item["side"], item["price"]) for item in preview["to_place"]],
-            [("buy", Decimal("90")), ("sell", Decimal("110"))],
+            [("sell", Decimal("110")), ("buy", Decimal("90"))],
         )
         self.assertEqual(preview["skipped"], [])
 
@@ -282,7 +282,7 @@ class GridLevelHoleTests(unittest.TestCase):
 
         self.assertEqual(
             [(call.args[0], call.args[1]) for call in place_order.call_args_list],
-            [(Decimal("90"), "buy"), (Decimal("110"), "sell")],
+            [(Decimal("110"), "sell"), (Decimal("90"), "buy")],
         )
 
 

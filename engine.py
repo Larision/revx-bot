@@ -927,14 +927,18 @@ class GridEngine(TrailingPolicyMixin):
         if STATE_PATH.exists():
             should_recover = recover_state
             if should_recover is None:
+                # Importación diferida para evitar dependencia circular al
+                # cargar el engine desde la CLI.
+                from cli import input_with_esc
+
                 try:
-                    respuesta = input(
+                    respuesta = input_with_esc(
                         f"Se encontró estado previo en {STATE_PATH}. "
                         "¿Deseas recuperarlo? (s/n): "
                     ).strip().lower()
                 except EOFError:
                     respuesta = "n"
-                should_recover = respuesta.startswith("s")
+                should_recover = respuesta in ("s", "si", "sí", "y", "yes")
 
             if should_recover:
                 if self.load_state():
@@ -2093,7 +2097,10 @@ class GridEngine(TrailingPolicyMixin):
             else:
                 skip_level = min(levels_sorted, key=lambda level: abs(level - current_price), default=None)
 
-        for level in levels_sorted:
+        # Recuperar primero el nivel más alto. Así, si hay varios huecos y el
+        # proceso se interrumpe, se preserva la prioridad de la parte alta del
+        # grid en vez de empezar por las BUY inferiores.
+        for level in reversed(levels_sorted):
             key = _price_key(level)
             if key in active_orders:
                 continue

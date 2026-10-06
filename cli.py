@@ -1,5 +1,6 @@
 from __future__ import annotations
 import csv
+import builtins
 import json
 import signal
 import threading
@@ -45,7 +46,7 @@ from api import (
     place_order,
 )
 
-class InputCancelled(Exception):
+class InputCancelled(BaseException):
     """Cancelación controlada de inputs desde la CLI."""
     pass
 
@@ -92,7 +93,7 @@ def input_with_esc(prompt: str) -> str:
 
     if not sys.stdin.isatty():
         try:
-            return input(prompt)
+            return builtins.input(prompt)
         except EOFError as exc:
             raise InputCancelled("Entrada cancelada") from exc
 
@@ -101,7 +102,7 @@ def input_with_esc(prompt: str) -> str:
         import tty
     except ImportError:
         try:
-            return input(prompt)
+            return builtins.input(prompt)
         except EOFError as exc:
             raise InputCancelled("Entrada cancelada") from exc
 
@@ -139,6 +140,12 @@ def input_with_esc(prompt: str) -> str:
             print(ch, end='', flush=True)
     finally:
         termios_mod.tcsetattr(fd, termios_mod.TCSADRAIN, old_settings)
+
+
+# Todas las entradas de esta CLI pasan por el lector con ESC.  Se mantiene el
+# nombre ``input`` para que también queden cubiertos los flujos antiguos que
+# todavía usan la llamada estándar.
+input = input_with_esc
 
 # =========================================================
 # ====================== MANUAL ORDER =====================
@@ -2546,7 +2553,7 @@ def run_cli() -> None:
                     raw = input(f"\nSe encontró estado previo en {STATE_PATH}. ¿Deseas recuperarlo? (s/n): ").strip().lower()
                 except EOFError:
                     raw = "n"
-                recover_state = raw.startswith("s")
+                recover_state = raw in ("s", "si", "sí", "y", "yes")
             else:
                 recover_state = False
 

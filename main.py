@@ -1,4 +1,7 @@
-from cli import run_cli
+from cli import InputCancelled, run_cli
 
 if __name__ == "__main__":
-    run_cli()
+    try:
+        run_cli()
+    except InputCancelled:
+        print("\nEntrada cancelada con ESC.")
