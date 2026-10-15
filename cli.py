@@ -70,6 +70,12 @@ def input_with_esc(prompt: str) -> str:
         while True:
             if msvcrt.kbhit():
                 ch = msvcrt.getch()
+                # Las flechas y otras teclas extendidas llegan como dos bytes
+                # (0x00/0xE0 + código). Hay que consumir ambos para que no se
+                # interpreten como texto ni queden pendientes para otro input.
+                if ch in (b'\x00', b'\xe0'):
+                    msvcrt.getch()
+                    continue
                 if ch == b'\x1b':  # ESC key
                     print()
                     raise InputCancelled("Entrada cancelada con ESC")
@@ -125,6 +131,20 @@ def input_with_esc(prompt: str) -> str:
 
             ch = sys.stdin.read(1)
             if ch == '\x1b':
+                # En terminales POSIX las flechas se reciben como una secuencia
+                # que empieza por ESC (por ejemplo, ESC [ A). Solo ESC aislado
+                # debe cancelar la entrada.
+                readable, _, _ = select_mod.select([sys.stdin], [], [], 0.05)
+                if readable:
+                    next_ch = sys.stdin.read(1)
+                    if next_ch in ('[', 'O'):
+                        # Consume el resto de la secuencia de una tecla especial.
+                        while True:
+                            readable, _, _ = select_mod.select([sys.stdin], [], [], 0.005)
+                            if not readable:
+                                break
+                            sys.stdin.read(1)
+                    continue
                 print()
                 raise InputCancelled("Entrada cancelada con ESC")
             if ch in ('\r', '\n'):
@@ -958,6 +978,9 @@ def _esc_pressed() -> bool:
 
         while msvcrt.kbhit():
             ch = msvcrt.getch()
+            if ch in (b"\x00", b"\xe0"):
+                msvcrt.getch()
+                continue
             if ch == b"\x1b":
                 return True
 
@@ -985,7 +1008,24 @@ def _esc_pressed() -> bool:
         if not readable:
             return False
 
-        return sys.stdin.read(1) == "\x1b"
+        ch = sys.stdin.read(1)
+        if ch != "\x1b":
+            return False
+
+        # Una flecha en terminales POSIX comienza por ESC. Si llega otro byte
+        # enseguida, es una secuencia de tecla especial y no una cancelación.
+        readable, _, _ = select.select([sys.stdin], [], [], 0.05)
+        if not readable:
+            return True
+
+        next_ch = sys.stdin.read(1)
+        if next_ch in ("[", "O"):
+            while True:
+                readable, _, _ = select.select([sys.stdin], [], [], 0.005)
+                if not readable:
+                    break
+                sys.stdin.read(1)
+        return False
 
     finally:
         termios_mod.tcsetattr(fd, termios_mod.TCSADRAIN, old_settings)
