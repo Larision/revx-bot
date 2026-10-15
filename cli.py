@@ -2,6 +2,7 @@ from __future__ import annotations
 import csv
 import builtins
 import json
+import os
 import signal
 import threading
 import time
@@ -50,6 +51,46 @@ class InputCancelled(BaseException):
     """Cancelación controlada de inputs desde la CLI."""
     pass
 
+
+def _is_windows_escape_sequence(msvcrt: Any) -> bool:
+    """Indica si el ESC leído en Windows inicia una secuencia de terminal."""
+    deadline = time.monotonic() + 0.05
+    while not msvcrt.kbhit() and time.monotonic() < deadline:
+        time.sleep(0.001)
+
+    if not msvcrt.kbhit():
+        return False
+
+    next_ch = msvcrt.getch()
+    if next_ch not in (b'[', b'O'):
+        return False
+
+    # Las flechas enviadas en modo VT suelen ser ESC [ A/B/C/D. Vacía la
+    # secuencia completa para que no afecte a la siguiente lectura.
+    while msvcrt.kbhit():
+        msvcrt.getch()
+    return True
+
+
+def _read_posix_char(fd: int) -> str:
+    """Lee un carácter UTF-8 sin el búfer de texto de ``sys.stdin``."""
+    first_byte = os.read(fd, 1)
+    if not first_byte:
+        return ""
+
+    byte_count = 1
+    first_value = first_byte[0]
+    if first_value & 0b11110000 == 0b11110000:
+        byte_count = 4
+    elif first_value & 0b11100000 == 0b11100000:
+        byte_count = 3
+    elif first_value & 0b11000000 == 0b11000000:
+        byte_count = 2
+
+    raw_char = first_byte + os.read(fd, byte_count - 1)
+    return raw_char.decode("utf-8", errors="replace")
+
+
 def input_with_esc(prompt: str) -> str:
     """
     Función de input personalizada que permite cancelar con ESC.
@@ -77,6 +118,8 @@ def input_with_esc(prompt: str) -> str:
                     msvcrt.getch()
                     continue
                 if ch == b'\x1b':  # ESC key
+                    if _is_windows_escape_sequence(msvcrt):
+                        continue
                     print()
                     raise InputCancelled("Entrada cancelada con ESC")
                 if ch in (b'\r', b'\n'):  # Enter
@@ -125,25 +168,25 @@ def input_with_esc(prompt: str) -> str:
     try:
         tty_mod.setcbreak(fd)
         while True:
-            readable, _, _ = select_mod.select([sys.stdin], [], [], 0.05)
+            readable, _, _ = select_mod.select([fd], [], [], 0.05)
             if not readable:
                 continue
 
-            ch = sys.stdin.read(1)
+            ch = _read_posix_char(fd)
             if ch == '\x1b':
                 # En terminales POSIX las flechas se reciben como una secuencia
                 # que empieza por ESC (por ejemplo, ESC [ A). Solo ESC aislado
                 # debe cancelar la entrada.
-                readable, _, _ = select_mod.select([sys.stdin], [], [], 0.05)
+                readable, _, _ = select_mod.select([fd], [], [], 0.05)
                 if readable:
-                    next_ch = sys.stdin.read(1)
+                    next_ch = _read_posix_char(fd)
                     if next_ch in ('[', 'O'):
                         # Consume el resto de la secuencia de una tecla especial.
                         while True:
-                            readable, _, _ = select_mod.select([sys.stdin], [], [], 0.005)
+                            readable, _, _ = select_mod.select([fd], [], [], 0.005)
                             if not readable:
                                 break
-                            sys.stdin.read(1)
+                            _read_posix_char(fd)
                     continue
                 print()
                 raise InputCancelled("Entrada cancelada con ESC")
@@ -982,6 +1025,8 @@ def _esc_pressed() -> bool:
                 msvcrt.getch()
                 continue
             if ch == b"\x1b":
+                if _is_windows_escape_sequence(msvcrt):
+                    continue
                 return True
 
         return False
@@ -1003,28 +1048,28 @@ def _esc_pressed() -> bool:
 
     try:
         tty_mod.setcbreak(fd)
-        readable, _, _ = select.select([sys.stdin], [], [], 0)
+        readable, _, _ = select.select([fd], [], [], 0)
 
         if not readable:
             return False
 
-        ch = sys.stdin.read(1)
-        if ch != "\x1b":
+        ch = os.read(fd, 1)
+        if ch != b"\x1b":
             return False
 
         # Una flecha en terminales POSIX comienza por ESC. Si llega otro byte
         # enseguida, es una secuencia de tecla especial y no una cancelación.
-        readable, _, _ = select.select([sys.stdin], [], [], 0.05)
+        readable, _, _ = select.select([fd], [], [], 0.05)
         if not readable:
             return True
 
-        next_ch = sys.stdin.read(1)
-        if next_ch in ("[", "O"):
+        next_ch = os.read(fd, 1)
+        if next_ch in (b"[", b"O"):
             while True:
-                readable, _, _ = select.select([sys.stdin], [], [], 0.005)
+                readable, _, _ = select.select([fd], [], [], 0.005)
                 if not readable:
                     break
-                sys.stdin.read(1)
+                os.read(fd, 1)
         return False
 
     finally:
