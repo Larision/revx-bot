@@ -1,6 +1,7 @@
 from __future__ import annotations
 import csv
 import builtins
+from functools import wraps
 import json
 import os
 import signal
@@ -210,10 +211,25 @@ def input_with_esc(prompt: str) -> str:
 # todavía usan la llamada estándar.
 input = input_with_esc
 
+
+def _cancel_to(default: Any = None):
+    """Convierte ESC en una vuelta segura al menú del flujo actual."""
+    def decorator(func: Any) -> Any:
+        @wraps(func)
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return func(*args, **kwargs)
+            except InputCancelled:
+                print("\nEntrada cancelada. Volviendo al menú.")
+                return default
+        return wrapped
+    return decorator
+
 # =========================================================
 # ====================== MANUAL ORDER =====================
 # =========================================================
 
+@_cancel_to((None, None, None))
 def manual_order() -> Tuple[Optional[str], Optional[Decimal], Optional[Decimal]]:
     """
     Pregunta al usuario el precio, lado y tamaño base de forma interactiva.
@@ -311,6 +327,7 @@ def check_esc():
 # ====================== MENU EXPORTAR ====================
 # =========================================================
 
+@_cancel_to()
 def menu_exportar_datos():
     """
     Submenú para obtener y exportar datos históricos de mercado (trades o velas).
@@ -852,6 +869,7 @@ def _import_tax_manual_lot() -> None:
     print(f"    ID    : {lot.source_order_id}")
 
 
+@_cancel_to()
 def menu_tax_fifo(engine: Optional["GridEngine"] = None) -> None:
     """Submenú de consulta y mantenimiento del ledger fiscal FIFO."""
     while True:
@@ -1374,6 +1392,7 @@ def _calculate_auto_grid_config(
     return levels_below, levels_above, base_size, step_percent, reserve_usdc, bot_usdc_budget
 
 
+@_cancel_to((False, None))
 def show_grid_preview(
     levels_below: int,
     levels_above: int,
@@ -1805,6 +1824,7 @@ def _show_balances_live(engine: Optional["GridEngine"] = None) -> None:
     print("\n" + "\n".join(f"  {line}" if line else "" for line in summary.splitlines()) + "\n")
 
 
+@_cancel_to()
 def _add_manual_order(engine: "GridEngine") -> None:
     """
     Añade una orden manual o un nivel vacío al grid.
@@ -1875,6 +1895,7 @@ def _add_manual_order(engine: "GridEngine") -> None:
     print("  ✓ Orden registrada en el engine.")
 
 
+@_cancel_to()
 def _cancel_order_by_price(engine: "GridEngine") -> None:
     """
     Función interactiva para cancelar una orden activa del motor especificando su precio.
@@ -1973,6 +1994,7 @@ def _cancel_order_by_price(engine: "GridEngine") -> None:
         print(f"  ✓ Orden cancelada; el nivel {target_key} queda vacío en el grid.")
 
 
+@_cancel_to()
 def _fill_empty_levels(engine: "GridEngine") -> None:
     """
     Activa un llenado manual de los niveles vacíos del grid utilizando un precio fresco.
@@ -2022,6 +2044,7 @@ def _fill_empty_levels(engine: "GridEngine") -> None:
     print("  ✓ Fill empty levels ejecutado.")
 
 
+@_cancel_to()
 def _resize_to_default(engine: "GridEngine") -> None:
     """Redimensiona ordenes de trailing_up fixed_quote al base_size predeterminado."""
     preview = engine.preview_resize_trailing_up_fixed_quote_to_default()
@@ -2287,6 +2310,7 @@ def _reserve_usdc_menu(engine: "GridEngine") -> None:
     print(f"  ✓ Reserva USDC actualizada a {_fmt_usdc_value(new_reserve)} USDC")
 
 
+@_cancel_to()
 def _engine_config_menu(engine: "GridEngine") -> None:
     """Submenú de configuración en caliente para el engine."""
     while True:
@@ -2316,6 +2340,7 @@ def _engine_config_menu(engine: "GridEngine") -> None:
             print("Opción inválida")
 
 
+@_cancel_to()
 def run_engine_menu(engine: "GridEngine", engine_thread: threading.Thread) -> None:
     """
     Submenú de monitor interactivo para una instancia de GridEngine en ejecución.
@@ -2387,6 +2412,7 @@ def run_engine_menu(engine: "GridEngine", engine_thread: threading.Thread) -> No
 # ========================= MENU ==========================
 # =========================================================
 
+@_cancel_to("")
 def show_menu(engine_running: bool = False) -> str:
     """
     Muestra el menú principal de la CLI y devuelve la opción del usuario.
@@ -2612,7 +2638,11 @@ def run_cli() -> None:
                 continue
 
             print("\n=== Cancelar todas las órdenes ===")
-            confirmacion = input("¿Está seguro? Esto cancelará TODAS las órdenes (s/n): ")
+            try:
+                confirmacion = input("¿Está seguro? Esto cancelará TODAS las órdenes (s/n): ")
+            except InputCancelled:
+                print("Entrada cancelada. Volviendo al menú.")
+                continue
             if confirmacion.strip().lower().startswith("s"):
                 cancel_all_orders()
             else:
@@ -2636,7 +2666,10 @@ def run_cli() -> None:
             if STATE_PATH.exists():
                 try:
                     raw = input(f"\nSe encontró estado previo en {STATE_PATH}. ¿Deseas recuperarlo? (s/n): ").strip().lower()
-                except EOFError:
+                except (EOFError, InputCancelled) as exc:
+                    if isinstance(exc, InputCancelled):
+                        print("Entrada cancelada. Volviendo al menú.")
+                        continue
                     raw = "n"
                 recover_state = raw in ("s", "si", "sí", "y", "yes")
             else:
@@ -2729,6 +2762,8 @@ def run_cli() -> None:
                     engine.clear_state()
                 else:
                     log_event("[ENGINE] Órdenes conservadas — estado guardado para recuperación.", "info")
+            except InputCancelled:
+                print("Entrada cancelada. Órdenes conservadas — estado guardado para recuperación.")
             except Exception as e:
                 log_event(f"[ENGINE] Error al procesar respuesta: {e}", "error")
 
