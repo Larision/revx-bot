@@ -1,9 +1,10 @@
 import copy
 import logging
 import re
+from logging.handlers import RotatingFileHandler
 from typing import List, Optional
 
-from config import LOG_PATH
+from config import LOG_BACKUP_COUNT, LOG_MAX_BYTES, LOG_PATH
 from types_ import LogEntry
 
 UUID_RE = re.compile(
@@ -70,8 +71,14 @@ ch = logging.StreamHandler()
 ch.setFormatter(fmt_console)
 logger.addHandler(ch)
 
-# Fichero (sin colores)
-fh = logging.FileHandler(LOG_PATH, encoding="utf-8")
+# Fichero rotativo (sin colores). Conserva el actual y diez históricos.
+LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+fh = RotatingFileHandler(
+    LOG_PATH,
+    maxBytes=LOG_MAX_BYTES,
+    backupCount=LOG_BACKUP_COUNT,
+    encoding="utf-8",
+)
 fh.setFormatter(fmt_file)
 logger.addHandler(fh)
 
