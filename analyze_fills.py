@@ -24,6 +24,7 @@ TICK_SIZE = Decimal("0.01")
 MULTIPLE_DECIMALS = Decimal("0.0001")
 QTY_EPSILON = Decimal("0.00000000000001")
 STEP_DETECTION_WINDOWS_DAYS = (7, 14, 30)
+GRID_STEP_TOLERANCE = Decimal("0.25")
 
 
 def _price_key(price: Decimal) -> str:
@@ -151,14 +152,33 @@ def detect_step(fills: List[Dict]) -> Decimal:
     return _detect_step_from_fills(fills, require_repeated=False)
 
 
-def _find_best_buy_match(open_buys: List[Dict], sell_fill: Dict) -> Optional[int]:
+def detect_steps_by_day(fills: List[Dict], fallback_step: Decimal) -> Dict[str, Decimal]:
+    """Detecta el step del grid por día y conserva el último si falta evidencia."""
+    fills_by_day: Dict[str, List[Dict]] = {}
+    for fill in fills:
+        fills_by_day.setdefault(str(fill["ts"])[:10], []).append(fill)
+
+    steps_by_day: Dict[str, Decimal] = {}
+    last_step = fallback_step
+    for day in sorted(fills_by_day):
+        detected = _detect_step_from_fills(fills_by_day[day], require_repeated=True)
+        if detected > 0:
+            last_step = detected
+        steps_by_day[day] = last_step
+    return steps_by_day
+
+
+def _find_best_buy_match(
+    open_buys: List[Dict], sell_fill: Dict, expected_step: Decimal
+) -> Optional[int]:
     """
-    Busca el BUY abierto mas cercano por precio para emparejar un SELL.
+    Busca el BUY abierto mas cercano por precio para emparejar un SELL de grid.
 
     La cantidad no interviene en la prioridad. Si las cantidades son distintas,
     pair_fills consume parcialmente el BUY o el SELL y continua con el siguiente
     nivel mas cercano. Esto evita saltarse BUYs proximos solo para encontrar una
-    cantidad exactamente igual mucho mas abajo.
+    cantidad exactamente igual mucho mas abajo. Para evitar asociar inventario
+    antiguo, el BUY debe estar dentro de la tolerancia del step de ese día.
     """
     sell_price = sell_fill["price"]
     candidates: List[Tuple[int, Dict]] = []
@@ -169,6 +189,11 @@ def _find_best_buy_match(open_buys: List[Dict], sell_fill: Dict) -> Optional[int
 
         buy_qty = buy.get("remaining_quantity", buy["quantity"])
         if buy_qty <= QTY_EPSILON:
+            continue
+
+        realized_step = sell_price - buy["price"]
+        tolerance = expected_step * GRID_STEP_TOLERANCE
+        if expected_step <= 0 or abs(realized_step - expected_step) > tolerance:
             continue
 
         candidates.append((idx, buy))
@@ -216,18 +241,25 @@ def _step_flags(step_used: Decimal, step_base: Decimal) -> Dict[str, str]:
     }
 
 
-def pair_fills(fills: List[Dict], step: Decimal) -> Tuple[List[Dict], List[Dict]]:
+def pair_fills(
+    fills: List[Dict],
+    step: Decimal,
+    steps_by_day: Optional[Dict[str, Decimal]] = None,
+) -> Tuple[List[Dict], List[Dict], List[Dict]]:
     """
-    Empareja fills BUY/SELL y devuelve un unico par por SELL cerrado.
+    Empareja fills BUY/SELL y devuelve pares de grid, BUYs abiertos y SELLs sin
+    BUY compatible.
 
     Un SELL puede consumir varios BUYs cercanos cuando sus quantities no coinciden
     exactamente (por ejemplo, tras un resize). Esos consumos se agregan en un solo
     par usando un precio BUY medio ponderado. Asi el numero de pares sigue
     representando el numero de SELLs cerrados y no el numero de fragmentos usados
-    internamente para reconstruir su coste.
+    internamente para reconstruir su coste. No fuerza asociaciones con BUYs de
+    otro régimen de step: esas cantidades se informan como SELLs sin casar.
     """
     pairs: List[Dict] = []
     open_buys: List[Dict] = []
+    open_sells: List[Dict] = []
 
     for fill in fills:
         fill = {**fill, "remaining_quantity": fill["quantity"]}
@@ -241,13 +273,14 @@ def pair_fills(fills: List[Dict], step: Decimal) -> Tuple[List[Dict], List[Dict]
             continue
 
         sell_price = fill["price"]
+        expected_step = (steps_by_day or {}).get(str(fill["ts"])[:10], step)
         matched_quantity = Decimal("0")
         total_buy_value = Decimal("0")
         total_sell_value = Decimal("0")
         first_buy_ts: Optional[str] = None
 
         while fill["remaining_quantity"] > QTY_EPSILON:
-            matched_idx = _find_best_buy_match(open_buys, fill)
+            matched_idx = _find_best_buy_match(open_buys, fill, expected_step)
             if matched_idx is None:
                 break
 
@@ -267,25 +300,33 @@ def pair_fills(fills: List[Dict], step: Decimal) -> Tuple[List[Dict], List[Dict]
             if buy["remaining_quantity"] <= QTY_EPSILON:
                 open_buys.pop(matched_idx)
 
-        if matched_quantity <= QTY_EPSILON:
-            continue
+        if matched_quantity > QTY_EPSILON:
+            weighted_buy_price = total_buy_value / matched_quantity
+            profit = total_sell_value - total_buy_value
+            step_used = sell_price - weighted_buy_price
 
-        weighted_buy_price = total_buy_value / matched_quantity
-        profit = total_sell_value - total_buy_value
-        step_used = sell_price - weighted_buy_price
+            pairs.append({
+                "buy_ts": first_buy_ts or "",
+                "buy_price": _price_key(weighted_buy_price),
+                "sell_ts": fill["ts"],
+                "sell_price": _price_key(sell_price),
+                "quantity": _quantity_key(matched_quantity),
+                "step_usdc": _price_key(step_used),
+                "profit_usdc": f"{profit:.4f}",
+                "step_base": _price_key(expected_step),
+                **_step_flags(step_used, expected_step),
+            })
 
-        pairs.append({
-            "buy_ts": first_buy_ts or "",
-            "buy_price": _price_key(weighted_buy_price),
-            "sell_ts": fill["ts"],
-            "sell_price": _price_key(sell_price),
-            "quantity": _quantity_key(matched_quantity),
-            "step_usdc": _price_key(step_used),
-            "profit_usdc": f"{profit:.4f}",
-            **_step_flags(step_used, step),
-        })
+        if fill["remaining_quantity"] > QTY_EPSILON:
+            open_sells.append({
+                "ts": fill["ts"],
+                "price": fill["price"],
+                "quantity": fill["remaining_quantity"],
+                "matched_quantity": matched_quantity,
+                "expected_step": expected_step,
+            })
 
-    return pairs, open_buys
+    return pairs, open_buys, open_sells
 
 
 def write_pairs(pairs: List[Dict], path: Path) -> None:
@@ -301,6 +342,7 @@ def write_pairs(pairs: List[Dict], path: Path) -> None:
                 "sell_price",
                 "quantity",
                 "step_usdc",
+                "step_base",
                 "step_multiple",
                 "step_band",
                 "gt_1x",
@@ -328,16 +370,38 @@ def write_open_buys(open_buys: List[Dict], path: Path) -> None:
             })
 
 
-def print_summary(pairs: List[Dict], open_buys: List[Dict], step: Decimal) -> None:
+def write_open_sells(open_sells: List[Dict], path: Path) -> None:
+    """Escribe SELLs que no tienen un BUY compatible en el mismo régimen."""
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["ts", "price", "quantity", "matched_quantity", "expected_step"],
+        )
+        writer.writeheader()
+        for sell in open_sells:
+            writer.writerow({
+                "ts": sell["ts"],
+                "price": _price_key(sell["price"]),
+                "quantity": _quantity_key(sell["quantity"]),
+                "matched_quantity": _quantity_key(sell["matched_quantity"]),
+                "expected_step": _price_key(sell["expected_step"]),
+            })
+
+
+def print_summary(
+    pairs: List[Dict], open_buys: List[Dict], open_sells: List[Dict], step: Decimal
+) -> None:
     """Muestra un resumen agregado del emparejamiento de fills."""
     print(f"\n{'=' * 52}")
     print("  RESUMEN DE FILLS EMPAREJADOS")
     print(f"{'=' * 52}")
-    print(f"  Step base detectado: {step} USDC")
+    print(f"  Step base actual   : {step} USDC")
+    print("  Steps históricos   : detectados por día")
 
     if not pairs:
-        print("  Pares completos    : 0")
+        print("  Pares de grid      : 0")
         print(f"  BUYs sin emparejar : {len(open_buys)}")
+        print(f"  SELLs sin emparejar: {len(open_sells)}")
         print(f"{'=' * 52}\n")
         return
 
@@ -352,8 +416,9 @@ def print_summary(pairs: List[Dict], open_buys: List[Dict], step: Decimal) -> No
     gt_2x_count = sum(1 for p in pairs if p["gt_2x"] == "yes")
     gt_3x_count = sum(1 for p in pairs if p["gt_3x"] == "yes")
 
-    print(f"  Pares completos    : {len(pairs)}")
+    print(f"  Pares de grid      : {len(pairs)}")
     print(f"  BUYs sin emparejar : {len(open_buys)}")
+    print(f"  SELLs sin emparejar: {len(open_sells)}")
     print(f"  Beneficio total    : {total_profit:.4f} USDC")
     print(f"  Beneficio medio    : {avg_profit:.4f} USDC / par")
     print(f"  Step realizado min : {min_step} USDC")
@@ -427,17 +492,21 @@ def main() -> None:
         print("[!] No hay suficientes fills para analizar.")
         sys.exit(1)
 
-    pairs, open_buys = pair_fills(fills, step)
+    steps_by_day = detect_steps_by_day(fills, step)
+    pairs, open_buys, open_sells = pair_fills(fills, step, steps_by_day)
 
     pairs_path = fills_path.parent / "pairs_with_anomalies.csv"
     open_buys_path = fills_path.parent / "open_buys.csv"
+    open_sells_path = fills_path.parent / "open_sells.csv"
 
     write_pairs(pairs, pairs_path)
     write_open_buys(open_buys, open_buys_path)
+    write_open_sells(open_sells, open_sells_path)
 
-    print_summary(pairs, open_buys, step)
+    print_summary(pairs, open_buys, open_sells, step)
     print(f"  Pares guardados en    : {pairs_path}")
     print(f"  BUYs abiertos en      : {open_buys_path}")
+    print(f"  SELLs sin emparejar en: {open_sells_path}")
 
 
 if __name__ == "__main__":
